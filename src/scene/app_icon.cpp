@@ -124,7 +124,7 @@ namespace umbriel {
     }
 
     // Busca «Icon=» en los temas instalados. Primero breeze-dark (el tema que
-    // usa ALBA), después los demás; los iconos de apps de terceros suelen estar
+    // usa Shell), después los demás; los iconos de apps de terceros suelen estar
     // en hicolor.
     std::string findIconFile(const std::string& icon) {
       static constexpr std::array<std::string_view, 8> themes{

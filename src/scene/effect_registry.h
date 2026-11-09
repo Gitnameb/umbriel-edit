@@ -58,7 +58,7 @@ namespace umbriel {
     // Built-in blur for the window under the pointer while Mod is held. Applies to the client content only, so the
     // native title bar and its buttons stay sharp.
     fx_effect_shader* modHoverBlurShader() const { return m_hoverBlur.get(); }
-    // Adds alba_brightness, alba_extra_dim, and alba_warm for displayFilterEffect().
+    // Adds shell_brightness, shell_extra_dim, and shell_warm for displayFilterEffect().
     void fillDisplayUniforms(fx_animation_parameters& parameters) const;
     // The preset bound to an animation event through `effect =`, or null (also null for the built-in fade).
     const EffectPreset* animationPreset(AnimationEvent event) const;

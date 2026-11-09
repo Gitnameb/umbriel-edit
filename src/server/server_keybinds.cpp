@@ -454,7 +454,7 @@ namespace umbriel {
     auto* self = static_cast<Server*>(data);
     if ((self->keyboardModifiers() & self->modKey()) != 0 && !self->m_sessionLocked) {
       self->setModHoldActive(true);
-      // ALBA may have just missed the modifier event while starting up, so
+      // Shell may have just missed the modifier event while starting up, so
       // publish the settled hold state for any shell listening for it.
       if (Ipc* ipc = self->ipc(); ipc != nullptr) {
         ipc->notifyModifiersChanged();

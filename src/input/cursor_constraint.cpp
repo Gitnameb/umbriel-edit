@@ -30,7 +30,7 @@ namespace umbriel {
       // A locked pointer would keep consuming motion, hiding the cursor and
       // keeping the window's mouse input alive while Mod is held. Skip the
       // cursor hint: opening window management must not teleport the pointer.
-      // Keep the modifier-tap state intact: a clean tap still opens ALBA's
+      // Keep the modifier-tap state intact: a clean tap still opens Shell's
       // launcher on release.
       cancelHotCorner();
       clearConstraint(false);

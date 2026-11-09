@@ -35,14 +35,14 @@ namespace umbriel {
     // Whole-output display filter: brightness, extra dim, and an amber white
     // point. Multiplying keeps black at black, unlike an alpha-tinted overlay.
     constexpr const char* kDisplayFilter = R"(
-uniform float alba_brightness;
-uniform float alba_extra_dim;
-uniform float alba_warm;
+uniform float shell_brightness;
+uniform float shell_extra_dim;
+uniform float shell_warm;
 vec4 screen(vec2 uv) {
   vec4 c = umbriel_sample(uv);
   vec3 rgb = c.rgb;
-  rgb *= vec3(1.0, mix(1.0, 0.84, alba_warm), mix(1.0, 0.64, alba_warm));
-  rgb *= alba_brightness * (1.0 - alba_extra_dim);
+  rgb *= vec3(1.0, mix(1.0, 0.84, shell_warm), mix(1.0, 0.64, shell_warm));
+  rgb *= shell_brightness * (1.0 - shell_extra_dim);
   return vec4(rgb, c.a);
 }
 )";
@@ -511,13 +511,13 @@ vec4 animation(vec2 uv) {
 
   void EffectRegistry::fillDisplayUniforms(fx_animation_parameters& parameters) const {
     const Config::Display& display = config().display;
-    if (fx_uniform* brightness = fx_parameters_add_uniform(&parameters, "alba_brightness", FX_UNIFORM_FLOAT, 1)) {
+    if (fx_uniform* brightness = fx_parameters_add_uniform(&parameters, "shell_brightness", FX_UNIFORM_FLOAT, 1)) {
       brightness->floats[0] = display.brightness;
     }
-    if (fx_uniform* dim = fx_parameters_add_uniform(&parameters, "alba_extra_dim", FX_UNIFORM_FLOAT, 1)) {
+    if (fx_uniform* dim = fx_parameters_add_uniform(&parameters, "shell_extra_dim", FX_UNIFORM_FLOAT, 1)) {
       dim->floats[0] = display.extraDim;
     }
-    if (fx_uniform* warm = fx_parameters_add_uniform(&parameters, "alba_warm", FX_UNIFORM_FLOAT, 1)) {
+    if (fx_uniform* warm = fx_parameters_add_uniform(&parameters, "shell_warm", FX_UNIFORM_FLOAT, 1)) {
       warm->floats[0] = display.warm;
     }
   }
