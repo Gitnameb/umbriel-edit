@@ -1,3 +1,8 @@
+> **Edit personal de Umbriel.** Este repositorio es una copia modificada de
+> Umbriel para mi escritorio. No es una versión oficial, no está afiliado a
+> Noctalia y no pretende ser mejor que el proyecto original. Si lo usas,
+> hazlo bajo tu responsabilidad y revisa los cambios.
+
 # Umbriel
 
 A Wayland compositor designed for daily use, with scrolling, dwindle, master, and stacking layouts, per-output workspaces, window rules, blur, shadows, and fluid animations.
