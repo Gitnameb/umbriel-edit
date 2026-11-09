@@ -311,7 +311,7 @@ vec4 animation(vec2 uv) {
     }
     if (settings.display.active() && m_displayFilter == nullptr) {
       m_displayFilter = {
-          fx_effect_shader_create(m_renderer, FX_EFFECT_SCREEN, kDisplayFilter, "screen.alba_display"),
+          fx_effect_shader_create(m_renderer, FX_EFFECT_SCREEN, kDisplayFilter, "screen.shell_display"),
           fx_effect_shader_unref
       };
       if (m_displayFilter == nullptr) {
