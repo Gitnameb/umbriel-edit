@@ -1,0 +1,1351 @@
+#pragma once
+#include "config/config_diag.h"
+#include "config/effects.h"
+#include "config/keybind_parse.h"
+#include "config/value_parse.h"
+#include "config/window_position.h"
+#include "core/animation.h"
+#include "layout/layout.h"
+#include "scene/ssd_frame_geometry.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <regex>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace umbriel {
+
+  struct ConfigReloadResult;
+
+  // Direction along which an output's workspaces are arranged. Scrolling layouts
+  // always scroll perpendicular to it.
+  enum class WorkspaceAxis {
+    Vertical,
+    Horizontal,
+  };
+
+  enum class TitleBarMode : uint8_t { On, Negotiated, Forced, Off };
+
+  enum class TitleBarButtonGlyph : uint8_t { Always, Hover, Never };
+
+  enum class ModifierKey {
+    Super,
+    Alt,
+    Control,
+    Shift,
+  };
+
+  // Which kinds of joining window are allowed to push a fullscreen window out of
+  // fullscreen (new_exits_fullscreen). A bitmask so any combination is expressible.
+  enum class FullscreenExitScope : uint8_t {
+    None = 0,
+    Tiled = 1 << 0,
+    Floating = 1 << 1,
+    Pinned = 1 << 2,
+    All = Tiled | Floating | Pinned,
+  };
+
+  // Which maximize state a tiled window's own maximize request enters (client_maximize).
+  enum class ClientMaximize : uint8_t {
+    Column,
+    Edges,
+  };
+
+  // What a tab bar draws in each slot.
+  enum class TabBarLook : uint8_t {
+    Titles,
+    Indicator,
+  };
+
+  // What a tab bar does with more tabs than its max_tabs.
+  enum class TabOverflow : uint8_t {
+    // Keep the slots at their size and scroll the strip.
+    Scroll,
+    // Narrow the slots until every tab fits.
+    Shrink,
+  };
+
+  enum class TitleAlign : uint8_t {
+    Left,
+    Center,
+    Right,
+  };
+
+  struct AccelProfile {
+    enum class Kind {
+      Flat,
+      Adaptive,
+      Custom,
+    } kind = Kind::Flat;
+    double step = 0.0;
+    std::vector<double> points;
+    bool operator==(const AccelProfile&) const = default;
+  };
+
+  // Per-workspace layout overrides (all optional → inherit Config::Layout).
+  struct WorkspaceLayoutOverrides {
+    std::optional<LayoutMode> mode;
+    std::optional<int> gap;
+    LayoutStrutOverrides struts;
+    std::optional<std::vector<double>> extentPresets;
+    std::optional<FullscreenExitScope> newExitsFullscreen;
+    std::optional<ClientMaximize> clientMaximize;
+    struct Scrolling {
+      std::optional<double> defaultExtentFraction;
+      std::optional<bool> centerUnderfullStrip;
+      std::optional<CenterFocusedColumn> centerFocused;
+      std::optional<bool> centerOnOverviewSelect;
+      bool operator==(const Scrolling&) const = default;
+    } scrolling;
+    struct Dwindle {
+      std::optional<bool> preserveSplit;
+      std::optional<bool> newTowardCursor;
+      bool operator==(const Dwindle&) const = default;
+    } dwindle;
+    struct Master {
+      std::optional<double> defaultWidthFraction;
+      std::optional<bool> newOnTop;
+      std::optional<bool> newBecomesMaster;
+      std::optional<MasterPosition> position;
+      bool operator==(const Master&) const = default;
+    } master;
+    struct Stacking {
+      std::optional<bool> dropZones;
+      std::optional<double> defaultWidthFraction;
+      std::optional<double> defaultHeightFraction;
+      std::optional<int> cascadeStep;
+      bool operator==(const Stacking&) const = default;
+    } stacking;
+    struct Tabs {
+      std::optional<ColumnDisplay> defaultDisplay;
+      std::optional<NewTabPosition> newTabPosition;
+      std::optional<bool> wrapFocus;
+      std::optional<bool> scrollSwitchesTabs;
+      std::optional<bool> middleClickCloses;
+      bool operator==(const Tabs&) const = default;
+    } tabs;
+
+    bool operator==(const WorkspaceLayoutOverrides&) const = default;
+  };
+
+  // Rule parsed from a [[workspace]] entry. Exactly one selector is set. A
+  // name also declares a persistent member of matching dynamic inventories.
+  struct WorkspaceConfig {
+    std::string name;
+    std::string output;       // optional output selector
+    std::optional<int> index; // optional 1-based position selector
+    WorkspaceLayoutOverrides layout;
+    bool operator==(const WorkspaceConfig&) const = default;
+  };
+
+  // A user-defined scratchpad. An empty list means that Umbriel provides the
+  // implicit scratchpad named "default" instead.
+  struct ScratchpadConfig {
+    std::string name;
+    std::string spawnWhenEmpty;
+    bool proportionalSize = false;
+    bool operator==(const ScratchpadConfig&) const = default;
+  };
+
+  // Fully resolved layout config. Owned by each Workspace.
+  struct ResolvedLayoutConfig {
+    LayoutMode mode = LayoutMode::Scrolling;
+    int gap = 8;
+    LayoutStruts struts;
+    std::vector<double> extentPresets{1.0 / 3, 0.5, 2.0 / 3};
+    FullscreenExitScope newExitsFullscreen = FullscreenExitScope::None;
+    ClientMaximize clientMaximize = ClientMaximize::Column;
+    struct Scrolling {
+      std::optional<double> defaultExtentFraction;
+      bool centerUnderfullStrip = true;
+      CenterFocusedColumn centerFocused = CenterFocusedColumn::Never;
+      bool centerOnOverviewSelect = false;
+      // Axis-agnostic layout state is preserved when config reload changes direction.
+      ScrollingDirection direction = ScrollingDirection::Horizontal;
+      bool operator==(const Scrolling&) const = default;
+    } scrolling;
+    struct Dwindle {
+      bool preserveSplit = false;
+      bool newTowardCursor = false;
+      bool operator==(const Dwindle&) const = default;
+    } dwindle;
+    struct Master {
+      double defaultWidthFraction = 0.55;
+      bool newOnTop = true;
+      bool newBecomesMaster = false;
+      MasterPosition position = MasterPosition::Left;
+      bool operator==(const Master&) const = default;
+    } master;
+    struct Stacking {
+      bool dropZones = true;
+      double defaultWidthFraction = 0.6;
+      double defaultHeightFraction = 0.6;
+      int cascadeStep = 0;
+      bool operator==(const Stacking&) const = default;
+    } stacking;
+    struct Tabs {
+      ColumnDisplay defaultDisplay = ColumnDisplay::Normal;
+      NewTabPosition newTabPosition = NewTabPosition::End;
+      bool wrapFocus = true;
+      bool scrollSwitchesTabs = true;
+      bool middleClickCloses = false;
+      // Derived from [appearance.tab_bar]; set by resolve function. The bar's space is part of the layout.
+      int barHeight = 24;
+      // [appearance.tab_bar] gap, or the layout gap when that is -1.
+      int barGap = 8;
+      TabBarPosition barPosition = TabBarPosition::Top;
+      bool hideWhenSingle = false;
+      // Whether bars are drawn unless a group says otherwise.
+      bool barVisible = true;
+      bool operator==(const Tabs&) const = default;
+    } tabs;
+    // Derived from gap + appearance border widths; set by resolve function.
+    int totalGap = 0; // gap + 2 * totalBorderWidth
+    int edgePad = 0;  // gap + totalBorderWidth
+    bool operator==(const ResolvedLayoutConfig&) const = default;
+  };
+
+  // Resolved workspace entry for a specific output. Anonymous entries use
+  // their current one-based position as the protocol label; `named` keeps an
+  // explicit configured name stable across inventory reconciliation.
+  struct ResolvedWorkspace {
+    std::string name;
+    bool named = false;
+    ResolvedLayoutConfig layout;
+    bool operator==(const ResolvedWorkspace&) const = default;
+  };
+  struct ResolvedWorkspaceSet {
+    bool dynamic = false;
+    size_t omittedNamed = 0;
+    std::vector<ResolvedWorkspace> workspaces;
+    bool operator==(const ResolvedWorkspaceSet&) const = default;
+  };
+  enum class VrrMode {
+    Disabled,
+    Always,
+    Fullscreen,
+  };
+
+  // Whether a keyboard layout change applies to the whole session or only to the
+  // surface that was focused when it happened.
+  enum class TrackLayout : uint8_t {
+    Global,
+    Window,
+  };
+
+  // How a touchpad device turns motion into scroll events: two fingers anywhere on the surface, or along
+  // its edges. `none` disables scrolling. Device support varies; unset keeps the device's libinput default.
+  enum class ScrollMethod : uint8_t {
+    TwoFinger,
+    Edge,
+    None,
+  };
+
+  // How a touchpad turns a physical press into a button: soft button areas along
+  // the bottom edge, or the finger count at press time.
+  enum class ClickMethod : uint8_t {
+    ButtonAreas,
+    ClickFinger,
+  };
+
+  // Which buttons one-, two-, and three-finger taps produce.
+  enum class TapButtonMap : uint8_t {
+    LeftRightMiddle,
+    LeftMiddleRight,
+  };
+
+  enum class DragLock : uint8_t {
+    Off,
+    Timeout,
+    Sticky,
+  };
+
+  enum class WindowDragToggle : uint8_t {
+    None,
+    Floating,
+    Pinned,
+  };
+
+  // What a second Mod+right-click on the same window does; "none" disables the
+  // gesture and keeps the button a pure resize drag.
+  enum class ModRightDoubleClick : uint8_t {
+    None,
+    Maximize,
+  };
+
+  enum class HdrMode {
+    Off,
+    On,
+    Auto,
+    Fullscreen,
+  };
+  enum class SdrTransfer {
+    Gamma22,
+    Srgb,
+  };
+  constexpr std::string_view hdrModeName(HdrMode mode) {
+    switch (mode) {
+    case HdrMode::Off:
+      return "off";
+    case HdrMode::On:
+      return "on";
+    case HdrMode::Auto:
+      return "auto";
+    case HdrMode::Fullscreen:
+      return "fullscreen";
+    }
+    return "off";
+  }
+  constexpr bool vrrEnabled(VrrMode mode, bool fullscreen) {
+    return mode == VrrMode::Always || (mode == VrrMode::Fullscreen && fullscreen);
+  }
+  constexpr bool hdrEnabled(HdrMode mode, bool fullscreen, bool autoEligible) {
+    return mode == HdrMode::On
+        || (mode == HdrMode::Auto && autoEligible)
+        || (mode == HdrMode::Fullscreen && fullscreen);
+  }
+  constexpr bool effectiveVrrEnabled(
+      VrrMode outputMode, bool outputFullscreen, std::optional<VrrMode> windowMode, bool windowFullscreen
+  ) {
+    return windowMode ? vrrEnabled(*windowMode, windowFullscreen) : vrrEnabled(outputMode, outputFullscreen);
+  }
+  constexpr bool tearingEnabled(bool outputAllowed, std::optional<bool> windowOverride, bool clientHintAsync) {
+    return outputAllowed && windowOverride.value_or(clientHintAsync);
+  }
+  struct OutputRule {
+    std::string name;
+    // False powers the monitor off, removes it from the layout, and hides its
+    // workspaces from the desktop. Content is preserved while disabled.
+    bool enabled = true;
+    std::optional<OutputMode> mode;
+    std::optional<std::array<int, 2>> position;
+    std::optional<double> scale;
+    std::optional<int> transform;
+    VrrMode vrr = VrrMode::Disabled;
+    bool focusAtStartup = false;
+    // Global safety gate. Even a client async hint or a window-rule override
+    // cannot request tearing unless the owning output enables it.
+    bool allowTearing = false;
+    // Allow eligible fullscreen buffers to bypass composition on this output.
+    bool directScanout = true;
+    HdrMode hdr = HdrMode::Off;
+    float sdrWhite = 203.0F;
+    SdrTransfer sdrTransfer = SdrTransfer::Gamma22;
+    std::optional<std::string> screenEffect;     // "off" disables the default
+    std::optional<std::string> screenCastEffect; // "off" disables effects.screen_cast here
+    // Render bit depth for SDR output: 8 (default) or 10 for 10-bit SDR.
+    int bitDepth = 8;
+    // Explicit workspace inventory. A count creates anonymous positional
+    // members, while a string list creates named members. Omitted is dynamic.
+    using WorkspaceInventory = std::variant<size_t, std::vector<std::string>>;
+    std::optional<WorkspaceInventory> workspaces;
+    // Smallest workspace count a dynamic output keeps. Rejected alongside an
+    // explicit inventory, which already states an exact count.
+    int minWorkspaces = 1;
+    // Wrap a workspace step around the ends of the inventory instead of stopping
+    // there: workspace-next/previous and the window and column move variants that
+    // name a step.
+    bool cyclicWorkspaces = false;
+    // Direction this output's workspaces are arranged along. Scrolling layouts on
+    // it scroll perpendicular to this.
+    WorkspaceAxis workspaceAxis = WorkspaceAxis::Vertical;
+    struct Layout {
+      struct Scrolling {
+        // Initial strip-axis extent inherited by workspaces on this output.
+        std::optional<double> defaultExtentFraction;
+        bool operator==(const Scrolling&) const = default;
+      } scrolling;
+      bool operator==(const Layout&) const = default;
+    } layout;
+    bool operator==(const OutputRule&) const = default;
+  };
+
+  enum class ContentType {
+    None,
+    Photo,
+    Video,
+    Game,
+  };
+
+  constexpr std::string_view contentTypeName(ContentType type) {
+    switch (type) {
+    case ContentType::None:
+      return "none";
+    case ContentType::Photo:
+      return "photo";
+    case ContentType::Video:
+      return "video";
+    case ContentType::Game:
+      return "game";
+    }
+    return "none";
+  }
+
+  // Window state the `match.is_*` selectors test. Every field is a live
+  // property, so a change to any of them re-selects a window's rules.
+  struct WindowRuleState {
+    bool focused = false;
+    bool floating = false;
+    bool maximizedToEdges = false;
+    bool pinned = false;
+    bool scratchpad = false;
+    bool alone = false;
+    // Stricter than alone: floating windows are included.
+    bool onlyWindow = false;
+    // The client named a parent window for it.
+    bool dialog = false;
+    // A live image-copy session reads this window's capture source: a window screencast or screenshot.
+    bool castTarget = false;
+
+    bool operator==(const WindowRuleState& other) const = default;
+  };
+
+  // The alternatives of one selector, written as a single string or as an array of them; a value matches when any one
+  // of them matches it. The regexes are derived, so equality is decided by the patterns alone.
+  struct RegexPatterns {
+    std::vector<std::string> patterns;
+    std::vector<std::regex> regexes;
+
+    // Throws `std::regex_error` on a pattern that does not compile, for the caller to report.
+    RegexPatterns& add(std::string pattern) {
+      regexes.emplace_back(pattern);
+      patterns.push_back(std::move(pattern));
+      return *this;
+    }
+    // A list with no pattern, or only an empty one, places no constraint.
+    bool constrains() const {
+      return std::ranges::any_of(patterns, [](const std::string& pattern) { return !pattern.empty(); });
+    }
+    bool operator==(const RegexPatterns& other) const { return patterns == other.patterns; }
+  };
+
+  struct WindowRule {
+    RegexPatterns appIdPatterns;
+    RegexPatterns titlePatterns;
+    RegexPatterns xdgTagPatterns;
+    std::optional<ContentType> matchContentType;
+    std::optional<bool> matchFocused;
+    std::optional<bool> matchFloating;
+    std::optional<bool> matchMaximizedToEdges;
+    std::optional<bool> matchPinned;
+    std::optional<bool> matchScratchpad;
+    std::optional<bool> matchAlone;
+    std::optional<bool> matchOnlyWindow;
+    std::optional<bool> matchDialog;
+    std::optional<bool> matchCastTarget;
+    std::optional<bool> matchAtStartup;
+    std::optional<std::string> defaultOutput;
+    std::optional<bool> defaultFloating;
+    std::optional<int> defaultFloatingWidthPx;
+    std::optional<int> defaultFloatingHeightPx;
+    std::optional<double> defaultFloatingWidth;
+    std::optional<double> defaultFloatingHeight;
+    std::optional<WindowPosition> defaultPosition;
+    std::optional<int> defaultScrollingExtentPx;
+    std::optional<double> defaultScrollingExtent;
+    std::optional<WorkspaceReference> defaultWorkspace;
+    std::optional<std::string> defaultScratchpad;
+    std::optional<std::string> defaultScrollingColumn;
+    std::optional<int> defaultScrollingColumnOrder;
+    std::optional<ColumnDisplay> defaultColumnDisplay;
+    std::optional<bool> defaultFullscreen;
+    std::optional<bool> defaultMaximizeToEdges;
+    std::optional<bool> defaultMaximize;
+    std::optional<bool> defaultFocused;
+    std::optional<bool> defaultPinned;
+    std::optional<bool> focusOnActivate;
+    // Lets a modal dialog hang on its parent's frame (true, the default) or opens it as an ordinary window (false).
+    std::optional<bool> attachToParent;
+    std::optional<bool> confinePointer;
+    // Whether matching windows may activate client-requested keyboard shortcut inhibition (true by default).
+    std::optional<bool> allowShortcutsInhibit;
+    // Keep a hidden window unsuspended and pace its frame callbacks at its output's refresh rate, for clients whose
+    // non-rendering work stalls without them.
+    std::optional<bool> backgroundRender;
+    std::optional<bool> blockCapture;
+    std::optional<VrrMode> vrr;
+    // Overrides the client's tearing-control hint. Omitted follows the hint,
+    // true forces async preference, and false vetoes it.
+    std::optional<bool> allowTearing;
+    std::optional<HdrMode> hdr;
+    std::optional<double> opacity; // 0.0-1.0
+    std::optional<bool> blur;
+    std::optional<bool> blurPopups;
+    std::optional<double> blurIgnoreAlpha;
+    std::optional<bool> blurOptimized;
+    // Scales the global blur radius for this rule, from 0 (no blur) to 1 (the full global radius).
+    std::optional<double> blurStrength;
+    std::optional<TitleBarMode> titleBar;
+    // Overrides [appearance.title_bar] buttons, read from the title outward.
+    std::optional<std::vector<TitleBarButton>> titleBarButtons;
+    // Overrides [colors.border] for windows this rule matches.
+    std::optional<std::array<float, 4>> borderColorFocused;
+    std::optional<std::array<float, 4>> borderColorUnfocused;
+    std::optional<std::array<float, 4>> borderColorOuter;
+    // Override [appearance] border_width, outer_border_width, corner_radius, and shadow.enabled for windows this rule
+    // matches.
+    std::optional<int> borderWidth;
+    std::optional<int> outerBorderWidth;
+    std::optional<int> cornerRadius;
+    std::optional<bool> shadow;
+    // Override [effects] border and window for windows this rule matches; "off" disables the default.
+    std::optional<std::string> borderEffect;
+    std::optional<std::string> windowEffect;
+
+    // See RegexPatterns: the regexes are derived from the patterns, so equality compares the patterns alone.
+    bool operator==(const WindowRule& other) const {
+      return appIdPatterns == other.appIdPatterns
+          && titlePatterns == other.titlePatterns
+          && xdgTagPatterns == other.xdgTagPatterns
+          && matchContentType == other.matchContentType
+          && matchFocused == other.matchFocused
+          && matchFloating == other.matchFloating
+          && matchMaximizedToEdges == other.matchMaximizedToEdges
+          && matchPinned == other.matchPinned
+          && matchScratchpad == other.matchScratchpad
+          && matchAlone == other.matchAlone
+          && matchOnlyWindow == other.matchOnlyWindow
+          && matchDialog == other.matchDialog
+          && matchCastTarget == other.matchCastTarget
+          && matchAtStartup == other.matchAtStartup
+          && defaultOutput == other.defaultOutput
+          && defaultFloating == other.defaultFloating
+          && defaultFloatingWidthPx == other.defaultFloatingWidthPx
+          && defaultFloatingHeightPx == other.defaultFloatingHeightPx
+          && defaultFloatingWidth == other.defaultFloatingWidth
+          && defaultFloatingHeight == other.defaultFloatingHeight
+          && defaultPosition == other.defaultPosition
+          && defaultScrollingExtentPx == other.defaultScrollingExtentPx
+          && defaultScrollingExtent == other.defaultScrollingExtent
+          && defaultWorkspace == other.defaultWorkspace
+          && defaultScratchpad == other.defaultScratchpad
+          && defaultScrollingColumn == other.defaultScrollingColumn
+          && defaultScrollingColumnOrder == other.defaultScrollingColumnOrder
+          && defaultColumnDisplay == other.defaultColumnDisplay
+          && defaultFullscreen == other.defaultFullscreen
+          && defaultMaximizeToEdges == other.defaultMaximizeToEdges
+          && defaultMaximize == other.defaultMaximize
+          && defaultFocused == other.defaultFocused
+          && defaultPinned == other.defaultPinned
+          && focusOnActivate == other.focusOnActivate
+          && attachToParent == other.attachToParent
+          && confinePointer == other.confinePointer
+          && allowShortcutsInhibit == other.allowShortcutsInhibit
+          && backgroundRender == other.backgroundRender
+          && blockCapture == other.blockCapture
+          && vrr == other.vrr
+          && allowTearing == other.allowTearing
+          && hdr == other.hdr
+          && opacity == other.opacity
+          && blur == other.blur
+          && blurPopups == other.blurPopups
+          && blurIgnoreAlpha == other.blurIgnoreAlpha
+          && blurOptimized == other.blurOptimized
+          && blurStrength == other.blurStrength
+          && titleBar == other.titleBar
+          && titleBarButtons == other.titleBarButtons
+          && borderColorFocused == other.borderColorFocused
+          && borderColorUnfocused == other.borderColorUnfocused
+          && borderColorOuter == other.borderColorOuter
+          && borderWidth == other.borderWidth
+          && outerBorderWidth == other.outerBorderWidth
+          && cornerRadius == other.cornerRadius
+          && shadow == other.shadow
+          && borderEffect == other.borderEffect
+          && windowEffect == other.windowEffect;
+    }
+  };
+
+  // Resolved result: merge of all matching rules (last writer wins per field).
+  struct ResolvedWindowRule {
+    std::optional<std::string> defaultOutput;
+    std::optional<bool> defaultFloating;
+    std::optional<int> defaultFloatingWidthPx;
+    std::optional<int> defaultFloatingHeightPx;
+    std::optional<double> defaultFloatingWidth;
+    std::optional<double> defaultFloatingHeight;
+    std::optional<WindowPosition> defaultPosition;
+    std::optional<int> defaultScrollingExtentPx;
+    std::optional<double> defaultScrollingExtent;
+    std::optional<WorkspaceReference> defaultWorkspace;
+    std::optional<std::string> defaultScratchpad;
+    std::optional<std::string> defaultScrollingColumn;
+    std::optional<int> defaultScrollingColumnOrder;
+    std::optional<ColumnDisplay> defaultColumnDisplay;
+    std::optional<bool> defaultFullscreen;
+    std::optional<bool> defaultMaximizeToEdges;
+    std::optional<bool> defaultMaximize;
+    std::optional<bool> defaultFocused;
+    std::optional<bool> defaultPinned;
+    std::optional<bool> focusOnActivate;
+    std::optional<bool> attachToParent;
+    std::optional<bool> confinePointer;
+    std::optional<bool> allowShortcutsInhibit;
+    std::optional<bool> backgroundRender;
+    std::optional<bool> blockCapture;
+    std::optional<VrrMode> vrr;
+    std::optional<bool> allowTearing;
+    std::optional<HdrMode> hdr;
+    std::optional<double> opacity;
+    std::optional<bool> blur;
+    std::optional<bool> blurPopups;
+    std::optional<double> blurIgnoreAlpha;
+    std::optional<bool> blurOptimized;
+    std::optional<double> blurStrength;
+    std::optional<TitleBarMode> titleBar;
+    std::optional<std::vector<TitleBarButton>> titleBarButtons;
+    std::optional<std::array<float, 4>> borderColorFocused;
+    std::optional<std::array<float, 4>> borderColorUnfocused;
+    std::optional<std::array<float, 4>> borderColorOuter;
+    std::optional<int> borderWidth;
+    std::optional<int> outerBorderWidth;
+    std::optional<int> cornerRadius;
+    std::optional<bool> shadow;
+    std::optional<std::string> borderEffect;
+    std::optional<std::string> windowEffect;
+    bool operator==(const ResolvedWindowRule&) const = default;
+  };
+
+  // The layer-shell layers a `[[layer_rule]]` can select with `match.layer`.
+  enum class LayerShellLayer {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
+  };
+
+  struct LayerRule {
+    RegexPatterns namespacePatterns;
+    std::optional<LayerShellLayer> matchLayer;
+    std::optional<bool> matchAtStartup;
+    std::optional<bool> blur;
+    std::optional<bool> blurPopups;
+    std::optional<double> ignoreAlpha;
+    std::optional<bool> optimized;
+    std::optional<double> strength;
+
+    // See WindowRule: the regexes are derived from the patterns.
+    bool operator==(const LayerRule& other) const {
+      return namespacePatterns == other.namespacePatterns
+          && matchLayer == other.matchLayer
+          && matchAtStartup == other.matchAtStartup
+          && blur == other.blur
+          && blurPopups == other.blurPopups
+          && ignoreAlpha == other.ignoreAlpha
+          && optimized == other.optimized
+          && strength == other.strength;
+    }
+  };
+
+  struct ResolvedLayerRule {
+    std::optional<bool> blur;
+    std::optional<bool> blurPopups;
+    std::optional<double> ignoreAlpha;
+    std::optional<bool> optimized;
+    std::optional<double> strength;
+    bool operator==(const ResolvedLayerRule&) const = default;
+  };
+
+  // Grants extra globals to security-context clients whose metadata matches.
+  // Additive only: the base allowed set cannot be narrowed from configuration.
+  struct SecurityContextRule {
+    RegexPatterns sandboxEnginePatterns;
+    RegexPatterns appIdPatterns;
+    std::vector<std::string> allowGlobals;
+
+    // See WindowRule: the regexes are derived from the patterns.
+    bool operator==(const SecurityContextRule& other) const {
+      return sandboxEnginePatterns == other.sandboxEnginePatterns
+          && appIdPatterns == other.appIdPatterns
+          && allowGlobals == other.allowGlobals;
+    }
+  };
+
+  struct Config {
+    // Every color Umbriel draws, each an independent literal. `background`
+    // through `error` are the palette Umbriel's own panels paint with: the
+    // cheatsheet, the diagnostics banner, the quit confirmation, and overview
+    // badge text.
+    struct Colors {
+      struct TitleBar {
+        std::array<float, 4> background{0.1607843F, 0.1607843F, 0.2F, 1.0F};
+        std::array<float, 4> backgroundUnfocused{0.1019608F, 0.1019608F, 0.1215686F, 1.0F};
+        std::array<float, 4> text{0.9098039F, 0.9098039F, 0.9176471F, 1.0F};
+        std::array<float, 4> textUnfocused{0.5411765F, 0.5411765F, 0.5725490F, 1.0F};
+        std::array<float, 4> close{1.0F, 0.4196078F, 0.4196078F, 1.0F};
+        std::array<float, 4> closeGlyph{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        std::array<float, 4> closeGlyphHover{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        std::array<float, 4> maximize{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+        std::array<float, 4> maximizeGlyph{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        std::array<float, 4> maximizeGlyphHover{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        std::array<float, 4> minimize{1.0F, 0.8196078F, 0.4F, 1.0F};
+        std::array<float, 4> minimizeGlyph{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        std::array<float, 4> minimizeGlyphHover{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        bool operator==(const TitleBar&) const = default;
+      } titleBar;
+      std::array<float, 4> background{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+      std::array<float, 4> textPrimary{0.9098039F, 0.9098039F, 0.9176471F, 1.0F};
+      std::array<float, 4> textMuted{0.5411765F, 0.5411765F, 0.5725490F, 1.0F};
+      std::array<float, 4> accentPrimary{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+      std::array<float, 4> accentSecondary{0.9607843F, 0.7882353F, 0.4196078F, 1.0F};
+      std::array<float, 4> warning{0.9607843F, 0.7882353F, 0.4196078F, 1.0F};
+      std::array<float, 4> error{1.0F, 0.4196078F, 0.4196078F, 1.0F};
+      // Drop-target preview during a drag.
+      std::array<float, 4> insertHint{0.4980392F, 0.7843137F, 1.0F, 0.5019608F};
+      // Fullscreen gaps and the lock screen.
+      std::array<float, 4> backdrop{0.0F, 0.0F, 0.0F, 1.0F};
+      std::array<float, 4> shadow{0.0F, 0.0F, 0.0F, 0.4980392F};
+
+      struct Border {
+        std::array<float, 4> focused{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+        std::array<float, 4> unfocused{0.1607843F, 0.1607843F, 0.2F, 1.0F};
+        // No focus variant.
+        std::array<float, 4> outer{0.1019608F, 0.1019608F, 0.1215686F, 1.0F};
+        bool operator==(const Border&) const = default;
+      } border;
+
+      struct Overview {
+        // Composited over the desktop background while the overview is visible.
+        std::array<float, 4> backgroundTint{0.0627451F, 0.0627451F, 0.0784314F, 0.1882353F};
+        // Rounded background behind each workspace; alpha controls opacity.
+        std::array<float, 4> workspaceBackground{0.0F, 0.0F, 0.0F, 0.2666667F};
+        std::array<float, 4> badge{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+        bool operator==(const Overview&) const = default;
+      } overview;
+
+      struct TabBar {
+        // Every tab that is neither shown nor urgent.
+        std::array<float, 4> background{0.1019608F, 0.1019608F, 0.1215686F, 1.0F};
+        std::array<float, 4> text{0.5411765F, 0.5411765F, 0.5725490F, 1.0F};
+        // The shown tab of the focused column.
+        std::array<float, 4> active{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+        std::array<float, 4> activeText{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        // The shown tab of any other column.
+        std::array<float, 4> activeUnfocused{0.1607843F, 0.1607843F, 0.2F, 1.0F};
+        std::array<float, 4> activeUnfocusedText{0.9098039F, 0.9098039F, 0.9176471F, 1.0F};
+        // A hidden tab whose window asks for attention.
+        std::array<float, 4> urgent{1.0F, 0.4196078F, 0.4196078F, 1.0F};
+        std::array<float, 4> urgentText{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
+        bool operator==(const TabBar&) const = default;
+      } tabBar;
+
+      bool operator==(const Colors&) const = default;
+    } colors;
+
+    struct Appearance {
+      struct TitleBar {
+        TitleBarMode mode = TitleBarMode::Off;
+        // Draw the bar over the content and show it only while the mod key is held.
+        bool overlay = false;
+        int height = 28;
+        std::string font = "sans 10";
+        TitleBarButtonSide buttonPosition = TitleBarButtonSide::Right;
+        int buttonCornerRadius = -1;
+        TitleBarButtonGlyph buttonGlyph = TitleBarButtonGlyph::Hover;
+        bool buttonBackground = true;
+        // Read from the title outward: the last one sits at the bar's edge.
+        std::vector<TitleBarButton> buttons{TitleBarButton::Minimize, TitleBarButton::Maximize, TitleBarButton::Close};
+        bool operator==(const TitleBar&) const = default;
+      } titleBar;
+      int borderWidth = 2;
+      int outerBorderWidth = 0;
+      int cornerRadius = 10;
+      double dragOpacity = 0.75;
+      // Fullscreen windows ignore window rule opacity and draw over the backdrop. When false, a fullscreen window with
+      // rule or client transparency shows the desktop instead.
+      bool opaqueFullscreen = true;
+      struct Blur {
+        bool enabled = true;
+        bool optimized = true;
+        int passes = 2;
+        int radius = 5;
+        double noise = 0.02;
+        double brightness = 0.9;
+        double contrast = 0.9;
+        double saturation = 1.1;
+        bool operator==(const Blur&) const = default;
+      } blur;
+      struct Shadow {
+        bool enabled = true;
+        int softness = 10;
+        int offsetX = 2;
+        int offsetY = 2;
+        bool operator==(const Shadow&) const = default;
+      } shadow;
+      // The strip a tabbed column draws across one edge.
+      struct TabBar {
+        // Titles shows each tab's title in its slot; indicator draws the slots alone, as a thin strip.
+        TabBarLook style = TabBarLook::Titles;
+        TabBarPosition position = TabBarPosition::Top;
+        // Thickness: the bar's height on the top or bottom edge, its width on the left or right.
+        int height = 24;
+        // A Pango font description.
+        std::string font = "sans 10";
+        // Space a title keeps from either end of its slot.
+        int padding = 8;
+        // Space between neighbouring slots.
+        int tabGap = 2;
+        // Space between the bar and its window; -1 follows the layout gap.
+        int gap = -1;
+        // -1 follows corner_radius.
+        int cornerRadius = -1;
+        // {title}, {app_id} and {index} are replaced; a window without a title shows its app id instead.
+        std::string titleFormat = "{title}";
+        TitleAlign titleAlign = TitleAlign::Center;
+        // A tabbed column of one window draws no bar and gives up its space.
+        bool hideWhenSingle = false;
+        // False draws no bar for any tab group the user has not shown one for; the tabs keep working, and take its
+        // space.
+        bool visible = true;
+        // Slots the bar shows at once; 0 shows every tab.
+        int maxTabs = 0;
+        TabOverflow overflow = TabOverflow::Scroll;
+        bool operator==(const TabBar&) const = default;
+      } tabBar;
+      bool preferNoCsd = true;
+
+      int totalBorderWidth() const { return borderWidth + outerBorderWidth; }
+      bool operator==(const Appearance&) const = default;
+    } appearance;
+
+    struct Animation {
+      bool enabled = true;
+      int durationMs = 250;
+      // Multiplicador de velocidad de todas las transiciones. Los tiempos se
+      // dividen y las resortes se aceleran con stiffness × speed², de modo que
+      // la forma (damping) no cambia. La shell lo escribe en [animation].
+      double speed = 1.0;
+      AnimationCurve curve{.easing = Easing::EaseOutCubic};
+      std::map<std::string, BezierCurve> beziers;
+      std::map<std::string, SpringConfig> springs;
+
+      struct WindowsIn {
+        std::string effect;
+        bool enabled = true;
+        // Springs derive their own length; duration_ms stays at the shared value for a duration-based curve.
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        std::string style = "popin";
+        double scale = 0.5;
+        bool operator==(const WindowsIn&) const = default;
+      } windowsIn;
+
+      struct WindowsOut {
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 1400.0}};
+        std::string style = "popin";
+        double scale = 0.8;
+        bool operator==(const WindowsOut&) const = default;
+      } windowsOut;
+
+      struct WindowsMove {
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
+        bool operator==(const WindowsMove&) const = default;
+      } windowsMove;
+
+      // The size half of a tiled window's layout change; windows_move keeps the position.
+      struct WindowsResize {
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        bool operator==(const WindowsResize&) const = default;
+      } windowsResize;
+
+      struct Workspaces {
+        std::string style = "slide";
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
+        bool operator==(const Workspaces&) const = default;
+      } workspaces;
+
+      struct Overview {
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
+        // Filmstrip movement between workspace previews, for the wheel, the keyboard and touchpad releases alike. A
+        // spring curve settles from the current position and carries the release velocity of a gesture; any other
+        // curve runs over duration_ms and ignores it.
+        AnimationCurve workspaceCurve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 1000.0}};
+        bool operator==(const Overview&) const = default;
+      } overview;
+
+      struct Scratchpad {
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
+        double dim = 0.8;
+        bool blur = false;
+        bool operator==(const Scratchpad&) const = default;
+      } scratchpad;
+
+      // The shade over a window while a modal dialog is attached to it. `dim` stays without the fade when disabled.
+      struct Dialogs {
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::EaseOutCubic};
+        double dim = 0.3;
+        bool operator==(const Dialogs&) const = default;
+      } dialogs;
+
+      struct Border {
+        std::string effect;
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        bool operator==(const Border&) const = default;
+      } border;
+
+      struct WindowsOpacity {
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        bool operator==(const WindowsOpacity&) const = default;
+      } windowsOpacity;
+
+      struct DimUnfocused {
+        std::string effect;
+        bool enabled = false;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::EaseOutCubic};
+        double dim = 0.0;
+        bool operator==(const DimUnfocused&) const = default;
+      } dimUnfocused;
+
+      struct Layers {
+        std::string effect;
+        bool enabled = false;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::EaseOutCubic};
+        bool operator==(const Layers&) const = default;
+      } layers;
+
+      struct WindowsDrag {
+        // Deform the window like an elastic sheet while it is dragged by the pointer.
+        bool physics = false;
+        // Spring sheet tuning (see view/drag_physics.h); the defaults are the
+        // values the simulation shipped with.
+        double stiffness = 36.0;
+        double damping = 6.5;
+        double coupling = 100.0;
+        double pointerResponse = 2.0;
+        double maxDisplacementPx = 200.0;
+        double settleAfterPauseS = 0.25;
+        bool operator==(const WindowsDrag&) const = default;
+      } windowsDrag;
+
+      // The preset an event names through `effect =` and whether the event is enabled. `effect` is null for slots
+      // without a config event.
+      struct EventEffect {
+        const std::string* effect = nullptr;
+        bool enabled = false;
+      };
+      EventEffect eventEffect(AnimationEvent event) const {
+        switch (event) {
+        case AnimationEvent::WindowsIn:
+          return {&windowsIn.effect, windowsIn.enabled};
+        case AnimationEvent::WindowsOut:
+          return {&windowsOut.effect, windowsOut.enabled};
+        case AnimationEvent::WindowsMove:
+          return {&windowsMove.effect, windowsMove.enabled};
+        case AnimationEvent::Workspaces:
+          return {&workspaces.effect, workspaces.enabled};
+        case AnimationEvent::Overview:
+          return {&overview.effect, overview.enabled};
+        case AnimationEvent::Scratchpad:
+          return {&scratchpad.effect, scratchpad.enabled};
+        case AnimationEvent::Border:
+          return {&border.effect, border.enabled};
+        case AnimationEvent::DimUnfocused:
+          return {&dimUnfocused.effect, dimUnfocused.enabled};
+        case AnimationEvent::Layers:
+          return {&layers.effect, layers.enabled};
+        case AnimationEvent::Window:
+        case AnimationEvent::Overlay:
+        case AnimationEvent::BorderEffect:
+        case AnimationEvent::Drag:
+          return {};
+        }
+        return {};
+      }
+
+      bool operator==(const Animation&) const = default;
+    } animation;
+    Effects effects;
+    // Whole-output color filter applied after every surface, including shell
+    // panels. brightness and extraDim multiply the image; warm shifts the white
+    // point towards amber without lifting blacks.
+    struct Display {
+      float brightness = 1.0F; // 0-1, used when DDC/CI is unavailable
+      float extraDim = 0.0F;   // 0-0.8
+      float warm = 0.0F;       // 0-1
+      bool active() const { return brightness < 0.999F || extraDim > 0.001F || warm > 0.001F; }
+      bool operator==(const Display&) const = default;
+    } display;
+
+    struct Overview {
+      // Workspace scale when fully zoomed out.
+      double zoom = 0.5;
+      // Touchpad travel and wheel accumulation in the overview, by the physical direction of the movement rather
+      // than the output's workspace axis. Independent of an input device's own scroll_factor.
+      double scrollFactorHorizontal = 1.0;
+      double scrollFactorVertical = 1.0;
+      // Blur the wallpaper behind the filmstrip while the overview is visible. Uses [appearance.blur] parameters;
+      // inert when appearance blur is disabled.
+      bool backgroundBlur = true;
+      // Mirror the output's background- and bottom-layer surfaces inside every workspace preview instead of the flat
+      // colors.overview.workspace_background fill. The real bottom layer is hidden while the overview is open, so a
+      // surface there appears once per workspace rather than twice at two scales.
+      bool workspaceWallpaper = true;
+      // Keyboard shortcut badges on overview cards. Pressing a badge key focuses
+      // that window and closes the overview.
+      bool shortcuts = true;
+      // Favorite badge keys in preference order, one ASCII character each.
+      std::string shortcutKeys = "1234567890";
+      bool operator==(const Overview&) const = default;
+    } overview;
+
+    struct HotCorner {
+      bool enabled = false;
+      int delayMs = 500;
+      std::optional<Keybind> action;
+      bool operator==(const HotCorner&) const = default;
+    };
+
+    struct HotCorners {
+      // Corners are ordered top-left, top-right, bottom-left, bottom-right.
+      std::array<HotCorner, 4> corners;
+      bool operator==(const HotCorners&) const = default;
+    } hotCorners;
+
+    struct Layout {
+      LayoutMode mode = LayoutMode::Scrolling;
+      int gap = 8;
+      LayoutStruts struts;
+      std::vector<double> extentPresets{1.0 / 3, 0.5, 2.0 / 3};
+      FullscreenExitScope newExitsFullscreen = FullscreenExitScope::None;
+      ClientMaximize clientMaximize = ClientMaximize::Column;
+      struct Scrolling {
+        std::optional<double> defaultExtentFraction;
+        bool centerUnderfullStrip = true;
+        CenterFocusedColumn centerFocused = CenterFocusedColumn::Never;
+        // Center the column picked in the overview on close, like column-center, whatever centerFocused says.
+        bool centerOnOverviewSelect = false;
+        bool operator==(const Scrolling&) const = default;
+      } scrolling;
+      struct Dwindle {
+        bool preserveSplit = false;
+        bool newTowardCursor = false;
+        bool operator==(const Dwindle&) const = default;
+      } dwindle;
+      struct Master {
+        double defaultWidthFraction = 0.55;
+        bool newOnTop = true;
+        bool newBecomesMaster = false;
+        MasterPosition position = MasterPosition::Left;
+        bool operator==(const Master&) const = default;
+      } master;
+      struct Stacking {
+        bool dropZones = true;
+        // Size a window lands on in its first floating episode, whether it
+        // opens directly in stacking or leaves tiling for floating, as a
+        // fraction of the usable area. A window that already floated keeps its
+        // remembered (possibly resized) box instead.
+        double defaultWidthFraction = 0.6;
+        double defaultHeightFraction = 0.6;
+        // Diagonal offset between cascaded floating windows. Zero derives it
+        // from the title bar so each title stays reachable.
+        int cascadeStep = 0;
+        bool operator==(const Stacking&) const = default;
+      } stacking;
+      struct Tabs {
+        ColumnDisplay defaultDisplay = ColumnDisplay::Normal;
+        NewTabPosition newTabPosition = NewTabPosition::End;
+        bool wrapFocus = true;
+        bool scrollSwitchesTabs = true;
+        bool middleClickCloses = false;
+        bool operator==(const Tabs&) const = default;
+      } tabs;
+      bool operator==(const Layout&) const = default;
+    } layout;
+
+    // Clear `layout.gap` outside decoration edges: borders are drawn outside the
+    // surface, so tile spacing and usable-area insets include total border width.
+    int layoutGap() const { return layout.gap + 2 * appearance.totalBorderWidth(); }
+    int layoutEdgePad() const { return layout.gap + appearance.totalBorderWidth(); }
+
+    struct Workspaces {
+      // Re-selecting the active workspace jumps back to the previous one.
+      bool backAndForth = false;
+      bool emptyAbove = false;
+      bool operator==(const Workspaces&) const = default;
+    } workspaces;
+
+    struct ScreenCast {
+      // Allow target-changing actions immediately. By default, the first such
+      // action during a share requires explicit confirmation.
+      bool disableDynamicConfirmation = false;
+      bool operator==(const ScreenCast&) const = default;
+    } screenCast;
+
+    struct General {
+      std::vector<std::string> autostart;
+      // Symbolic `Mod` in keybinds. Unset preserves the runtime default:
+      // Super on DRM, Alt when running nested.
+      std::optional<ModifierKey> modKey;
+      // Start wlroots' Xwayland server (lazily) for X11 app support. Requires restart.
+      bool xwayland = true;
+      // Present outputs to X11 clients at their physical resolution, so they render at native size instead of being
+      // upscaled on scaled outputs. Requires restart.
+      bool xwaylandNativeResolution = false;
+      // Run an XSETTINGS manager in Xwayland that announces the X screen scale and cursor theme. Requires restart.
+      bool xwaylandXsettings = true;
+      // Connector or monitor identity to publish as the X11 primary. Empty leaves RandR unmanaged.
+      std::string xwaylandPrimaryOutput;
+      // Wait for composed NVIDIA output frames when no explicit synchronization timeline is available.
+      bool nvidiaSyncWorkaround = true;
+      // Show the keybinds cheatsheet overlay on startup.
+      bool showCheatsheet = true;
+      // Honor activation requests by focusing and revealing the target window.
+      bool focusOnActivate = false;
+      // Hang a modal dialog on its parent's frame, so it follows the parent and holds its input.
+      bool attachModalDialogs = true;
+      // Honor maximized state restored by a client while its window opens.
+      bool honorRestoredMaximize = false;
+      bool operator==(const General&) const = default;
+    } general;
+
+    struct Drm {
+      // Absolute card or render-node paths. Either node excludes the whole GPU.
+      std::vector<std::string> ignoredDevices;
+      // Canonical PCI domain:bus:slot.function addresses.
+      std::vector<std::string> ignoredPciAddresses;
+
+      bool configured() const { return !ignoredDevices.empty() || !ignoredPciAddresses.empty(); }
+      bool operator==(const Drm&) const = default;
+    } drm;
+
+    struct Environment {
+      // Ordered NAME=value pairs exported to the compositor and the native session's systemd user manager.
+      std::vector<std::pair<std::string, std::string>> variables;
+      bool operator==(const Environment&) const = default;
+    } environment;
+
+    struct Events {
+      std::string lidClose;
+      std::string lidOpen;
+      bool operator==(const Events&) const = default;
+    } events;
+
+    struct Input {
+      // How long Mod must be held before the desktop treats it as a hold
+      // (window-management mode) instead of a tap (launcher). A short tap
+      // never dims content or releases a game's pointer.
+      int modHoldDelayMs = 320;
+      // Advertise and accept the primary-selection clipboard used for
+      // middle-click paste.
+      bool middleClickPaste = true;
+      // Let a client start an interactive move from its own drag area
+      // (xdg_toplevel.move), such as a CSD title bar or Chromium tab strip.
+      bool clientWindowDrag = true;
+      // Retarget an interactive window drag with the free mouse button: float
+      // it, pin it, or leave the drag alone.
+      WindowDragToggle windowDragToggle = WindowDragToggle::None;
+      // What a second Mod+right-click on the same window within the
+      // double-click window does. "none" keeps Mod+right-click a pure resize
+      // drag.
+      ModRightDoubleClick modRightDoubleClick = ModRightDoubleClick::None;
+
+      struct Keyboard {
+        // Comma-separated XKB layout list ("us,de"); the first entry is active at startup. `options` carries XKB option
+        // names such as `grp:alt_shift_toggle`, which is what makes a second layout reachable from the keyboard itself
+        // rather than only through the `keyboard-layout-next` action.
+        std::string layout;
+        std::string variant;
+        std::string options;
+        std::string model;
+        int repeatRate = 25;
+        int repeatDelay = 600;
+        bool numlockToggle = false;
+        // Global by default: the layout is one session-wide setting, which is the
+        // behaviour every existing config already relies on.
+        TrackLayout trackLayout = TrackLayout::Global;
+        bool operator==(const Keyboard&) const = default;
+      } keyboard;
+
+      struct Touchpad {
+        bool enabled = true;
+        std::optional<bool> tap = true;
+        std::optional<bool> tapAndDrag;
+        std::optional<DragLock> dragLock;
+        std::optional<bool> naturalScroll;
+        std::optional<bool> leftHanded;
+        std::optional<AccelProfile> accelProfile;
+        std::optional<double> sensitivity;
+        // Touchpad scroll speed multiplier. `scroll_factor` is either one number
+        // for both axes or a table with per-axis `horizontal`/`vertical` overrides.
+        // A missing axis, or the whole key absent, stays at identity 1.0. Only the
+        // continuous two-finger delta is scaled, never the discrete notches.
+        struct ScrollFactor {
+          std::optional<double> horizontal = std::nullopt;
+          std::optional<double> vertical = std::nullopt;
+          bool operator==(const ScrollFactor&) const = default;
+        };
+        std::optional<ScrollFactor> scrollFactor;
+        std::optional<bool> disableWhileTyping;
+        std::optional<bool> disableOnExternalMouse;
+        std::optional<ScrollMethod> scrollMethod;
+        std::optional<ClickMethod> clickMethod;
+        std::optional<TapButtonMap> tapButtonMap;
+        bool operator==(const Touchpad&) const = default;
+      } touchpad;
+
+      struct Mouse {
+        std::optional<bool> naturalScroll;
+        std::optional<bool> leftHanded;
+        std::optional<AccelProfile> accelProfile;
+        // Evdev BTN_* code libinput turns into a scroll modifier: holding it makes pointer motion scroll instead of
+        // clicking. Unset leaves the device's libinput default alone.
+        std::optional<uint32_t> scrollButton;
+        // One press latches scrolling on, the next releases it, instead of requiring a hold.
+        std::optional<bool> scrollButtonLock;
+        double sensitivity = 0.0;
+        int scrollWheelStep = 60;
+        bool operator==(const Mouse&) const = default;
+      } mouse;
+
+      struct Cursor {
+        std::string theme;
+        int size = 24;
+        bool hardwareCursor = true;
+        // Warp to the window selected by explicit focus-navigation actions.
+        bool followsFocus = false;
+        bool hideWhenTyping = false;
+        // Milliseconds without pointer activity before hiding the cursor. Zero disables it.
+        int hideTimeoutMs = 0;
+        bool operator==(const Cursor&) const = default;
+      } cursor;
+
+      // Auto-scroll a scrolling layout while a data drag sits near one of its ends.
+      struct DragEdgeScroll {
+        bool enabled = true;
+        int triggerZone = 30;
+        int delayMs = 100;
+        double maxSpeed = 1500.0;
+        bool operator==(const DragEdgeScroll&) const = default;
+      } dragEdgeScroll;
+
+      struct Focus {
+        bool followsMouse = false;
+        std::optional<double> followsMouseMaxScroll;
+        // false narrows hover to focus alone: raising is left to clicks, keybinds, and activation, so sweeping the
+        // pointer across a larger window underneath cannot bury the window above it.
+        bool hoverRaises = true;
+        bool operator==(const Focus&) const = default;
+      } focus;
+
+      struct Tablet {
+        // false silences the tablet and its pads via libinput
+        bool enabled = true;
+        // empty = no static output mapping
+        std::string mapToOutput;
+        bool mapToFocusedOutput = false;
+        bool mapToFocusedWindow = false;
+        bool leftHanded = false;
+        std::optional<std::array<float, 6>> calibrationMatrix;
+        bool operator==(const Tablet&) const = default;
+      } tablet;
+
+      struct Touch {
+        bool enabled = true;
+        // empty = no static output mapping
+        std::string mapToOutput;
+        bool operator==(const Touch&) const = default;
+      } touch;
+
+      struct Device {
+        std::string name;
+        std::optional<std::string> layout;
+        std::optional<std::string> variant;
+        std::optional<std::string> options;
+        std::optional<std::string> model;
+        std::optional<int> repeatRate;
+        std::optional<int> repeatDelay;
+        std::optional<bool> enabled;
+        std::optional<bool> tap;
+        std::optional<bool> tapAndDrag;
+        std::optional<DragLock> dragLock;
+        std::optional<bool> naturalScroll;
+        std::optional<bool> leftHanded;
+        std::optional<AccelProfile> accelProfile;
+        std::optional<double> sensitivity;
+        std::optional<bool> disableWhileTyping;
+        std::optional<ScrollMethod> scrollMethod;
+        std::optional<ClickMethod> clickMethod;
+        std::optional<TapButtonMap> tapButtonMap;
+        std::optional<uint32_t> scrollButton;
+        std::optional<bool> scrollButtonLock;
+        bool operator==(const Device&) const = default;
+      };
+
+      std::vector<Device> devices;
+      const Device* findDevice(std::string_view name) const;
+      bool operator==(const Input&) const = default;
+    } input;
+
+    std::vector<Keybind> keybinds;
+    std::vector<OutputRule> outputs;
+    std::vector<WindowRule> windowRules;
+    std::vector<LayerRule> layerRules;
+    std::vector<SecurityContextRule> securityContextRules;
+    std::vector<ScratchpadConfig> scratchpads;   // [[scratchpad]] definitions
+    std::vector<WorkspaceConfig> workspaceRules; // [[workspace]] declarations and layout rules
+
+    // True when any surface may sample the cached background blur, so every
+    // output has to keep its optimized blur node alive.
+    bool optimizedBlurNeeded() const {
+      if (appearance.blur.optimized) {
+        return true;
+      }
+      for (const WindowRule& rule : windowRules) {
+        if (rule.blurOptimized.value_or(false)) {
+          return true;
+        }
+      }
+      return std::ranges::any_of(layerRules, [](const LayerRule& rule) { return rule.optimized.value_or(false); });
+    }
+
+    bool operator==(const Config&) const = default;
+  };
+
+  // Palette order shaders see through umbriel_palette_at: accent_primary, accent_secondary, warning, error.
+  inline std::array<std::array<float, 4>, 4> effectPalette(const Config::Colors& colors) {
+    return {colors.accentPrimary, colors.accentSecondary, colors.warning, colors.error};
+  }
+
+  const Config& config();
+  void loadConfig(const char* explicitPath);
+  ConfigReloadResult replaceConfig(const std::filesystem::path& explicitPath, std::string& errors);
+  ConfigReloadResult reloadConfig();
+  const std::vector<std::filesystem::path>& configWatchPaths();
+  const std::vector<ConfigDiagnostic>& configDiagnostics();
+  const std::filesystem::path& configRootPath();
+  bool configFileMissing();
+  bool configHasMissingIncludes();
+} // namespace umbriel

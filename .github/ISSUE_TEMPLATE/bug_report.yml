@@ -1,0 +1,122 @@
+name: Bug Report
+description: Report a bug, crash, or regression in Umbriel
+title: "[BUG] "
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Reports are welcome, including small or incomplete ones.
+
+        Tell us what you know and leave anything you do not have blank. Steps, logs, screenshots, and system details
+        help us investigate, but we can work from a clear description of what went wrong.
+
+        For bar, launcher, notification, or widget issues, please use
+        [noctalia](https://github.com/noctalia-dev/noctalia). For screen sharing or portal screenshots, please use
+        [xdg-desktop-portal-umbriel](https://github.com/noctalia-dev/xdg-desktop-portal-umbriel).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem in your own words.
+      placeholder: I expected ..., but instead ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we reproduce it?
+      description: If you know the steps, share them. Include any relevant keybind, command, or configuration snippet.
+      placeholder: |
+        1. Start a session with ...
+        2. Open ...
+        3. Press ...
+        4. See ...
+
+  - type: input
+    id: umbriel-version
+    attributes:
+      label: Umbriel version
+      description: Paste `umbriel --version` if you can.
+      placeholder: "umbriel 0.1.0 (c8adc515af29)"
+
+  - type: input
+    id: regression
+    attributes:
+      label: Last working version
+      description: If this used to work, name the last version or commit where it did.
+      placeholder: "Optional: v0.1.0, or commit hash"
+
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Pick the closest match if you know it.
+      options:
+        - Layout (scrolling)
+        - Layout (dwindle)
+        - Layout (master)
+        - Floating, pinned, or fullscreen windows
+        - Workspaces or scratchpad
+        - Overview
+        - Window or layer rules
+        - Input (keyboard, pointer, touch, gestures, IME)
+        - Output or display (modes, scale, hotplug, DPMS)
+        - Rendering (blur, shadows, borders, corners, animation)
+        - Xwayland or X11 applications
+        - Configuration or reload
+        - IPC or CLI
+        - Session lock, clipboard, or screen capture
+        - Startup, session, or packaging
+        - I am not sure
+        - Other
+
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: Distribution
+      description: Select the Linux distribution family, if relevant.
+      options:
+        - Arch-based
+        - Fedora-based
+        - Debian-based
+        - Gentoo-based
+        - NixOS
+        - openSUSE-based
+        - Void
+        - Other
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: System details
+      description: Include anything that might help, such as GPU and driver, wlroots version, outputs, or kernel version.
+      placeholder: |
+        GPU and driver: AMD RX 7800 XT (amdgpu)
+        wlroots: 0.20.2
+        Outputs: DP-1 3840x2160@144 scale 1.5
+        Kernel: 6.17.4
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, errors, or backtraces
+      description: |
+        If available, paste relevant output here. Useful sources include:
+        - `$XDG_CACHE_HOME/umbriel/umbriel.log` (or `~/.cache/umbriel/umbriel.log`)
+        - `journalctl --user -u umbriel.service -b` for managed systemd sessions
+        - Terminal output when running the binary directly
+
+        Large outputs can be attached as a file.
+      render: text
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
+      description: Screenshots, recordings, configuration snippets, and any other context are welcome.

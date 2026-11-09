@@ -1,0 +1,2233 @@
+#include "server/server.h"
+
+#include "config/config.h"
+#include "config/config_diag.h"
+#include "config/config_watcher.h"
+#include "config/resolve.h"
+#include "core/application_scope.h"
+#include "core/fdlimit.h"
+#include "core/log.h"
+#include "core/process.h"
+#include "core/tracy.h"
+#include "input/cursor.h"
+#include "input/eis.h"
+#include "input/gestures.h"
+#include "input/input_capture.h"
+#include "input/keyboard.h"
+#include "input/keyboard_leds.h"
+#include "input/seat.h"
+#include "input/text_input.h"
+#include "layer/layer_surface.h"
+#include "lock/session_lock.h"
+#include "output/output.h"
+#include "overview/overview.h"
+#include "scene/cheatsheet.h"
+#include "scene/color.h"
+#include "scene/config_banner.h"
+#include "scene/effect_registry.h"
+#include "scene/hint_rect.h"
+#include "scene/move_menu.h"
+#include "scene/quit_confirm.h"
+#include "server/allocator.h"
+#include "server/backend_manager.h"
+#include "server/color_manager.h"
+#include "server/drm_lease.h"
+#include "server/ipc.h"
+#include "server/syncobj_acquire_barrier.h"
+#include "server/syncobj_superseded_release.h"
+#include "server/syncobj_unmap_release.h"
+#include "view/view.h"
+#include "wlr.h"
+#include "workspace/scratchpad.h"
+#include "workspace/workspace.h"
+#include "xwayland/xwayland.h"
+
+extern "C" {
+#include <umbrielfx/render/effect.h>
+}
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <format>
+#include <optional>
+#include <ranges>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unistd.h>
+#include <vector>
+
+namespace umbriel {
+
+  namespace {
+
+    constexpr Logger kLog("server");
+    constexpr size_t kWaylandClientBufferSize = 1024 * 1024;
+    // Security-context clients only receive reviewed, ordinary application
+    // protocols. New globals stay unavailable until they are classified here.
+    // [[security_context_rule]] widens the set for matching clients.
+    constexpr std::array<std::string_view, 32> kAllowedSecurityContextGlobals{
+        "wl_shm",
+        "wl_drm",
+        "zwp_linux_dmabuf_v1",
+        "wp_linux_drm_syncobj_manager_v1",
+        "wl_compositor",
+        "wl_subcompositor",
+        "wl_data_device_manager",
+        "zwp_primary_selection_device_manager_v1",
+        "wp_viewporter",
+        "wp_fractional_scale_manager_v1",
+        "wp_presentation",
+        "wp_tearing_control_manager_v1",
+        "wp_content_type_manager_v1",
+        "wl_output",
+        "wp_color_manager_v1",
+        "xdg_wm_base",
+        "xdg_toplevel_tag_manager_v1",
+        "xdg_toplevel_drag_manager_v1",
+        "zxdg_exporter_v2",
+        "xdg_wm_dialog_v1",
+        "zxdg_decoration_manager_v1",
+        "org_kde_kwin_server_decoration_manager",
+        "zwp_relative_pointer_manager_v1",
+        "zwp_pointer_constraints_v1",
+        "zwp_pointer_gestures_v1",
+        "zwp_tablet_manager_v2",
+        "zwp_idle_inhibit_manager_v1",
+        "zwp_keyboard_shortcuts_inhibit_manager_v1",
+        "xdg_activation_v1",
+        "wl_seat",
+        "wp_cursor_shape_manager_v1",
+        "zwp_text_input_manager_v3",
+    };
+
+    bool isAllowedSecurityContextGlobal(std::string_view interface) {
+      return std::ranges::find(kAllowedSecurityContextGlobals, interface) != kAllowedSecurityContextGlobals.end();
+    }
+
+    struct ClientGlobalPolicy {
+      wl_listener destroy{};
+      bool advertiseDecorationManagers = true;
+      bool advertisePrimarySelection = true;
+      // Resolved on first use: security-context metadata is attached after the client-created signal.
+      std::optional<std::vector<std::string>> securityContextGlobals;
+    };
+
+    void onClientGlobalPolicyDestroy(wl_listener* listener, void* /*data*/) {
+      ClientGlobalPolicy* policy;
+      policy = wl_container_of(listener, policy, destroy);
+      wl_list_remove(&policy->destroy.link);
+      delete policy;
+    }
+
+    ClientGlobalPolicy* attachClientGlobalPolicy(wl_client* client) {
+      auto* policy = new ClientGlobalPolicy{};
+      policy->advertiseDecorationManagers = config().appearance.preferNoCsd;
+      policy->advertisePrimarySelection = config().input.middleClickPaste;
+      policy->destroy.notify = onClientGlobalPolicyDestroy;
+      wl_client_add_destroy_listener(client, &policy->destroy);
+      return policy;
+    }
+
+    ClientGlobalPolicy* clientGlobalPolicy(const wl_client* client) {
+      wl_listener* listener =
+          wl_client_get_destroy_listener(const_cast<wl_client*>(client), onClientGlobalPolicyDestroy);
+      if (listener == nullptr) {
+        return attachClientGlobalPolicy(const_cast<wl_client*>(client));
+      }
+      ClientGlobalPolicy* policy;
+      policy = wl_container_of(listener, policy, destroy);
+      return policy;
+    }
+
+    void onClientCreated(wl_listener* /*listener*/, void* data) {
+      attachClientGlobalPolicy(static_cast<wl_client*>(data));
+    }
+
+    bool filterGlobal(const wl_client* client, const wl_global* global, void* data) {
+      auto* server = static_cast<Server*>(data);
+      const wl_interface* interface = wl_global_get_interface(global);
+      if (interface == nullptr) {
+        return true;
+      }
+      const std::string_view interfaceName(interface->name);
+      // A global filter is consulted both when a global is advertised and when
+      // it is bound, so each client's decisions must remain stable for its
+      // entire connection.
+      ClientGlobalPolicy* policy = clientGlobalPolicy(client);
+      if (const wlr_security_context_v1_state* context = server->clientSecurityContext(client);
+          context != nullptr && !isAllowedSecurityContextGlobal(interfaceName)) {
+        // Nested contexts stay blocked unconditionally: per-app grants are only
+        // trustworthy while labels originate from unrestricted clients.
+        if (interfaceName == "wp_security_context_manager_v1") {
+          return false;
+        }
+        if (!policy->securityContextGlobals) {
+          policy->securityContextGlobals =
+              securityContextRuleGlobals(config(), context->sandbox_engine, context->app_id);
+        }
+        if (std::ranges::find(*policy->securityContextGlobals, interfaceName)
+            == policy->securityContextGlobals->end()) {
+          return false;
+        }
+      }
+      if (interfaceName == "zwp_primary_selection_device_manager_v1") {
+        return policy->advertisePrimarySelection;
+      }
+      if (interfaceName == "zxdg_decoration_manager_v1" || interfaceName == "org_kde_kwin_server_decoration_manager") {
+        return policy->advertiseDecorationManagers;
+      }
+      if (interfaceName == "zxdg_output_manager_v1" && server->xwayland() != nullptr) {
+        return server->xwayland()->advertiseOutputManager(client, global);
+      }
+      return true;
+    }
+
+    std::string shellQuote(std::string_view value) {
+      std::string quoted("'");
+      for (const char character : value) {
+        if (character == '\'') {
+          quoted += "'\\''";
+        } else {
+          quoted += character;
+        }
+      }
+      quoted += '\'';
+      return quoted;
+    }
+
+    void applyConfiguredEnvironment() {
+      for (const auto& [name, value] : config().environment.variables) {
+        if (setenv(name.c_str(), value.c_str(), 1) != 0) {
+          kLog.warn("failed to export environment variable {}", name);
+        }
+      }
+    }
+
+    std::string sessionEnvironmentCommand(bool managedReadiness) {
+      std::string configuredAssignments;
+      for (const auto& [name, value] : config().environment.variables) {
+        configuredAssignments += ' ';
+        configuredAssignments += shellQuote(std::format("{}={}", name, value));
+      }
+
+      const std::string publishConfigured =
+          configuredAssignments.empty() ? "" : " && systemctl --user set-environment" + configuredAssignments;
+      std::string command =
+          "variables='WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE "
+          "XCURSOR_THEME XCURSOR_SIZE UMBRIEL_SOCKET'; systemd_ready=false; "
+          "if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then "
+          "if systemctl --user import-environment $variables";
+      command += publishConfigured;
+      command += "; then systemd_ready=true; else "
+                 "echo 'umbriel: failed to publish the session environment' >&2; exit 1; fi; fi; "
+                 // The compositor waits on this script with its event loop stopped. Without a bus address, libdbus
+                 // autolaunches over X11, and DISPLAY names an Xwayland that only that loop can start. Use the
+                 // user bus socket when the address is unset, and skip the update when there is no bus at all.
+                 "if [ -z \"${DBUS_SESSION_BUS_ADDRESS:-}\" ] && [ -S \"${XDG_RUNTIME_DIR:-}/bus\" ]; then "
+                 "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=$XDG_RUNTIME_DIR/bus\"; fi; "
+                 "if [ -n \"${DBUS_SESSION_BUS_ADDRESS:-}\" ] "
+                 "&& command -v dbus-update-activation-environment >/dev/null 2>&1; then "
+                 "dbus-update-activation-environment $variables || { "
+                 "echo 'umbriel: failed to update the D-Bus activation environment' >&2; exit 1; }; fi; ";
+      if (managedReadiness) {
+        command += "$systemd_ready";
+      } else {
+        command += "if $systemd_ready; then systemctl --user start --no-block umbriel-session.target; fi";
+      }
+      return command;
+    }
+
+  } // namespace
+
+  void Server::setScreenCastActive(bool active) {
+    if (m_screenCastActive == active) {
+      return;
+    }
+    m_screenCastActive = active;
+    m_screenCastDynamicConfirmed = false;
+    m_pendingScreenCastCommand.reset();
+    if (m_quitConfirm != nullptr
+        && m_quitConfirm->visible()
+        && m_quitConfirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+      m_quitConfirm->hide();
+    }
+  }
+
+  void Server::clearScreenCastTarget() {
+    if (m_quitConfirm != nullptr
+        && m_quitConfirm->visible()
+        && m_quitConfirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+      dismissConfirmation();
+    }
+    m_screenCastCommand.kind = ScreenCastCommandKind::Clear;
+    m_screenCastCommand.value.clear();
+    ++m_screenCastCommand.serial;
+    if (m_ipc != nullptr) {
+      m_ipc->notifyScreenCastChanged();
+    }
+  }
+
+  bool Server::requestScreenCastCommand(ScreenCastCommandKind kind, std::string value, std::string* error) {
+    if (!m_screenCastActive) {
+      if (error != nullptr) {
+        *error = "no active screencast";
+      }
+      return false;
+    }
+
+    ScreenCastCommand requested{.kind = kind, .value = std::move(value)};
+    if (config().screenCast.disableDynamicConfirmation || m_screenCastDynamicConfirmed) {
+      if (m_quitConfirm != nullptr
+          && m_quitConfirm->visible()
+          && m_quitConfirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+        dismissConfirmation();
+      }
+      m_screenCastCommand.kind = requested.kind;
+      m_screenCastCommand.value = std::move(requested.value);
+      ++m_screenCastCommand.serial;
+      if (m_ipc != nullptr) {
+        m_ipc->notifyScreenCastChanged();
+      }
+      return true;
+    }
+
+    if (m_quitConfirm == nullptr || sessionLocked()) {
+      if (error != nullptr) {
+        *error = "screencast target change confirmation is unavailable";
+      }
+      return false;
+    }
+    if (m_quitConfirm->visible()) {
+      if (m_quitConfirm->kind() != QuitConfirm::Kind::ScreenCastDynamic) {
+        if (error != nullptr) {
+          *error = "another confirmation is active";
+        }
+        return false;
+      }
+      m_pendingScreenCastCommand = std::move(requested);
+      confirmScreenCastDynamic();
+      return true;
+    }
+
+    m_pendingScreenCastCommand = std::move(requested);
+    m_quitConfirm->show(QuitConfirm::Kind::ScreenCastDynamic);
+    return true;
+  }
+
+  bool Server::setScreenCastOutput(const Output& output, std::string* error) {
+    return requestScreenCastCommand(ScreenCastCommandKind::SetOutput, output.wlr()->name, error);
+  }
+
+  bool Server::setScreenCastWindow(const View& view, std::string* error) {
+    const char* identifier = view.extForeignIdentifier();
+    if (identifier == nullptr) {
+      if (error != nullptr) {
+        *error = "window has no capture identifier";
+      }
+      return false;
+    }
+    return requestScreenCastCommand(ScreenCastCommandKind::SetWindow, identifier, error);
+  }
+
+  bool Server::followScreenCastWindow(std::string* error) {
+    return requestScreenCastCommand(ScreenCastCommandKind::FollowWindow, {}, error);
+  }
+
+  bool Server::followScreenCastOutput(std::string* error) {
+    return requestScreenCastCommand(ScreenCastCommandKind::FollowOutput, {}, error);
+  }
+
+  void Server::confirmScreenCastDynamic() {
+    if (!m_screenCastActive || !m_pendingScreenCastCommand) {
+      dismissConfirmation();
+      return;
+    }
+    ScreenCastCommand requested = std::move(*m_pendingScreenCastCommand);
+    m_pendingScreenCastCommand.reset();
+    m_screenCastDynamicConfirmed = true;
+    if (m_quitConfirm != nullptr) {
+      m_quitConfirm->hide();
+    }
+    m_screenCastCommand.kind = requested.kind;
+    m_screenCastCommand.value = std::move(requested.value);
+    ++m_screenCastCommand.serial;
+    if (m_ipc != nullptr) {
+      m_ipc->notifyScreenCastChanged();
+    }
+  }
+
+  void Server::showWindowVolume(View* view, double x, double y) {
+    if (m_sessionLocked || m_ipc == nullptr || view == nullptr) {
+      return;
+    }
+    const char* id = view->extForeignIdentifier();
+    if (id != nullptr) {
+      m_ipc->notifyWindowVolume(id, x, y);
+    }
+  }
+
+  void Server::showMoveMenu(View* view, double x, double y) {
+    if (!m_sessionLocked && m_moveMenu != nullptr) {
+      m_moveMenu->show(view, x, y);
+    }
+  }
+
+  void Server::hideMoveMenu() {
+    if (m_moveMenu != nullptr) {
+      m_moveMenu->hide();
+    }
+  }
+
+  void Server::forgetMoveMenuView(const View* view) {
+    if (m_moveMenu != nullptr) {
+      m_moveMenu->forgetView(view);
+    }
+  }
+
+  void Server::dismissConfirmation() {
+    if (m_pendingCaptureId != 0 && m_inputCapture != nullptr) {
+      const auto id = std::exchange(m_pendingCaptureId, 0);
+      m_inputCapture->authorizeSession(id, false);
+    }
+    if (m_pendingInputId != 0) {
+      const auto id = std::exchange(m_pendingInputId, 0);
+      m_deniedInputNames.insert(m_pendingInputName);
+      kLog.info("input permission denied id={} app='{}'", id, m_pendingInputName);
+      m_pendingInputName.clear();
+      if (m_eisInput != nullptr) {
+        m_eisInput->authorizeClient(id, false);
+      }
+    }
+    if (m_quitConfirm != nullptr
+        && m_quitConfirm->visible()
+        && m_quitConfirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+      m_pendingScreenCastCommand.reset();
+    }
+    if (m_quitConfirm != nullptr) {
+      m_quitConfirm->hide();
+    }
+  }
+
+  void Server::requestInputEmulation(uint64_t id, std::string_view name) {
+    const std::string application(name);
+    if (m_allowedInputNames.contains(application) && !sessionLocked()) {
+      m_eisInput->authorizeClient(id, true);
+      return;
+    }
+    if (application.empty()
+        || application.size() > 256
+        || sessionLocked()
+        || m_deniedInputNames.contains(application)
+        || m_quitConfirm == nullptr
+        || m_quitConfirm->visible()) {
+      m_eisInput->authorizeClient(id, false);
+      return;
+    }
+    m_pendingInputId = id;
+    m_pendingInputName = application;
+    std::string displayName;
+    for (const unsigned char character : application) {
+      displayName += character >= 32 && character < 127 ? static_cast<char>(character) : '?';
+    }
+    kLog.info("input permission requested id={} app='{}'", id, displayName);
+    m_quitConfirm->showInputEmulation(displayName);
+  }
+
+  void Server::confirmInputEmulation() {
+    if (m_pendingInputId == 0 || m_eisInput == nullptr || sessionLocked()) {
+      dismissConfirmation();
+      return;
+    }
+    const auto id = std::exchange(m_pendingInputId, 0);
+    m_allowedInputNames.insert(m_pendingInputName);
+    kLog.info("input permission granted id={} app='{}'", id, m_pendingInputName);
+    m_pendingInputName.clear();
+    m_quitConfirm->hide();
+    m_eisInput->authorizeClient(id, true);
+  }
+
+  void Server::cancelInputEmulation(uint64_t id) {
+    if (id != m_pendingInputId) {
+      return;
+    }
+    m_pendingInputId = 0;
+    m_pendingInputName.clear();
+    if (m_quitConfirm != nullptr && m_quitConfirm->kind() == QuitConfirm::Kind::InputEmulation) {
+      m_quitConfirm->hide();
+    }
+  }
+
+  void Server::requestInputCapture(uint64_t id, std::string_view name, uint32_t persistMode) {
+    if (m_stopping
+        || m_sessionLock != nullptr
+        || sessionLocked()
+        || (m_session != nullptr && !m_session->active)
+        || name.size() > 256
+        || m_quitConfirm == nullptr
+        || m_quitConfirm->visible()
+        || (m_inputCapture != nullptr && m_inputCapture->active())) {
+      m_inputCapture->authorizeSession(id, false);
+      return;
+    }
+    m_pendingCaptureId = id;
+    std::string label;
+    for (const unsigned char character : name) {
+      label += character >= 32 && character < 127 ? static_cast<char>(character) : '?';
+    }
+    m_quitConfirm->showInputCapture(label.empty() ? "Unknown application" : label, persistMode);
+    if (!m_quitConfirm->visible()) {
+      dismissConfirmation();
+    }
+  }
+
+  void Server::confirmInputCapture(bool remember) {
+    if (m_pendingCaptureId == 0
+        || m_inputCapture == nullptr
+        || m_sessionLock != nullptr
+        || sessionLocked()
+        || (m_session != nullptr && !m_session->active)
+        || (remember && (m_quitConfirm == nullptr || !m_quitConfirm->canRememberInputCapture()))) {
+      dismissConfirmation();
+      return;
+    }
+    const auto id = std::exchange(m_pendingCaptureId, 0);
+    m_quitConfirm->hide();
+    m_inputCapture->authorizeSession(id, true, remember);
+  }
+
+  void Server::cancelInputCapture(uint64_t id) {
+    if (m_pendingCaptureId != id) {
+      return;
+    }
+    m_pendingCaptureId = 0;
+    if (m_quitConfirm != nullptr && m_quitConfirm->kind() == QuitConfirm::Kind::InputCapture) {
+      m_quitConfirm->hide();
+    }
+  }
+
+  void Server::inputCaptureStateChanged(bool active) {
+    if (m_stopping) {
+      return;
+    }
+    const uint32_t capabilities = active ? m_inputCapture->capabilities() : m_inputCaptureCapabilities;
+    m_inputCaptureCapabilities = active ? capabilities : 0;
+    cancelModifierTap();
+    if ((capabilities & 1U) != 0) {
+      for (const auto& keyboard : m_keyboards) {
+        keyboard->prepareInputCapture(!active);
+      }
+      if (active) {
+        notifyKeyboardClearFocus();
+        m_seat->notifyPointerModifiers(true);
+      } else if (!sessionLocked()) {
+        refocus();
+        if (m_eisInput != nullptr) {
+          if (wlr_keyboard* keyboard = wlr_seat_get_keyboard(m_seat->wlr()); keyboard != nullptr) {
+            m_eisInput->updateModifiers(keyboard->modifiers);
+          }
+        }
+      }
+    }
+    if ((capabilities & 2U) != 0 && m_cursor != nullptr) {
+      m_cursor->setInputCaptured(active);
+    }
+  }
+
+  bool Server::physicalInputDevice(const wlr_input_device* device) const {
+    return device != nullptr
+        && (m_eisInput == nullptr || !m_eisInput->ownsDevice(device))
+        && std::ranges::none_of(m_virtualPointers, [device](const auto& pointer) {
+             return &pointer->vpointer->pointer.base == device;
+           });
+  }
+
+  bool Server::keyboardKeyConsumed(wlr_keyboard* keyboard, uint32_t keycode) const {
+    const auto entry =
+        std::ranges::find_if(m_keyboards, [keyboard](const auto& candidate) { return candidate->wlr() == keyboard; });
+    return entry != m_keyboards.end() && (*entry)->consumedKeycodes().contains(keycode);
+  }
+
+  void Server::onSessionActive(wl_listener* listener, void* /*data*/) {
+    Server* self;
+    self = wl_container_of(listener, self, m_sessionActive);
+    self->updateDrmLeaseState();
+    if (!self->m_session->active) {
+      if (self->m_inputCapture != nullptr) {
+        self->m_inputCapture->suspend();
+      }
+      if (self->m_pendingCaptureId != 0) {
+        self->dismissConfirmation();
+      }
+    }
+  }
+
+  void Server::updateDrmLeaseState() {
+    if (m_drmLeaseManager != nullptr) {
+      m_drmLeaseManager->setActive(
+          !m_stopping && !m_sessionLocked && m_sessionLock == nullptr && (m_session == nullptr || m_session->active)
+      );
+    }
+  }
+
+  void Server::stopFollowingScreenCast() {
+    if (m_quitConfirm != nullptr
+        && m_quitConfirm->visible()
+        && m_quitConfirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+      dismissConfirmation();
+    }
+    m_screenCastCommand.kind = ScreenCastCommandKind::FollowStop;
+    m_screenCastCommand.value.clear();
+    ++m_screenCastCommand.serial;
+    if (m_ipc != nullptr) {
+      m_ipc->notifyScreenCastChanged();
+    }
+  }
+
+  const wlr_security_context_v1_state* Server::clientSecurityContext(const wl_client* client) const {
+    if (m_securityContextManager == nullptr) {
+      return nullptr;
+    }
+    return wlr_security_context_manager_v1_lookup_client(m_securityContextManager, client);
+  }
+
+  ContentType Server::surfaceContentType(wlr_surface* surface) const {
+    if (m_contentTypeManager == nullptr || surface == nullptr) {
+      return ContentType::None;
+    }
+    switch (wlr_surface_get_content_type_v1(m_contentTypeManager, surface)) {
+    case WP_CONTENT_TYPE_V1_TYPE_PHOTO:
+      return ContentType::Photo;
+    case WP_CONTENT_TYPE_V1_TYPE_VIDEO:
+      return ContentType::Video;
+    case WP_CONTENT_TYPE_V1_TYPE_GAME:
+      return ContentType::Game;
+    case WP_CONTENT_TYPE_V1_TYPE_NONE:
+    default:
+      return ContentType::None;
+    }
+  }
+
+  pid_t surfaceClientPid(const wlr_surface* surface) {
+    if (surface == nullptr || surface->resource == nullptr) {
+      return -1;
+    }
+    pid_t pid = -1;
+    wl_client_get_credentials(wl_resource_get_client(surface->resource), &pid, nullptr, nullptr);
+    return pid > 0 ? pid : -1;
+  }
+
+  Server::Server() : m_effects(*this) {
+    m_nested = std::getenv("WAYLAND_DISPLAY") != nullptr
+        || std::getenv("WAYLAND_SOCKET") != nullptr
+        || std::getenv("DISPLAY") != nullptr;
+
+    m_display = wl_display_create();
+    if (m_display == nullptr) {
+      throw std::runtime_error("failed to create wl_display");
+    }
+    m_protocolLogger = wl_display_add_protocol_logger(m_display, onProtocolMessage, this);
+    if (m_protocolLogger == nullptr) {
+      throw std::runtime_error("failed to register Wayland protocol logger");
+    }
+    wl_display_set_default_max_buffer_size(m_display, kWaylandClientBufferSize);
+    m_clientCreated.notify = onClientCreated;
+    wl_display_add_client_created_listener(m_display, &m_clientCreated);
+
+    m_backendManager = BackendManager::create(m_display, config().drm);
+    if (m_backendManager == nullptr) {
+      throw std::runtime_error("failed to create wlr_backend");
+    }
+    m_backend = m_backendManager->backend();
+    m_session = m_backendManager->session();
+
+    m_renderer = m_backendManager->createRenderer();
+    if (m_renderer == nullptr) {
+      throw std::runtime_error("failed to create fx_renderer");
+    }
+    m_rendererLost.notify = onRendererLost;
+    wl_signal_add(&m_renderer->events.lost, &m_rendererLost);
+
+    if (!wlr_renderer_init_wl_shm(m_renderer, m_display)) {
+      throw std::runtime_error("failed to initialize wl_shm");
+    }
+
+    const int drmFd = wlr_renderer_get_drm_fd(m_renderer);
+    wlr_linux_dmabuf_v1* linuxDmabuf = nullptr;
+    if (wlr_renderer_get_texture_formats(m_renderer, WLR_BUFFER_CAP_DMABUF) != nullptr && drmFd >= 0) {
+      if (wlr_drm_create(m_display, m_renderer) == nullptr) {
+        kLog.warn("failed to create legacy wl_drm global");
+      }
+      linuxDmabuf = wlr_linux_dmabuf_v1_create_with_renderer(m_display, 4, m_renderer);
+      if (linuxDmabuf == nullptr) {
+        throw std::runtime_error("failed to create linux-dmabuf global");
+      }
+    }
+
+    const bool explicitSync = drmFd >= 0 && m_renderer->features.timeline && m_backend->features.timeline;
+    if (explicitSync) {
+      if (wlr_linux_drm_syncobj_manager_v1_create(m_display, 1, drmFd) == nullptr) {
+        throw std::runtime_error("failed to create linux-drm-syncobj manager");
+      }
+      kLog.info("explicit synchronization enabled");
+    }
+
+    m_allocator = createAllocator(m_backend, m_renderer);
+    if (m_allocator == nullptr) {
+      throw std::runtime_error("failed to create wlr_allocator");
+    }
+    if (!m_backendManager->verifyOpenDevices("after allocator creation")) {
+      throw std::runtime_error("renderer or allocator opened an excluded GPU");
+    }
+
+    m_cursorEffectSlot.configuredSelector = config().effects.cursor;
+    resolveEffectSlot(m_cursorEffectSlot, EffectKind::Cursor);
+    effectRegistry().prepare(m_renderer);
+    m_compositor = wlr_compositor_create(m_display, 5, m_renderer);
+    if (explicitSync) {
+      m_syncobjAcquireBarrier = std::make_unique<SyncobjAcquireBarrier>(m_compositor);
+      m_syncobjUnmapRelease = std::make_unique<SyncobjUnmapRelease>(m_compositor);
+      m_syncobjSupersededRelease = std::make_unique<SyncobjSupersededRelease>(m_compositor);
+    }
+    wlr_subcompositor_create(m_display);
+    wlr_data_device_manager_create(m_display);
+    if (wlr_primary_selection_v1_device_manager_create(m_display) == nullptr) {
+      throw std::runtime_error("failed to create primary-selection manager");
+    }
+    m_securityContextManager = wlr_security_context_manager_v1_create(m_display);
+    if (m_securityContextManager == nullptr) {
+      throw std::runtime_error("failed to create security-context manager");
+    }
+    wl_display_set_global_filter(m_display, filterGlobal, this);
+    m_drmLeaseManager = std::make_unique<DrmLeaseManager>(m_display, m_backend);
+    updateDrmLeaseState();
+    wlr_viewporter_create(m_display);
+    wlr_fractional_scale_manager_v1_create(m_display, 1);
+    wlr_presentation_create(m_display, m_backend, 2);
+    m_tearingControlManager = wlr_tearing_control_manager_v1_create(m_display, 1);
+    if (m_tearingControlManager == nullptr) {
+      throw std::runtime_error("failed to create tearing-control manager");
+    }
+    m_contentTypeManager = wlr_content_type_manager_v1_create(m_display, 1);
+    if (m_contentTypeManager == nullptr) {
+      throw std::runtime_error("failed to create content-type manager");
+    }
+    if (wlr_ext_data_control_manager_v1_create(m_display, 1) == nullptr) {
+      throw std::runtime_error("failed to create ext-data-control manager");
+    }
+    if (wlr_data_control_manager_v1_create(m_display) == nullptr) {
+      throw std::runtime_error("failed to create legacy data-control manager");
+    }
+
+    m_outputLayout = wlr_output_layout_create(m_display);
+    wlr_xdg_output_manager_v1_create(m_display, m_outputLayout);
+    // A scene helper served by libwlroots allocates nodes too small for
+    // umbrielfx's trailing fields, which renders every surface black instead of
+    // failing. Refuse to build a scene on top of that.
+    if (const char* mismatch = umbrielfx_scene_check_helpers(); mismatch != nullptr) {
+      throw std::runtime_error(std::string("umbrielfx scene helpers are not linked correctly: ") + mismatch);
+    }
+    m_scene = wlr_scene_create();
+    if (linuxDmabuf != nullptr) {
+      wlr_scene_set_linux_dmabuf_v1(m_scene, linuxDmabuf);
+    }
+    if (m_renderer->features.input_color_transform) {
+      m_colorManager = std::make_unique<ColorManager>(*this);
+      if (!m_colorManager->valid()) {
+        throw std::runtime_error("failed to create color-management manager");
+      }
+    }
+    const Config::Appearance::Blur& blur = config().appearance.blur;
+    wlr_scene_set_blur_data(
+        m_scene, blur.passes, blur.radius, static_cast<float>(blur.noise), static_cast<float>(blur.brightness),
+        static_cast<float>(blur.contrast), static_cast<float>(blur.saturation)
+    );
+    m_sceneLayout = wlr_scene_attach_output_layout(m_scene, m_outputLayout);
+    wlr_scene_set_background_color(m_scene, config().colors.backdrop.data());
+
+    // Global stacking keeps scratchpads above normal windows and below drag, panels, fullscreen, overlays, and lock.
+    // Per-output layer trees keep normal windows below panels.
+    m_backdrop = wlr_scene_rect_create(&m_scene->tree, 0, 0, config().colors.backdrop.data());
+    wlr_scene_rect_set_corner_radius(m_backdrop, 0);
+    m_shellLayerTrees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND] = wlr_scene_tree_create(&m_scene->tree);
+    m_overviewBlurTree = wlr_scene_tree_create(&m_scene->tree);
+    wlr_scene_node_set_enabled(&m_overviewBlurTree->node, false);
+    m_shellLayerTrees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM] = wlr_scene_tree_create(&m_scene->tree);
+    m_xdgTree = wlr_scene_tree_create(&m_scene->tree);
+    m_scratchpadTree = wlr_scene_tree_create(&m_scene->tree);
+    m_scratchpadManager = std::make_unique<ScratchpadManager>(*this, m_scratchpadTree);
+    m_overviewTree = wlr_scene_tree_create(&m_scene->tree);
+    wlr_scene_node_set_enabled(&m_overviewTree->node, false);
+    m_dragTree = wlr_scene_tree_create(&m_scene->tree);
+    m_dragIconTree = wlr_scene_tree_create(&m_scene->tree);
+    m_shellLayerTrees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] = wlr_scene_tree_create(&m_scene->tree);
+    m_fullscreenTree = wlr_scene_tree_create(&m_scene->tree);
+    m_pinnedTree = wlr_scene_tree_create(&m_scene->tree);
+    m_xwaylandUnmanagedTree = wlr_scene_tree_create(&m_scene->tree);
+    m_shellLayerTrees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY] = wlr_scene_tree_create(&m_scene->tree);
+    m_imPopupTree = wlr_scene_tree_create(&m_scene->tree);
+    m_cheatsheetTree = wlr_scene_tree_create(&m_scene->tree);
+    m_bannerTree = wlr_scene_tree_create(&m_scene->tree);
+    m_moveMenuTree = wlr_scene_tree_create(&m_scene->tree);
+    m_quitConfirmTree = wlr_scene_tree_create(&m_scene->tree);
+    m_lockTree = wlr_scene_tree_create(&m_scene->tree);
+    m_lockBlank = wlr_scene_rect_create(m_lockTree, 0, 0, config().colors.backdrop.data());
+    wlr_scene_rect_set_corner_radius(m_lockBlank, 0);
+    wlr_scene_node_set_enabled(&m_lockBlank->node, false);
+    wlr_scene_node_set_enabled(&m_lockTree->node, false);
+    wlr_scene_node_lower_to_bottom(&m_backdrop->node);
+    m_effects.syncLightLayer();
+
+    m_gammaManager = wlr_gamma_control_manager_v1_create(m_display);
+    m_setGamma.notify = onSetGamma;
+    wl_signal_add(&m_gammaManager->events.set_gamma, &m_setGamma);
+
+    // Version 6 adds the suspended state hidden tabs are given. The window-manager capabilities version 5 sends default
+    // to every capability, which is what a client assumed before, so no client sees a change in what it may ask for.
+    m_xdgShell = wlr_xdg_shell_create(m_display, 6);
+    m_newXdgToplevel.notify = onNewXdgToplevel;
+    wl_signal_add(&m_xdgShell->events.new_toplevel, &m_newXdgToplevel);
+    m_newXdgPopup.notify = onNewXdgPopup;
+    wl_signal_add(&m_xdgShell->events.new_popup, &m_newXdgPopup);
+
+    wlr_xdg_foreign_registry* foreignRegistry = wlr_xdg_foreign_registry_create(m_display);
+    if (foreignRegistry == nullptr) {
+      throw std::runtime_error("failed to create xdg-foreign registry");
+    }
+    if (wlr_xdg_foreign_v2_create(m_display, foreignRegistry) == nullptr) {
+      throw std::runtime_error("failed to create xdg-foreign global");
+    }
+    wlr_xdg_wm_dialog_v1* dialogManager = wlr_xdg_wm_dialog_v1_create(m_display, 1);
+    if (dialogManager == nullptr) {
+      throw std::runtime_error("failed to create xdg-dialog global");
+    }
+    m_newXdgDialog.notify = onNewXdgDialog;
+    wl_signal_add(&dialogManager->events.new_dialog, &m_newXdgDialog);
+
+    m_xdgToplevelTagManager = wlr_xdg_toplevel_tag_manager_v1_create(m_display, 1);
+    if (m_xdgToplevelTagManager == nullptr) {
+      throw std::runtime_error("failed to create XDG toplevel tag manager");
+    }
+    m_setXdgToplevelTag.notify = onSetXdgToplevelTag;
+    wl_signal_add(&m_xdgToplevelTagManager->events.set_tag, &m_setXdgToplevelTag);
+
+    m_xdgDecorationManager = wlr_xdg_decoration_manager_v1_create(m_display);
+    m_newXdgDecoration.notify = onNewXdgDecoration;
+    wl_signal_add(&m_xdgDecorationManager->events.new_toplevel_decoration, &m_newXdgDecoration);
+
+    m_serverDecorationManager = wlr_server_decoration_manager_create(m_display);
+    m_newLegacyDecoration.notify = onNewLegacyDecoration;
+    wl_signal_add(&m_serverDecorationManager->events.new_decoration, &m_newLegacyDecoration);
+    wlr_server_decoration_manager_set_default_mode(
+        m_serverDecorationManager, WLR_SERVER_DECORATION_MANAGER_MODE_SERVER
+    );
+
+    m_layerShell = wlr_layer_shell_v1_create(m_display, 4);
+    m_newLayerSurface.notify = onNewLayerSurface;
+    wl_signal_add(&m_layerShell->events.new_surface, &m_newLayerSurface);
+
+    m_foreignToplevelManager = wlr_foreign_toplevel_manager_v1_create(m_display);
+    m_extForeignToplevelList = wlr_ext_foreign_toplevel_list_v1_create(m_display, 1);
+    m_toplevelCaptureSourceManager = wlr_ext_foreign_toplevel_image_capture_source_manager_v1_create(m_display, 1);
+    m_toplevelCaptureRequest.notify = onToplevelCaptureRequest;
+    wl_signal_add(&m_toplevelCaptureSourceManager->events.new_request, &m_toplevelCaptureRequest);
+
+    m_workspaceManager = wlr_ext_workspace_manager_v1_create(m_display, 1);
+    m_workspaceCommit.notify = onWorkspaceCommit;
+    wl_signal_add(&m_workspaceManager->events.commit, &m_workspaceCommit);
+
+    m_sessionLockManager = wlr_session_lock_manager_v1_create(m_display);
+    m_newSessionLock.notify = onNewSessionLock;
+    wl_signal_add(&m_sessionLockManager->events.new_lock, &m_newSessionLock);
+
+    m_relativePointerManager = wlr_relative_pointer_manager_v1_create(m_display);
+    m_pointerConstraints = wlr_pointer_constraints_v1_create(m_display);
+    m_newPointerConstraint.notify = onNewPointerConstraint;
+    wl_signal_add(&m_pointerConstraints->events.new_constraint, &m_newPointerConstraint);
+    m_pointerGestures = wlr_pointer_gestures_v1_create(m_display);
+    m_virtualKeyboardManager = wlr_virtual_keyboard_manager_v1_create(m_display);
+    m_newVirtualKeyboard.notify = onNewVirtualKeyboard;
+    wl_signal_add(&m_virtualKeyboardManager->events.new_virtual_keyboard, &m_newVirtualKeyboard);
+    m_virtualPointerManager = wlr_virtual_pointer_manager_v1_create(m_display);
+    m_newVirtualPointer.notify = onNewVirtualPointer;
+    wl_signal_add(&m_virtualPointerManager->events.new_virtual_pointer, &m_newVirtualPointer);
+    m_tabletManager = wlr_tablet_v2_create(m_display);
+
+    m_idleNotifier = wlr_idle_notifier_v1_create(m_display);
+    m_idleInhibitManager = wlr_idle_inhibit_v1_create(m_display);
+    m_newIdleInhibitor.notify = onNewIdleInhibitor;
+    wl_signal_add(&m_idleInhibitManager->events.new_inhibitor, &m_newIdleInhibitor);
+    m_shortcutsInhibitManager = wlr_keyboard_shortcuts_inhibit_v1_create(m_display);
+    if (m_shortcutsInhibitManager == nullptr) {
+      throw std::runtime_error("failed to create keyboard-shortcuts-inhibit manager");
+    }
+    m_newShortcutsInhibitor.notify = onNewShortcutsInhibitor;
+    wl_signal_add(&m_shortcutsInhibitManager->events.new_inhibitor, &m_newShortcutsInhibitor);
+
+    wlr_screencopy_manager_v1_create(m_display);
+    wlr_ext_output_image_capture_source_manager_v1_create(m_display, 1);
+    wlr_ext_image_copy_capture_manager_v1* imageCopyManager =
+        wlr_ext_image_copy_capture_manager_v1_create(m_display, 1);
+    if (imageCopyManager == nullptr) {
+      throw std::runtime_error("failed to create image-copy-capture manager");
+    }
+    m_newImageCopySession.notify = onNewImageCopySession;
+    wl_signal_add(&imageCopyManager->events.new_session, &m_newImageCopySession);
+
+    // Create the manager so apply/test listeners stay wired, but leave heads empty (see updateOutputManagerConfig).
+    // Advertising a full configuration on bind currently takes down the desktop shell from this flake.
+    m_outputManager = wlr_output_manager_v1_create(m_display);
+    m_outputManagerApply.notify = onOutputManagerApply;
+    wl_signal_add(&m_outputManager->events.apply, &m_outputManagerApply);
+    m_outputManagerTest.notify = onOutputManagerTest;
+    wl_signal_add(&m_outputManager->events.test, &m_outputManagerTest);
+
+    m_xdgActivation = wlr_xdg_activation_v1_create(m_display);
+    m_newActivationToken.notify = onNewActivationToken;
+    wl_signal_add(&m_xdgActivation->events.new_token, &m_newActivationToken);
+    m_requestActivate.notify = onRequestActivate;
+    wl_signal_add(&m_xdgActivation->events.request_activate, &m_requestActivate);
+
+    m_cursor = std::make_unique<Cursor>(*this);
+    // Registered after the cursor attaches to the layout: wlr_cursor's own listener clamps the pointer first.
+    m_outputLayoutChange.notify = onOutputLayoutChange;
+    wl_signal_add(&m_outputLayout->events.change, &m_outputLayoutChange);
+    m_seat = std::make_unique<Seat>(*this);
+    m_padKeyboardFocusChange.notify = onPadKeyboardFocusChange;
+    wl_signal_add(&m_seat->wlr()->keyboard_state.events.focus_change, &m_padKeyboardFocusChange);
+    m_layerKeyboardFocusChange.notify = onLayerKeyboardFocusChange;
+    wl_signal_add(&m_seat->wlr()->keyboard_state.events.focus_change, &m_layerKeyboardFocusChange);
+    m_inputMethodRelay = std::make_unique<InputMethodRelay>(*this);
+    m_keyboardLeds =
+        std::make_unique<KeyboardLeds>(wl_display_get_event_loop(m_display), [this](wlr_keyboard* keyboard) {
+          return m_inputMethodRelay == nullptr || !m_inputMethodRelay->ownsKeyboard(keyboard);
+        });
+    m_gestures = std::make_unique<Gestures>(*this);
+    m_overview = std::make_unique<Overview>(*this);
+    updateSeatCapabilities();
+
+    m_newOutput.notify = onNewOutput;
+    wl_signal_add(&m_backend->events.new_output, &m_newOutput);
+    m_newInput.notify = onNewInput;
+    wl_signal_add(&m_backend->events.new_input, &m_newInput);
+
+    wlr_log(WLR_INFO, "mod key: %s (%s session)", m_nested ? "Alt" : "Super", m_nested ? "nested" : "native");
+    kLog.info("mod key: {} ({} session)", m_nested ? "Alt" : "Super", m_nested ? "nested" : "native");
+  }
+  namespace {
+    // wlroots never announces ext-image-copy-capture cursor sessions and their struct is private, so the only
+    // public trace of "this client asked for cursor metadata for this source" is the update listener the session
+    // attaches to that source's cursor. Probing it per source keeps a cursor session bound to output A from
+    // pacing the same client's pixel-only capture of output B. The seat is only what the interface takes; the
+    // output source ignores it.
+    constexpr std::string_view kSourceInterface = "ext_image_capture_source_v1";
+
+    struct CursorSessionProbe {
+      const wlr_output* output = nullptr;
+      wlr_seat* seat = nullptr;
+      bool found = false;
+    };
+
+    wl_iterator_result probeCursorSession(wl_resource* resource, void* data) {
+      auto* probe = static_cast<CursorSessionProbe*>(data);
+      const char* klass = wl_resource_get_class(resource);
+      if (klass == nullptr || std::string_view(klass) != kSourceInterface) {
+        return WL_ITERATOR_CONTINUE;
+      }
+      wlr_ext_image_capture_source_v1* source = wlr_ext_image_capture_source_v1_from_resource(resource);
+      if (source == nullptr || wlr_output_try_from_ext_image_capture_source_v1(source) != probe->output) {
+        return WL_ITERATOR_CONTINUE;
+      }
+      // Only a live cursor session for exactly this source has a listener here; its destroy path removes it.
+      const wlr_ext_image_capture_source_v1_cursor* cursor = source->impl->get_pointer_cursor(source, probe->seat);
+      if (cursor != nullptr && !wl_list_empty(&cursor->events.update.listener_list)) {
+        probe->found = true;
+        return WL_ITERATOR_STOP;
+      }
+      return WL_ITERATOR_CONTINUE;
+    }
+  } // namespace
+
+  bool Server::outputCaptured(const wlr_output* output) const {
+    return output != nullptr
+        && std::ranges::any_of(m_imageCopySessions, [output](const std::unique_ptr<ImageCopySessionWatch>& watch) {
+             return watch->session != nullptr && watch->output == output;
+           });
+  }
+
+  bool Server::hasCopyCaptureFor(const wlr_output* output) const {
+    if (output == nullptr) {
+      return false;
+    }
+    for (const auto& watch : m_imageCopySessions) {
+      if (watch->session == nullptr || watch->output != output) {
+        continue;
+      }
+      wl_client* client = wl_resource_get_client(watch->session->resource);
+      if (client == nullptr) {
+        continue;
+      }
+      CursorSessionProbe probe{.output = output, .seat = m_seat != nullptr ? m_seat->wlr() : nullptr};
+      wl_client_for_each_resource(client, probeCursorSession, &probe);
+      if (probe.found) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Server::~Server() {
+    m_stopping = true;
+    updateDrmLeaseState();
+    m_inputCapture.reset();
+    if (m_sessionActive.link.next != nullptr) {
+      wl_list_remove(&m_sessionActive.link);
+    }
+    m_keyboardLeds.reset();
+    if (m_cursor != nullptr) {
+      m_cursor->finishToplevelDrag(false);
+    }
+    if (m_sessionExitResultSource != nullptr) {
+      wl_event_source_remove(m_sessionExitResultSource);
+    }
+    if (m_sessionExitResultFd >= 0) {
+      close(m_sessionExitResultFd);
+    }
+    if (m_lidStateReconcileIdle != nullptr) {
+      wl_event_source_remove(m_lidStateReconcileIdle);
+      m_lidStateReconcileIdle = nullptr;
+    }
+    if (m_rendererRecoveryIdle != nullptr) {
+      wl_event_source_remove(m_rendererRecoveryIdle);
+      m_rendererRecoveryIdle = nullptr;
+    }
+    if (m_suspensionSyncIdle != nullptr) {
+      wl_event_source_remove(m_suspensionSyncIdle);
+      m_suspensionSyncIdle = nullptr;
+    }
+    if (m_protocolLogger != nullptr) {
+      wl_protocol_logger_destroy(m_protocolLogger);
+      m_protocolLogger = nullptr;
+    }
+    wl_list_remove(&m_clientCreated.link);
+    wl_list_remove(&m_newOutput.link);
+    wl_list_remove(&m_newInput.link);
+    wl_list_remove(&m_newXdgToplevel.link);
+    wl_list_remove(&m_setXdgToplevelTag.link);
+    wl_list_remove(&m_newXdgDialog.link);
+    wl_list_remove(&m_newXdgPopup.link);
+    wl_list_remove(&m_newXdgDecoration.link);
+    wl_list_remove(&m_newLegacyDecoration.link);
+    wl_list_remove(&m_newLayerSurface.link);
+    wl_list_remove(&m_newSessionLock.link);
+    wl_list_remove(&m_newPointerConstraint.link);
+    wl_list_remove(&m_newVirtualKeyboard.link);
+    wl_list_remove(&m_newVirtualPointer.link);
+    wl_list_remove(&m_newIdleInhibitor.link);
+    wl_list_remove(&m_newShortcutsInhibitor.link);
+    wl_list_remove(&m_newImageCopySession.link);
+    // The manager listener is gone, so no new track can appear. Unlink each
+    // session's destroy listener before freeing its track: otherwise a session
+    // that outlives this point in teardown still holds a wl_listener pointing
+    // into memory we're about to free, and its destroy signal firing later is a
+    // use-after-free.
+    for (const auto& track : m_imageCopySessions) {
+      wl_list_remove(&track->destroy.link);
+    }
+    m_imageCopySessions.clear();
+    wl_list_remove(&m_newActivationToken.link);
+    wl_list_remove(&m_requestActivate.link);
+    wl_list_remove(&m_workspaceCommit.link);
+    wl_list_remove(&m_setGamma.link);
+    wl_list_remove(&m_outputManagerApply.link);
+    wl_list_remove(&m_outputManagerTest.link);
+    wl_list_remove(&m_outputLayoutChange.link);
+    wl_list_remove(&m_rendererLost.link);
+    wl_list_remove(&m_toplevelCaptureRequest.link);
+    wl_list_remove(&m_padKeyboardFocusChange.link);
+    wl_list_remove(&m_layerKeyboardFocusChange.link);
+    m_configWatcher.reset();
+    m_ipc.reset();
+    m_insertHint.reset();
+    // Each snapshot destroys its own scene tree.
+    m_closeSnapshots.clear();
+    m_configBanner.reset();
+    m_moveMenu.reset();
+    // Owns scene nodes under m_scene; must go before the scene teardown below.
+    m_cheatsheet.reset();
+    m_overview.reset();
+    m_sessionLock.reset();
+    m_layerSurfaces.clear();
+    m_registry.clear();
+    // After the views, which hold listeners on X11 surfaces, and before the seat, which unmanaged X11 windows release
+    // keyboard focus through. The Xwayland client itself goes with the other Wayland clients below.
+    m_xwayland.reset();
+    m_eisInput.reset();
+    m_keyboards.clear();
+    m_manualShortcutsInhibit.clear();
+    // The backend destroys physical input devices below, after the seat and cursor; detach their watchers first.
+    for (const auto& pointer : m_pointers) {
+      wl_list_remove(&pointer->destroy.link);
+    }
+    m_pointers.clear();
+    for (const auto& touch : m_touchDevices) {
+      wl_list_remove(&touch->destroy.link);
+    }
+    m_touchDevices.clear();
+    for (const auto& pad : m_tabletPads) {
+      wl_list_remove(&pad->destroy.link);
+      wl_list_remove(&pad->button.link);
+      wl_list_remove(&pad->ring.link);
+      wl_list_remove(&pad->strip.link);
+    }
+    m_tabletPads.clear();
+    for (const auto& tablet : m_tabletDevices) {
+      wl_list_remove(&tablet->destroy.link);
+    }
+    m_tabletDevices.clear();
+    for (const auto& entry : m_switchDevices) {
+      wl_list_remove(&entry->destroy.link);
+      wl_list_remove(&entry->toggle.link);
+    }
+    m_switchDevices.clear();
+    m_outputs.clear();
+    m_inputMethodRelay.reset();
+    m_seat.reset();
+    // Holds listeners on the wlr_cursor's gesture signals. wlr_cursor_destroy
+    // asserts its signal lists are empty, so this must precede the cursor.
+    m_gestures.reset();
+    m_cursor.reset();
+
+    if (m_backgroundFrameTimer != nullptr) {
+      wl_event_source_remove(m_backgroundFrameTimer);
+      m_backgroundFrameTimer = nullptr;
+    }
+    if (m_backgroundRenderTimer != nullptr) {
+      wl_event_source_remove(m_backgroundRenderTimer);
+      m_backgroundRenderTimer = nullptr;
+    }
+    if (m_startupRulesTimer != nullptr) {
+      wl_event_source_remove(m_startupRulesTimer);
+      m_startupRulesTimer = nullptr;
+    }
+    if (m_modHoldTimer != nullptr) {
+      wl_event_source_remove(m_modHoldTimer);
+      m_modHoldTimer = nullptr;
+    }
+    for (wl_event_source*& source : m_signalSources) {
+      if (source != nullptr) {
+        wl_event_source_remove(source);
+        source = nullptr;
+      }
+    }
+    wl_display_destroy_clients(m_display);
+    m_drmLeaseManager.reset();
+    m_colorManager.reset();
+    m_syncobjAcquireBarrier.reset();
+    m_syncobjUnmapRelease.reset();
+    m_syncobjSupersededRelease.reset();
+    // Chrome components destroy scene nodes in their destructors, so they must go before the scene tree does; otherwise
+    // the destructor body frees the nodes and the member destructors touch already-freed memory.
+    m_quitConfirm.reset();
+    m_moveMenu.reset();
+    m_cheatsheet.reset();
+    m_configBanner.reset();
+    m_scratchpadManager.reset();
+    wlr_scene_node_destroy(&m_scene->tree.node);
+    wlr_allocator_destroy(m_allocator);
+    effectRegistry().clear();
+    wlr_renderer_destroy(m_renderer);
+    m_backendManager.reset();
+    m_backend = nullptr;
+    m_session = nullptr;
+    wl_display_destroy(m_display);
+  }
+
+  const wlr_image_description_v1_data* Server::surfaceImageDescription(wlr_surface* surface) const {
+    if (m_colorManager != nullptr) {
+      if (const wlr_image_description_v1_data* description = m_colorManager->surfaceDescription(surface)) {
+        return description;
+      }
+    }
+    return nullptr;
+  }
+
+  const wlr_image_description_v1_data* Server::surfaceTreeHdrDescription(wlr_surface* surface) const {
+    struct Context {
+      const Server* server;
+      const wlr_image_description_v1_data* description = nullptr;
+    } context{.server = this};
+
+    wlr_surface_for_each_surface(
+        surface,
+        [](wlr_surface* candidate, int, int, void* data) {
+          auto* context = static_cast<Context*>(data);
+          if (context->description != nullptr) {
+            return;
+          }
+          const wlr_image_description_v1_data* description = context->server->surfaceImageDescription(candidate);
+          if (description == nullptr) {
+            return;
+          }
+          const ColorManager* colorManager = context->server->colorManager();
+          if (colorManager != nullptr && colorManager->surfaceRequiresHdrOutput(candidate)) {
+            context->description = description;
+          }
+        },
+        &context
+    );
+    return context.description;
+  }
+
+  void Server::updateColorPreferences() {
+    if (m_colorManager != nullptr) {
+      m_colorManager->updatePreferredDescriptions();
+    }
+  }
+
+  bool Server::start(const char* startupCmd) {
+    const char* socket = wl_display_add_socket_auto(m_display);
+    if (socket == nullptr) {
+      wlr_log(WLR_ERROR, "failed to add Wayland socket");
+      return false;
+    }
+    m_socketName = socket;
+
+    refreshSystemKeymap();
+    if (!wlr_backend_start(m_backend)) {
+      wlr_log(WLR_ERROR, "failed to start backend");
+      return false;
+    }
+    m_backendManager->markStarted();
+
+    // Move the mouse cursor to the first output with "focus_at_startup" enabled, if any.
+    for (const auto& output : m_outputs) {
+      const OutputRule* rule = findOutputRule(config(), output->identity());
+      if (rule == nullptr || !rule->focusAtStartup || !output->desktopEnabled()) {
+        continue;
+      }
+      wlr_box box{};
+      wlr_output_layout_get_box(m_outputLayout, output->wlr(), &box);
+      if (box.width <= 0 || box.height <= 0) {
+        continue;
+      }
+      m_cursor->warpToPreservingFocus(box.x + box.width / 2.0, box.y + box.height / 2.0);
+      break;
+    }
+
+    // These are delivered through the event loop, not a signal handler, so the shutdown path is ordinary code. Note the
+    // side effect: wl_event_loop_add_signal blocks the signal process-wide, and a blocked mask survives fork and exec,
+    // so every fork below must clear it before handing off to a child.
+    wl_event_loop* loop = wl_display_get_event_loop(m_display);
+    m_signalSources[0] = wl_event_loop_add_signal(loop, SIGINT, onTerminateSignal, this);
+    m_signalSources[1] = wl_event_loop_add_signal(loop, SIGTERM, onTerminateSignal, this);
+    m_applicationScopesRequired = !m_nested && isDirectSystemdService(getpid(), std::getenv("SYSTEMD_EXEC_PID"));
+    const char* inheritedNotifySocket = std::getenv("NOTIFY_SOCKET");
+    const std::string notifySocket =
+        m_applicationScopesRequired && inheritedNotifySocket != nullptr ? inheritedNotifySocket : "";
+    unsetenv("NOTIFY_SOCKET");
+    if (m_applicationScopesRequired) {
+      m_systemdRunExecutable = resolveExecutable("systemd-run");
+      m_systemctlExecutable = resolveExecutable("systemctl");
+      m_systemdControlEnvironment = captureSystemdControlEnvironment();
+      const std::string ownerUnit = currentSystemdUnit();
+      m_sessionShutdownAvailable = ownerUnit == "umbriel.service" && !m_systemctlExecutable.empty();
+      if (m_systemdRunExecutable.empty()) {
+        kLog.warn("application scope isolation unavailable: systemd-run was not found on PATH");
+      } else if (ownerUnit.empty()) {
+        kLog.warn("application scope isolation unavailable: cannot identify the compositor unit");
+      } else {
+        m_applicationScopePartOfProperty = "--property=PartOf=umbriel-session.target";
+        m_applicationScopeBindsToProperty = "--property=BindsTo=" + ownerUnit;
+        m_applicationScopeAfterProperty = "--property=After=" + ownerUnit;
+        m_applicationScopeEnvironmentArguments = applicationScopeEnvironmentArguments(config().environment.variables);
+        kLog.info("application processes will use transient scopes under app.slice");
+      }
+    }
+
+    // Point new clients at us. Drop WAYLAND_SOCKET so children do not keep the
+    // parent compositor connection (libwayland prefers it over WAYLAND_DISPLAY).
+    setenv("WAYLAND_DISPLAY", m_socketName.c_str(), true);
+    unsetenv("WAYLAND_SOCKET");
+    kLog.info("running on WAYLAND_DISPLAY={}", m_socketName);
+
+    // Keep clients on hidden workspaces receiving wl_surface.frame ticks
+    // (see kBackgroundFrameIntervalMs and Server::onBackgroundFrameTimer).
+    m_backgroundFrameTimer =
+        wl_event_loop_add_timer(wl_display_get_event_loop(m_display), onBackgroundFrameTimer, this);
+    if (m_backgroundFrameTimer != nullptr) {
+      wl_event_source_timer_update(m_backgroundFrameTimer, kBackgroundFrameIntervalMs);
+    }
+    // Armed only while a hidden window has a background_render rule (see Server::armBackgroundRenderTimer).
+    m_backgroundRenderTimer =
+        wl_event_loop_add_timer(wl_display_get_event_loop(m_display), onBackgroundRenderTimer, this);
+    setenv(
+        "UMBRIEL_SOCKET",
+        (std::string(std::getenv("XDG_RUNTIME_DIR") ?: "") + "/umbriel-" + m_socketName + ".sock").c_str(), true
+    );
+    m_ipc = std::make_unique<Ipc>(*this, m_socketName);
+    setenv("XDG_CURRENT_DESKTOP", "umbriel", 1);
+    setenv("XDG_SESSION_DESKTOP", "umbriel", 1);
+    setenv("XDG_SESSION_TYPE", "wayland", 1);
+
+    // Export cursor settings so X11 clients and toolkit clients pick up the
+    // compositor's configured cursor.
+    const auto& cursorCfg = config().input.cursor;
+    const std::string cursorSize = std::to_string(cursorCfg.size);
+    setenv("XCURSOR_SIZE", cursorSize.c_str(), 1);
+    if (!cursorCfg.theme.empty()) {
+      setenv("XCURSOR_THEME", cursorCfg.theme.c_str(), 1);
+    }
+
+    m_inputCapture = std::make_unique<InputCapture>(*this);
+    m_inputCapture->setAuthorize([this](uint64_t id, std::string_view name, uint32_t persistMode) {
+      requestInputCapture(id, name, persistMode);
+    });
+    m_inputCapture->setAuthorizationCancelled([this](uint64_t id) { cancelInputCapture(id); });
+    m_inputCapture->setActiveChanged([this](bool active) { inputCaptureStateChanged(active); });
+    for (const auto& keyboard : m_keyboards) {
+      if (!keyboard->virtualDevice()) {
+        m_inputCapture->addKeyboard(keyboard->wlr());
+      }
+    }
+    if (m_session != nullptr) {
+      m_sessionActive.notify = onSessionActive;
+      wl_signal_add(&m_session->events.active, &m_sessionActive);
+    }
+
+    // Create the Xwayland server before session services and autostart so X11
+    // applications can connect. It starts lazily: the X display socket exists
+    // now, and Xwayland itself spawns when the first X client connects.
+    if (config().general.xwayland) {
+      m_eisInput = std::make_unique<EisInput>(*this);
+      m_eisInput->setAuthenticate([this](pid_t peer) {
+        return m_xwayland != nullptr && m_xwayland->authenticateInputPeer(peer);
+      });
+      m_eisInput->setAuthorize([this](uint64_t id, std::string_view name) { requestInputEmulation(id, name); });
+      m_eisInput->setAuthorizationCancelled([this](uint64_t id) { cancelInputEmulation(id); });
+      m_xwayland = std::make_unique<Xwayland>(*this);
+      if (m_xwayland->available() && m_xwayland->setInputSocket(m_eisInput->socketFd())) {
+        setenv("DISPLAY", m_xwayland->displayName(), 1);
+      } else {
+        m_xwayland.reset();
+        m_eisInput.reset();
+      }
+    }
+
+    // Wait before applying configured values locally, so the importer keeps
+    // the inherited PATH and bus addresses. Readiness and autostart must not
+    // release session services until these imports have completed.
+    if (!m_nested) {
+      const std::string command = sessionEnvironmentCommand(!notifySocket.empty());
+      if (!runShellCommand(command)) {
+        kLog.error("session environment synchronization failed: {}", std::strerror(errno));
+        if (!notifySocket.empty()) {
+          return false;
+        }
+      }
+    }
+    applyConfiguredEnvironment();
+
+    // Initial libinput switch events are dispatched synchronously inside
+    // wlr_backend_start(). Publish their settled aggregate only after IPC and
+    // the configured child environment are ready.
+    m_lidState.setReady();
+    reconcileLidState();
+
+    m_startTime = std::chrono::steady_clock::now();
+    m_startupRulesTimer = wl_event_loop_add_timer(loop, onStartupRulesTimer, this);
+    if (m_startupRulesTimer != nullptr) {
+      wl_event_source_timer_update(m_startupRulesTimer, kStartupRuleDurationMs);
+    }
+
+#ifdef UMBRIEL_HARNESS
+    // Harness builds only: UMBRIEL_CONFIG_WATCH=0 turns the config file watcher off.
+    const char* watchSetting = std::getenv("UMBRIEL_CONFIG_WATCH");
+    const bool watchConfig = watchSetting == nullptr || std::strcmp(watchSetting, "0") != 0;
+#else
+    constexpr bool watchConfig = true;
+#endif
+    if (watchConfig) {
+      m_configWatcher = std::make_unique<ConfigWatcher>(wl_display_get_event_loop(m_display), [this] {
+        const ConfigReloadResult result = reloadConfig();
+        handleConfigReload(result);
+      });
+      m_configWatcher->watch(configWatchPaths());
+    }
+    m_configBanner = std::make_unique<ConfigBanner>(*this, m_bannerTree);
+    showConfigDiagnostics();
+    m_cheatsheet = std::make_unique<Cheatsheet>(*this, m_cheatsheetTree);
+    if (config().general.showCheatsheet) {
+      m_cheatsheet->showOnStartup();
+    }
+    m_moveMenu = std::make_unique<MoveMenu>(*this, m_moveMenuTree);
+    m_quitConfirm = std::make_unique<QuitConfirm>(*this, m_quitConfirmTree);
+    if (!notifyServiceReady(notifySocket)) {
+      kLog.error("failed to report session readiness: {}", std::strerror(errno));
+      return false;
+    }
+    if (startupCmd != nullptr) {
+      spawn(startupCmd);
+    }
+    for (const std::string& command : config().general.autostart) {
+      spawn(command.c_str());
+    }
+    return true;
+  }
+
+  void Server::showConfigDiagnostics() {
+    std::vector<ConfigDiagnostic> diagnostics = configDiagnostics();
+    if (config().general.xwayland && m_xwayland == nullptr) {
+      ConfigDiagnostic diagnostic;
+      diagnostic.severity = ConfigDiagnostic::Severity::Warning;
+      diagnostic.message =
+          "general.xwayland is enabled, but the Xwayland server could not be created; X11 applications will not work";
+      diagnostics.push_back(std::move(diagnostic));
+    }
+    m_configBanner->show(diagnostics);
+  }
+
+  void Server::markDirty(Dirty what) {
+    m_dirty |= what;
+    // Recording is only useful if a frame follows, so ask for one. Marking work
+    // that nothing then flushes would simply never happen.
+    for (const auto& output : m_outputs) {
+      if (output->wlr() != nullptr) {
+        wlr_output_schedule_frame(output->wlr());
+      }
+    }
+  }
+
+  void Server::relayoutBanner() {
+    if (m_configBanner != nullptr) {
+      m_configBanner->relayout();
+    }
+  }
+
+  void Server::relayoutCheatsheet() {
+    if (m_cheatsheet != nullptr) {
+      m_cheatsheet->relayout();
+    }
+  }
+
+  void Server::relayoutQuitConfirm() {
+    if (m_quitConfirm != nullptr) {
+      m_quitConfirm->relayout();
+    }
+  }
+
+  int Server::onTerminateSignal(int signal, void* data) {
+    kLog.info("received signal {}, shutting down", signal);
+    static_cast<Server*>(data)->stop();
+    return 0;
+  }
+
+  void Server::run() { wl_display_run(m_display); }
+
+  void Server::stop() {
+    m_stopping = true;
+    updateDrmLeaseState();
+    wl_display_terminate(m_display);
+  }
+
+  void Server::requestSessionExit() {
+    if (m_stopping || m_sessionExitRequested) {
+      return;
+    }
+    if (!m_sessionShutdownAvailable) {
+      stop();
+      return;
+    }
+    m_sessionExitRequested = true;
+    int resultPipe[2]{-1, -1};
+    if (pipe2(resultPipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+      kLog.error("cannot create session shutdown pipe: {}", std::strerror(errno));
+      stop();
+      return;
+    }
+    m_sessionExitResultSource = wl_event_loop_add_fd(
+        wl_display_get_event_loop(m_display), resultPipe[0], WL_EVENT_READABLE,
+        [](int fd, uint32_t mask, void* data) {
+          auto* server = static_cast<Server*>(data);
+          char result = 0;
+          ssize_t size = 0;
+          do {
+            size = read(fd, &result, sizeof(result));
+          } while (size < 0 && errno == EINTR);
+          if (size < 0 && errno == EAGAIN && (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) == 0) {
+            return 0;
+          }
+          wl_event_source_remove(server->m_sessionExitResultSource);
+          server->m_sessionExitResultSource = nullptr;
+          close(fd);
+          server->m_sessionExitResultFd = -1;
+          if (size != 1 || result != 'x') {
+            kLog.error("session shutdown request failed; stopping the compositor directly");
+            server->stop();
+          }
+          return 0;
+        },
+        this
+    );
+    if (m_sessionExitResultSource == nullptr) {
+      close(resultPipe[0]);
+      close(resultPipe[1]);
+      kLog.error("cannot monitor the session shutdown request");
+      stop();
+      return;
+    }
+    m_sessionExitResultFd = resultPipe[0];
+    const std::string command = shellQuote(m_systemctlExecutable)
+        + " --user start --job-mode=replace-irreversibly --no-block umbriel-shutdown.target 1>&2 && printf x";
+    const pid_t pid = fork();
+    if (pid == 0) {
+      resetChildSignalState();
+      restoreFileDescriptorLimit();
+      close(resultPipe[0]);
+      if (dup2(resultPipe[1], STDOUT_FILENO) < 0
+          || fcntl(STDOUT_FILENO, F_SETFD, 0) < 0
+          || !closeChildFileDescriptors()
+          || !restoreSystemdControlEnvironment(m_systemdControlEnvironment)) {
+        _exit(1);
+      }
+      execl("/bin/sh", "/bin/sh", "-c", command.c_str(), nullptr);
+      _exit(1);
+    }
+    if (pid < 0) {
+      kLog.error("cannot fork the session shutdown request: {}", std::strerror(errno));
+      stop();
+    }
+    close(resultPipe[1]);
+  }
+
+  uint32_t Server::modKey() const {
+    if (!config().general.modKey) {
+      return m_nested ? WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
+    }
+    switch (*config().general.modKey) {
+    case ModifierKey::Super:
+      return WLR_MODIFIER_LOGO;
+    case ModifierKey::Alt:
+      return WLR_MODIFIER_ALT;
+    case ModifierKey::Control:
+      return WLR_MODIFIER_CTRL;
+    case ModifierKey::Shift:
+      return WLR_MODIFIER_SHIFT;
+    }
+    return WLR_MODIFIER_LOGO;
+  }
+
+  std::string_view Server::modKeyName() const {
+    if (!config().general.modKey) {
+      return m_nested ? "Alt" : "Super";
+    }
+    switch (*config().general.modKey) {
+    case ModifierKey::Super:
+      return "Super";
+    case ModifierKey::Alt:
+      return "Alt";
+    case ModifierKey::Control:
+      return "Ctrl";
+    case ModifierKey::Shift:
+      return "Shift";
+    }
+    return "Super";
+  }
+
+  HintRect& Server::insertHint() {
+    if (m_insertHint == nullptr) {
+      m_insertHint = std::make_unique<HintRect>(*this, dragTree());
+    }
+    return *m_insertHint;
+  }
+
+  void Server::hideInsertHint() {
+    if (m_insertHint != nullptr) {
+      m_insertHint->hideImmediate();
+    }
+  }
+
+  void Server::setEffectLightLayer(bool present) {
+    if (present && m_effectLightTree == nullptr && m_dragIconTree != nullptr) {
+      // Ring illumination stays below panels and pinned content, above dragged windows.
+      m_effectLightTree = wlr_scene_tree_create(&m_scene->tree);
+      wlr_scene_node_place_above(&m_effectLightTree->node, &m_dragIconTree->node);
+      wlr_scene_set_effect_light_layer(m_scene, m_effectLightTree);
+    } else if (!present && m_effectLightTree != nullptr) {
+      wlr_scene_set_effect_light_layer(m_scene, nullptr);
+      wlr_scene_node_destroy(&m_effectLightTree->node);
+      m_effectLightTree = nullptr;
+    }
+  }
+
+  wlr_scene_tree* Server::shellLayerTree(uint32_t layer) const {
+    if (layer >= kLayerCount) {
+      return m_shellLayerTrees[ZWLR_LAYER_SHELL_V1_LAYER_TOP];
+    }
+    return m_shellLayerTrees[layer];
+  }
+
+  void Server::spawn(const char* command, const char* description, bool withActivationToken) {
+    if (m_socketName.empty()) {
+      wlr_log(WLR_ERROR, "cannot spawn before the Wayland socket exists");
+      return;
+    }
+
+    const bool scopeRequired = m_applicationScopesRequired;
+    if (scopeRequired
+        && (m_systemdRunExecutable.empty()
+            || m_applicationScopePartOfProperty.empty()
+            || m_applicationScopeBindsToProperty.empty()
+            || m_applicationScopeAfterProperty.empty())) {
+      kLog.error("cannot launch application because systemd scope isolation is unavailable");
+      return;
+    }
+    const std::string scopeUnitArgument = scopeRequired
+        ? "--unit=app-umbriel-" + std::to_string(getpid()) + "-" + std::to_string(m_nextApplicationScopeId++) + ".scope"
+        : "";
+
+    wlr_xdg_activation_token_v1* launchToken = nullptr;
+    std::string launchTokenName;
+    if (withActivationToken && m_xdgActivation != nullptr) {
+      launchToken = wlr_xdg_activation_token_v1_create(m_xdgActivation);
+      if (launchToken != nullptr) {
+        const char* name = wlr_xdg_activation_token_v1_get_name(launchToken);
+        if (name != nullptr) {
+          launchTokenName = name;
+        }
+      }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      if (launchToken != nullptr) {
+        wlr_xdg_activation_token_v1_destroy(launchToken);
+      }
+      wlr_log(WLR_ERROR, "fork failed");
+      return;
+    }
+    if (pid == 0) {
+      resetChildSignalState();
+      restoreFileDescriptorLimit();
+      if (scopeRequired
+          && (!closeChildFileDescriptors() || !restoreSystemdControlEnvironment(m_systemdControlEnvironment))) {
+        _exit(1);
+      }
+      setenv("WAYLAND_DISPLAY", m_socketName.c_str(), 1);
+      unsetenv("WAYLAND_SOCKET");
+      unsetenv("LIBEI_SOCKET");
+      if (m_xwayland != nullptr) {
+        setenv("DISPLAY", m_xwayland->displayName(), 1);
+      } else {
+        // Avoid X11/XWayland fallback into the parent session.
+        unsetenv("DISPLAY");
+      }
+      if (!launchTokenName.empty()) {
+        setenv("XDG_ACTIVATION_TOKEN", launchTokenName.c_str(), 1);
+        setenv("DESKTOP_STARTUP_ID", launchTokenName.c_str(), 1);
+        setenv(kLaunchTokenEnvironment.data(), launchTokenName.c_str(), 1);
+      } else {
+        unsetenv("XDG_ACTIVATION_TOKEN");
+        unsetenv("DESKTOP_STARTUP_ID");
+        unsetenv(kLaunchTokenEnvironment.data());
+      }
+      if (scopeRequired) {
+        execApplicationInScope(
+            m_systemdRunExecutable.c_str(), scopeUnitArgument.c_str(), m_applicationScopePartOfProperty.c_str(),
+            m_applicationScopeBindsToProperty.c_str(), m_applicationScopeAfterProperty.c_str(),
+            m_applicationScopeEnvironmentArguments, command
+        );
+      }
+      execl("/bin/sh", "/bin/sh", "-c", command, nullptr);
+      _exit(1);
+    }
+
+    if (launchToken != nullptr) {
+      trackActivationToken(launchToken, true, pid);
+    }
+    if (scopeRequired) {
+      wlr_log(
+          WLR_INFO, "launch requested for '%s' on WAYLAND_DISPLAY=%s", description == nullptr ? command : description,
+          m_socketName.c_str()
+      );
+    } else {
+      wlr_log(
+          WLR_INFO, "spawned '%s' on WAYLAND_DISPLAY=%s", description == nullptr ? command : description,
+          m_socketName.c_str()
+      );
+    }
+  }
+
+  void Server::updateSeatCapabilities() { m_seat->updateCapabilities(!m_keyboards.empty(), !m_touchDevices.empty()); }
+
+  void Server::reconcileDynamicWorkspaces() {
+    for (const auto& output : m_outputs) {
+      if (WorkspaceGroup* group = output->workspaceGroup()) {
+        group->reconcileDynamic();
+      }
+    }
+  }
+
+  Server::CloseSnapshot::CloseSnapshot(
+      Server& server, CloseSnapshotId id, Output* output, wlr_scene_tree* tree, wlr_scene_tree* content,
+      std::vector<BorderSnapshot> borders, const wlr_box& box, int durationMs, const AnimationCurve& curve,
+      std::string_view style, double scale, AnimationEvent event, ShadowSnapshot shadow, int topExtension
+  )
+      : m_server(&server), m_id(id), m_tree(tree), m_content(content != nullptr ? content : tree), m_output(output),
+        m_captured(box), m_canvasX(tree->node.x), m_canvasY(tree->node.y), m_borders(std::move(borders)),
+        m_shadow(shadow) {
+    m_topExtension = topExtension;
+    m_event = event;
+    m_blurBackground =
+        output != nullptr && tree->node.parent == output->layerTree(ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND);
+    const fx_effect_requirements requirements = wlr_scene_node_effect_requirements(&tree->node);
+    m_retainedPersistent = requirements.persistent;
+    m_retainedInPlace = requirements.in_place;
+    m_retainedLight = requirements.light;
+    server.effects().retainRequirements(requirements);
+    if (m_shadow.node != nullptr) {
+      m_shadowWidth = m_shadow.node->width;
+      m_shadowHeight = m_shadow.node->height;
+      m_shadowHole = m_shadow.node->clipped_region.area;
+    }
+    if (m_content != nullptr && box.width > 0 && box.height > 0) {
+      const wlr_box clip{.x = 0, .y = 0, .width = box.width, .height = box.height};
+      wlr_scene_tree_set_clip(m_content, &clip);
+    }
+    struct CaptureCtx {
+      std::vector<Buffer>* buffers;
+    } ctx{&m_buffers};
+    wlr_scene_node_for_each_buffer(
+        &m_tree->node,
+        [](wlr_scene_buffer* buffer, int, int, void* data) {
+          auto& ctx = *static_cast<CaptureCtx*>(data);
+          int width = buffer->dst_width;
+          int height = buffer->dst_height;
+          if (width <= 0 || height <= 0) {
+            width = buffer->buffer != nullptr ? buffer->buffer->width : 0;
+            height = buffer->buffer != nullptr ? buffer->buffer->height : 0;
+          }
+          ctx.buffers->push_back({
+              .node = buffer,
+              .baseOpacity = buffer->opacity,
+              .x = buffer->node.x,
+              .y = buffer->node.y,
+              .width = width,
+              .height = height,
+          });
+        },
+        &ctx
+    );
+    const auto captureNodes = [&](auto&& visit, wlr_scene_tree* tree) -> void {
+      wlr_scene_node* node;
+      wl_list_for_each(node, &tree->children, link) {
+        if (node->type == WLR_SCENE_NODE_TREE) {
+          visit(visit, wlr_scene_tree_from_node(node));
+        } else if (node->type == WLR_SCENE_NODE_RECT) {
+          auto* rect = wlr_scene_rect_from_node(node);
+          m_rects.push_back(
+              {rect,
+               {rect->color[0], rect->color[1], rect->color[2], rect->color[3]},
+               {node->x, node->y, rect->width, rect->height},
+               rect->corners.top_left}
+          );
+        } else if (node->type == WLR_SCENE_NODE_BLUR) {
+          auto* blur = wlr_scene_blur_from_node(node);
+          m_blurs.push_back({
+              blur,
+              blur->alpha,
+              {node->x, node->y, blur->width, blur->height},
+              {blur->corners.top_left, blur->corners.top_right, blur->corners.bottom_right, blur->corners.bottom_left},
+          });
+        }
+      }
+    };
+    captureNodes(captureNodes, m_tree);
+    m_alpha.snap(1.0);
+    m_alpha.retarget(0.0, durationMs, curve);
+
+    if (effectRegistry().animationEffect(event) == nullptr) {
+      if (style == "slide") {
+        m_slide.snap(0.0);
+        m_slide.retarget(80.0, durationMs, curve);
+      } else if (style == "zoom") {
+        m_shrinkTo = 0.5;
+      } else if (style == "popin") {
+        m_shrinkTo = std::clamp(scale, 0.1, 1.0);
+      }
+    }
+  }
+
+  Server::CloseSnapshot::~CloseSnapshot() {
+    if (m_server != nullptr) {
+      m_server->unregisterAnimatable(this);
+    }
+    if (m_shadow.tree != nullptr) {
+      wlr_scene_node_destroy(&m_shadow.tree->node);
+    }
+    if (m_tree != nullptr) {
+      wlr_scene_node_destroy(&m_tree->node);
+    }
+    if (m_blurBackground && m_output != nullptr) {
+      m_output->markBlurBackgroundDirty();
+    }
+    if (m_server != nullptr) {
+      m_server->effects().releaseRequirements(
+          {.persistent = m_retainedPersistent, .in_place = m_retainedInPlace, .light = m_retainedLight}
+      );
+    }
+  }
+
+  void Server::CloseSnapshot::applyShrink(int width, int height) {
+    // Every border in a snapshot comes from one window, so the first one carries its ring.
+    const BorderSnapshot captured = m_borders.empty() ? BorderSnapshot{} : m_borders.front();
+    // Once the box is thinner than its own ring, shrink the ring with it so the decorated geometry collapses
+    // continuously instead of disappearing in one frame.
+    const int fullExtent = captured.innerWidth + captured.outerWidth;
+    const double ringScale =
+        fullExtent > 0 ? std::clamp(static_cast<double>(std::min(width, height)) / (2 * fullExtent), 0.0, 1.0) : 1.0;
+    const int innerWidth = static_cast<int>(std::lround(captured.innerWidth * ringScale));
+    const int outerWidth = static_cast<int>(std::lround(captured.outerWidth * ringScale));
+    const int radius = static_cast<int>(std::lround(captured.cornerRadius * ringScale));
+    const int padding = static_cast<int>(std::lround(captured.padding * ringScale));
+    const int top = m_captured.height > 0
+        ? static_cast<int>(std::lround(static_cast<double>(m_topExtension) * height / m_captured.height))
+        : 0;
+    BorderRing ring = makeBorderRing(width, height + top, radius, innerWidth, outerWidth, padding);
+    ring.box.y -= top;
+    const bool ringVisible = innerWidth + outerWidth > 0;
+    wlr_box treeClip = m_borders.empty() || !ringVisible ? wlr_box{0, -top, width, height + top} : ring.box;
+    // A frozen drag deformation draws past the box by its slot's expand.
+    const int expand = wlr_scene_node_animation_expand(&m_tree->node);
+    treeClip = {treeClip.x - expand, treeClip.y - expand, treeClip.width + 2 * expand, treeClip.height + 2 * expand};
+    wlr_scene_tree_set_clip(m_tree, &treeClip);
+
+    if (m_content != nullptr && m_captured.width > 0 && m_captured.height > 0) {
+      // Scale the frozen buffers into the shrinking box just like a live view's presented resize. The windows_out
+      // AnimatedValue remains the sole lifecycle clock.
+      const double scaleX = static_cast<double>(width) / m_captured.width;
+      const double scaleY = static_cast<double>(height) / m_captured.height;
+      for (const Buffer& buffer : m_buffers) {
+        wlr_scene_node_set_position(
+            &buffer.node->node, static_cast<int>(std::lround(buffer.x * scaleX)),
+            static_cast<int>(std::lround(buffer.y * scaleY))
+        );
+        wlr_scene_buffer_set_dest_size(
+            buffer.node, std::max(1, static_cast<int>(std::lround(buffer.width * scaleX))),
+            std::max(1, static_cast<int>(std::lround(buffer.height * scaleY)))
+        );
+      }
+      for (const Rect& rect : m_rects) {
+        wlr_scene_node_set_position(
+            &rect.node->node, static_cast<int>(std::lround(rect.box.x * scaleX)),
+            static_cast<int>(std::lround(rect.box.y * scaleY))
+        );
+        wlr_scene_rect_set_size(
+            rect.node, std::max(1, static_cast<int>(std::lround(rect.box.width * scaleX))),
+            std::max(1, static_cast<int>(std::lround(rect.box.height * scaleY)))
+        );
+        const int r = static_cast<int>(std::lround(rect.radius * std::min(scaleX, scaleY)));
+        const bool background = rect.box.y == -m_topExtension && rect.box.width == m_captured.width;
+        wlr_scene_rect_set_corner_radii(rect.node, background ? corner_radii_new(r, r, 0, 0) : corner_radii_all(r));
+      }
+      for (const Blur& blur : m_blurs) {
+        wlr_scene_node_set_position(
+            &blur.node->node, static_cast<int>(std::lround(blur.box.x * scaleX)),
+            static_cast<int>(std::lround(blur.box.y * scaleY))
+        );
+        wlr_scene_blur_set_size(
+            blur.node, std::max(1, static_cast<int>(std::lround(blur.box.width * scaleX))),
+            std::max(1, static_cast<int>(std::lround(blur.box.height * scaleY)))
+        );
+        const auto radius = [&](size_t corner) {
+          return static_cast<int>(std::lround(blur.radii[corner] * std::min(scaleX, scaleY)));
+        };
+        wlr_scene_blur_set_corner_radii(blur.node, corner_radii_new(radius(0), radius(1), radius(2), radius(3)));
+      }
+      if (m_content != m_tree) {
+        const wlr_box contentClip{0, 0, width, height};
+        wlr_scene_tree_set_clip(m_content, &contentClip);
+      }
+    }
+
+    for (auto& border : m_borders) {
+      wlr_scene_node_set_enabled(&border.node->node, ringVisible);
+      applyBorderGeometry(border.node, ring, innerWidth, outerWidth);
+    }
+    if (m_shadow.node != nullptr) {
+      const int dw = width - m_captured.width;
+      const int dh = height - m_captured.height;
+      wlr_scene_tree_set_clip(m_shadow.tree, nullptr);
+      wlr_scene_shadow_set_size(m_shadow.node, std::max(0, m_shadowWidth + dw), std::max(0, m_shadowHeight + dh));
+      clipped_region shadowClip = m_shadow.node->clipped_region;
+      shadowClip.area = {
+          m_shadowHole.x,
+          m_shadowHole.y,
+          std::max(0, m_shadowHole.width + dw),
+          std::max(0, m_shadowHole.height + dh),
+      };
+      wlr_scene_shadow_set_clipped_region(m_shadow.node, shadowClip);
+    }
+  }
+
+  void Server::CloseSnapshot::applyPresentation() {
+    if (!m_visible) {
+      // An empty output clip keeps a custom shader's feedback history alive without compositing; a plain snapshot is
+      // disabled.
+      constexpr wlr_box kEmpty{0, 0, 0, 0};
+      const bool animated = wlr_scene_node_set_animation_output_clip(&m_tree->node, &kEmpty);
+      wlr_scene_node_set_enabled(&m_tree->node, animated);
+      if (m_shadow.tree != nullptr) {
+        wlr_scene_node_set_enabled(&m_shadow.tree->node, false);
+      }
+      return;
+    }
+    const bool shrinks = m_shrinkTo < 1.0 && m_captured.width > 0 && m_captured.height > 0;
+    const double closeProgress = 1.0 - std::clamp(m_alpha.current(), 0.0, 1.0);
+    const double scale = shrinks ? std::lerp(1.0, m_shrinkTo, closeProgress) : 1.0;
+    const int width = std::max(1, static_cast<int>(std::lround(m_captured.width * scale)));
+    const int height = std::max(1, static_cast<int>(std::lround(m_captured.height * scale)));
+    const int x = m_canvasX + (shrinks ? (m_captured.width - width) / 2 : 0);
+    const int y =
+        m_canvasY + (shrinks ? (m_captured.height - height) / 2 : 0) + static_cast<int>(std::lround(m_slide.current()));
+    wlr_scene_node_set_position(&m_tree->node, x, y);
+    if (m_shadow.tree != nullptr) {
+      wlr_scene_node_set_position(&m_shadow.tree->node, x, y);
+    }
+    (void)wlr_scene_node_set_animation_output_clip(&m_tree->node, nullptr);
+    wlr_scene_node_set_enabled(&m_tree->node, true);
+    if (m_shadow.tree != nullptr) {
+      wlr_scene_node_set_enabled(&m_shadow.tree->node, true);
+    }
+    if (shrinks) {
+      applyShrink(width, height);
+      return;
+    }
+    wlr_scene_tree_set_clip(m_tree, nullptr);
+    if (m_shadow.tree != nullptr) {
+      wlr_scene_tree_set_clip(m_shadow.tree, nullptr);
+    }
+  }
+
+  void Server::CloseSnapshot::present(int canvasX, int canvasY, bool visible) {
+    m_canvasX = canvasX;
+    m_canvasY = canvasY;
+    m_visible = visible;
+    applyPresentation();
+  }
+
+  bool Server::CloseSnapshot::tickAnimations(double nowMsec) {
+    const bool movedAlpha = m_alpha.tick(nowMsec);
+    const bool movedSlide = m_slide.tick(nowMsec);
+    bindAnimationEffect(&m_tree->node, m_event, m_alpha, -1.0F);
+
+    if (!movedAlpha && !movedSlide) {
+      return false;
+    }
+    // Overshooting curves can push this out of range; wlr_scene_buffer_set_opacity asserts opacity is in [0, 1].
+    const float rawAlpha = std::clamp(static_cast<float>(m_alpha.current()), 0.0F, 1.0F);
+    // A lifecycle shader fades the whole snapshot at once, so its buffers and borders stay opaque under it.
+    const bool composited = effectRegistry().lifecycleEffect(m_event) != nullptr;
+    const bool builtInSlide = !composited && m_slide.target() != m_slide.from();
+    // Keep the moving snapshot visible long enough for slide to read as motion. Fade keeps the configured timeline.
+    const float alpha = composited ? 1.0F : (builtInSlide ? std::sqrt(rawAlpha) : rawAlpha);
+    for (const Buffer& buffer : m_buffers) {
+      wlr_scene_buffer_set_opacity(buffer.node, std::clamp(buffer.baseOpacity * alpha, 0.0F, 1.0F));
+    }
+    for (const Rect& rect : m_rects) {
+      auto color = rect.color;
+      for (float& channel : color)
+        channel *= alpha;
+      wlr_scene_rect_set_color(rect.node, color.data());
+    }
+    for (const Blur& blur : m_blurs)
+      wlr_scene_blur_set_alpha(blur.node, blur.baseAlpha * alpha);
+    for (auto& border : m_borders) {
+      float innerColor[4];
+      float outerColor[4];
+      premultiplied(innerColor, border.innerColor, alpha);
+      premultiplied(outerColor, border.outerColor, alpha);
+      wlr_scene_border_set_colors(border.node, innerColor, outerColor);
+    }
+
+    if (m_shadow.node != nullptr) {
+      auto color = m_shadow.color;
+      color[3] *= builtInSlide ? alpha : rawAlpha;
+      wlr_scene_shadow_set_color(m_shadow.node, color.data());
+    }
+
+    applyPresentation();
+    if (m_blurBackground && m_output != nullptr) {
+      m_output->markBlurBackgroundDirty();
+    }
+    return m_alpha.animating() || m_slide.animating();
+  }
+
+  void Server::registerAnimatable(Animatable* animatable) {
+    if (animatable == nullptr) {
+      return;
+    }
+    // Insert after every owner in an earlier or equal phase, so the registry
+    // stays in phase order and registration order is preserved within a phase.
+    const auto phase = animatable->animationPhase();
+    const auto at = std::ranges::find_if(m_animatables, [phase](const Animatable* entry) {
+      return entry->animationPhase() > phase;
+    });
+    m_animatables.insert(at, animatable);
+  }
+
+  void Server::unregisterAnimatable(Animatable* animatable) { std::erase(m_animatables, animatable); }
+
+  bool Server::tickAnimations(double nowMsec) {
+    UMBRIEL_ZONE("Server::tickAnimations");
+    // Outputs tick at their own vblank instants, which interleave. Animation state is shared, so an earlier instant
+    // than the last tick never moves it backwards.
+    if (nowMsec <= m_lastAnimTickMsec) {
+      return animationsActive();
+    }
+    m_lastAnimTickMsec = nowMsec;
+
+    bool active = false;
+    // Iterate a copy so a registration during the pass cannot invalidate the walk. Nothing unregisters mid-pass:
+    // snapshots are reaped below rather than from their own tick, and no owner destroys another. The phase order is
+    // what makes that hold, since finishing the overview calls focusView, which reorders the view registry after every
+    // view has already ticked.
+    m_animatablesScratch.assign(m_animatables.begin(), m_animatables.end());
+    for (Animatable* owner : m_animatablesScratch) {
+      active = owner->tickAnimations(nowMsec) || active;
+    }
+
+    // A snapshot only exists while fading out, so a settled one is finished.
+    // Erasing destroys its scene tree and unregisters it.
+    std::erase_if(m_closeSnapshots, [this](const std::unique_ptr<CloseSnapshot>& snap) {
+      if (snap->hasActiveAnimations()) {
+        return false;
+      }
+      unregisterAnimatable(snap.get());
+      return true;
+    });
+    return active;
+  }
+
+  bool Server::animationsActive() const {
+    return std::ranges::any_of(m_animatables, [](const Animatable* owner) { return owner->hasActiveAnimations(); });
+  }
+
+  bool Server::animationsActiveFor(const Output* output) const {
+    if (output == nullptr) {
+      return false;
+    }
+    return std::ranges::any_of(m_animatables, [output](const Animatable* owner) {
+      return owner->hasActiveAnimations() && owner->animatesOn(output);
+    });
+  }
+
+  namespace {
+    uint64_t monotonicClockMsec() {
+      timespec now{};
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      return static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1'000'000;
+    }
+  } // namespace
+
+  uint64_t Server::animationClockMsec() const {
+    return static_cast<uint64_t>(animationFrameClockMsec(static_cast<double>(monotonicClockMsec())));
+  }
+
+  double Server::animationFrameClockMsec(double monotonicMsec) const {
+#ifdef UMBRIEL_HARNESS
+    if (m_frozenAnimationClockMsec) {
+      return static_cast<double>(*m_frozenAnimationClockMsec);
+    }
+    return monotonicMsec + static_cast<double>(m_animationClockOffsetMsec);
+#else
+    return monotonicMsec;
+#endif
+  }
+
+#ifdef UMBRIEL_HARNESS
+  void Server::freezeAnimationClock() {
+    if (!m_frozenAnimationClockMsec) {
+      m_frozenAnimationClockMsec = animationClockMsec();
+    }
+    // The frozen instant may equal the last tick's; ticking it once more lets views re-sync their effects'
+    // clockAdvancing on the next frame instead of skipping it as a repeat.
+    m_lastAnimTickMsec = 0;
+    for (const auto& output : m_outputs) {
+      wlr_output_schedule_frame(output->wlr());
+    }
+  }
+
+  bool Server::advanceAnimationClock(uint64_t ms) {
+    if (!m_frozenAnimationClockMsec) {
+      return false;
+    }
+    // An action taken while frozen may have left its arrange for the next frame; run it now so the motion it starts
+    // belongs to this instant. Every frame since the freeze ticked the same instant, which the tick skips as a repeat,
+    // so an animation that began meanwhile has no start time yet. Tick once more at that instant to give it one.
+    for (const auto& output : m_outputs) {
+      if (WorkspaceGroup* group = output->workspaceGroup()) {
+        group->flushArrange();
+      }
+    }
+    m_lastAnimTickMsec = 0;
+    tickAnimations(static_cast<double>(*m_frozenAnimationClockMsec));
+    *m_frozenAnimationClockMsec += ms;
+    for (const auto& output : m_outputs) {
+      wlr_output_schedule_frame(output->wlr());
+    }
+    return true;
+  }
+
+  void Server::resumeAnimationClock() {
+    if (m_frozenAnimationClockMsec) {
+      m_animationClockOffsetMsec =
+          static_cast<int64_t>(*m_frozenAnimationClockMsec) - static_cast<int64_t>(monotonicClockMsec());
+      m_frozenAnimationClockMsec.reset();
+    }
+    for (const auto& output : m_outputs) {
+      wlr_output_schedule_frame(output->wlr());
+    }
+  }
+
+  void Server::emitRendererLostForTest() { wl_signal_emit_mutable(&m_renderer->events.lost, nullptr); }
+
+  bool Server::injectPlaneCursor(std::string_view spec, std::string* error) {
+    std::istringstream stream{std::string(spec)};
+    std::string name;
+    double x = 0.0;
+    double y = 0.0;
+    int visible = 0;
+    std::uint64_t image = 0;
+    // Geometry and hotspot default to the 24x24 hotspot-0 cursor, so existing checks keep working unchanged.
+    int width = 24;
+    int height = 24;
+    int hotspotX = 0;
+    int hotspotY = 0;
+    if (!(stream >> name >> x >> y >> visible >> image)) {
+      *error = "plane-cursor needs '<output> <x> <y> <visible> <image> [width height hotspot_x hotspot_y]'";
+      return false;
+    }
+    if (!(stream >> width >> height >> hotspotX >> hotspotY)) {
+      width = 24;
+      height = 24;
+      hotspotX = 0;
+      hotspotY = 0;
+    }
+    for (const auto& output : m_outputs) {
+      if (name != output->wlr()->name) {
+        continue;
+      }
+      output->setSyntheticPlaneCursorForTest(
+          x, y, visible != 0, static_cast<std::uintptr_t>(image), width, height, hotspotX, hotspotY
+      );
+      wl_signal_emit_mutable(&output->wlr()->events.needs_frame, nullptr);
+      return true;
+    }
+    *error = "no such output: " + name;
+    return false;
+  }
+#endif
+
+  bool Server::settled() const {
+    if (std::ranges::any_of(m_animatables, [](const Animatable* owner) { return owner->hasActiveAnimations(); })) {
+      return false;
+    }
+    // A window whose latest configure is still queued, or not yet acknowledged and committed, has not drawn the state
+    // the compositor asked for.
+    for (const auto& view : m_registry.all()) {
+      if (view->effectSelectionPending()) {
+        return false;
+      }
+      if (view->mapped() && view->configureOutstanding()) {
+        return false;
+      }
+    }
+    for (const auto& output : m_outputs) {
+      const WorkspaceGroup* group = output->workspaceGroup();
+      if (group == nullptr) {
+        continue;
+      }
+      for (size_t index = 0; index < group->workspaceCount(); ++index) {
+        if (const Workspace* workspace = group->workspaceAt(index);
+            workspace != nullptr && workspace->arrangePending()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  CloseSnapshotId Server::animateCloseSnapshot(
+      Output* output, wlr_scene_tree* tree, wlr_scene_tree* content, std::vector<BorderSnapshot> borders,
+      const wlr_box& box, std::optional<CloseSnapshotOverrides> overrides, ShadowSnapshot shadow, int topExtension
+  ) {
+    int durationMs = 0;
+    AnimationCurve curve{.easing = Easing::Snappy};
+    std::string style = "fade";
+    double scale = 0.8;
+    if (overrides) {
+      durationMs = overrides->durationMs;
+      curve = overrides->curve;
+      style = overrides->style;
+      scale = overrides->scale;
+    } else {
+      const auto& animation = config().animation;
+      const auto& close = animation.windowsOut;
+      if (!animation.enabled || !close.enabled) {
+        if (shadow.tree != nullptr) {
+          wlr_scene_node_destroy(&shadow.tree->node);
+        }
+        wlr_scene_node_destroy(&tree->node);
+        return kInvalidCloseSnapshot;
+      }
+      durationMs = close.durationMs;
+      curve = close.curve;
+      style = close.style;
+      scale = close.scale;
+    }
+    if (durationMs <= 0) {
+      if (shadow.tree != nullptr) {
+        wlr_scene_node_destroy(&shadow.tree->node);
+      }
+      wlr_scene_node_destroy(&tree->node);
+      return kInvalidCloseSnapshot;
+    }
+
+    const CloseSnapshotId id = m_nextCloseSnapshotId++;
+    auto snapshot = std::make_unique<CloseSnapshot>(
+        *this, id, output, tree, content, std::move(borders), box, durationMs, curve, style, scale,
+        overrides ? overrides->event : AnimationEvent::WindowsOut, shadow, topExtension
+    );
+    registerAnimatable(snapshot.get());
+    m_closeSnapshots.push_back(std::move(snapshot));
+    return id;
+  }
+
+  void Server::presentCloseSnapshot(CloseSnapshotId id, int canvasX, int canvasY, bool visible) {
+    for (const auto& snapshot : m_closeSnapshots) {
+      if (snapshot->id() == id) {
+        snapshot->present(canvasX, canvasY, visible);
+        return;
+      }
+    }
+  }
+
+  bool Server::closeSnapshotAlive(CloseSnapshotId id) const {
+    return std::ranges::any_of(m_closeSnapshots, [id](const std::unique_ptr<CloseSnapshot>& snapshot) {
+      return snapshot->id() == id;
+    });
+  }
+
+  uint64_t Server::uptimeMs() const {
+    const auto diff = std::chrono::steady_clock::now() - m_startTime;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(diff).count();
+  }
+} // namespace umbriel

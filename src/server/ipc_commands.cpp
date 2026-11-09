@@ -1,0 +1,1542 @@
+#include "server/ipc_commands.h"
+
+#include "config/change.h"
+#include "config/config.h"
+#include "input/cursor.h"
+#include "input/input_capture.h"
+#include "layer/layer_surface.h"
+#include "output/identity.h"
+#include "output/output.h"
+#include "scene/effect_registry.h"
+#include "scene/effect_selection.h"
+#include "server/action_request.h"
+#include "server/focus.h"
+#include "server/ipc.h"
+#include "server/server.h"
+#include "view/view.h"
+#include "wlr.h"
+#include "workspace/scratchpad.h"
+#include "workspace/workspace.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <drm_fourcc.h>
+#include <format>
+#include <map>
+#include <nlohmann/json.hpp>
+#include <print>
+#include <sstream>
+#include <string>
+#include <utility>
+
+extern "C" {
+#include <umbrielfx/render/effect.h>
+}
+
+namespace umbriel {
+
+  nlohmann::json IpcCommands::inputCapturePermissions(Server& server, IpcArgs /*args*/) {
+    auto result = nlohmann::json::array();
+    if (auto* capture = server.inputCapture()) {
+      for (const auto& permission : capture->permissions()) {
+        result.push_back(
+            {{"id", permission.id},
+             {"application", permission.application},
+             {"capabilities", permission.capabilities},
+             {"persist_mode", permission.persistMode}}
+        );
+      }
+    }
+    return nlohmann::json{{"ok", std::move(result)}};
+  }
+
+  nlohmann::json IpcCommands::inputCaptureRevoke(Server& server, IpcArgs args) {
+    if (args.size() != 1 || args.front().empty() || args.front().find_first_of(" \t\r\n") != std::string::npos) {
+      return nlohmann::json{{"err", "usage: input-capture-revoke <id|all>"}};
+    }
+    auto* capture = server.inputCapture();
+    if (capture == nullptr || !capture->revokePermission(args.front())) {
+      return nlohmann::json{{"err", "unable to revoke input capture permission (invalid id or state write failed)"}};
+    }
+    return nlohmann::json{{"ok", true}};
+  }
+
+  std::optional<EffectAudio> IpcCommands::parseAudioSpectrum(const nlohmann::json& request) {
+    if (!request.is_object()
+        || request.size() != 3
+        || !request.contains("cmd")
+        || request["cmd"] != "effect-audio"
+        || !request.contains("version")
+        || !request["version"].is_number_integer()
+        || request["version"] != 2
+        || !request.contains("bands")
+        || !request["bands"].is_array()
+        || request["bands"].size() != FX_AUDIO_BANDS) {
+      return std::nullopt;
+    }
+    EffectAudio audio{};
+    for (size_t i = 0; i < FX_AUDIO_BANDS; ++i) {
+      const auto& band = request["bands"][i];
+      if (!band.is_number()) {
+        return std::nullopt;
+      }
+      const double value = band.get<double>();
+      if (std::isnan(value) || value < 0.0 || value > 1.0) {
+        return std::nullopt;
+      }
+      audio[i] = static_cast<float>(value);
+    }
+    audio[FX_AUDIO_BANDS] = 1.0F;
+    return audio;
+  }
+
+  namespace {
+    const char* layerName(uint32_t layer) {
+      switch (layer) {
+      case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+        return "background";
+      case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+        return "bottom";
+      case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+        return "top";
+      case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+        return "overlay";
+      default:
+        return "unknown";
+      }
+    }
+
+    const char* keyboardInteractivityName(uint32_t interactivity) {
+      switch (interactivity) {
+      case ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE:
+        return "none";
+      case ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE:
+        return "exclusive";
+      case ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND:
+        return "on_demand";
+      default:
+        return "unknown";
+      }
+    }
+
+    constexpr std::pair<uint32_t, const char*> kLayerAnchors[] = {
+        {ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP, "top"},
+        {ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM, "bottom"},
+        {ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT, "left"},
+        {ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT, "right"},
+    };
+
+    // One human row per window entry; `focused-window` prints the same row for its reply.
+    void printWindowRow(const nlohmann::json& entry) {
+      const std::string appId = entry.value("app_id", "");
+      const std::string title = entry.value("title", "");
+      const std::string xdgTag = entry.value("xdg_tag", "");
+      const std::string xdgTagSuffix = xdgTag.empty() ? "" : " [xdg_tag=" + xdgTag + "]";
+      const std::string contentType = entry.value("content_type", "none");
+      const std::string contentTypeSuffix = contentType == "none" ? "" : " [content_type=" + contentType + "]";
+      const std::string scratchpad = entry.value("scratchpad", "");
+      const std::string scratchpadSuffix = scratchpad.empty() ? "" : " [scratchpad=" + scratchpad + "]";
+      const std::string_view minimizedSuffix = entry.value("minimized", false) ? " [minimized]" : "";
+      std::println(
+          "{}{}{}\t{}\t[{} {}x{}{:+}{:+}]{}{}{}{}",
+          entry.value("focused", false) ? "*" : (entry.value("urgent", false) ? "!" : " "),
+          entry.value("xwayland", false) ? "[Xwayland] " : "", appId.empty() ? "-" : appId, title.empty() ? "-" : title,
+          entry.value("floating", false)     ? "float"
+              : entry.value("tabbed", false) ? "tab"
+                                             : "tile",
+          entry.value("w", 0), entry.value("h", 0), entry.value("x", 0), entry.value("y", 0), xdgTagSuffix,
+          contentTypeSuffix, scratchpadSuffix, minimizedSuffix
+      );
+    }
+
+    void printWindows(const nlohmann::json& ok) {
+      for (const auto& entry : ok) {
+        printWindowRow(entry);
+      }
+    }
+
+    nlohmann::json effectSlotJson(const EffectSlot& slot, bool border = false) {
+      nlohmann::json result{
+          {"name", slot.name},
+          {"pool", slot.pool},
+          {"source", effectSelectorSourceName(slot.source())},
+          {"suppressed", slot.suppressed},
+      };
+      if (border) {
+        const EffectPreset* preset = findEffectPreset(config().effects, slot.name);
+        result["overlay"] = preset != nullptr ? preset->overlay : "";
+      }
+      return result;
+    }
+
+    void printEffects(const nlohmann::json& ok) {
+      std::println("Presets\nNAME\tKIND\tSTATE\tOVERLAY");
+      for (const auto& preset : ok.at("presets")) {
+        std::println(
+            "{}\t{}\t{}\t{}", preset.value("name", ""), preset.value("kind", ""), preset.value("state", ""),
+            preset.value("overlay", "")
+        );
+      }
+      std::println("\nPools\nNAME\tKIND\tPOLICY\tMEMBERS (held)");
+      for (const auto& pool : ok.at("pools")) {
+        std::string members;
+        for (const auto& member : pool.at("members")) {
+          if (!members.empty()) {
+            members += ", ";
+          }
+          members += std::format("{} ({})", member.value("name", ""), member.value("held", size_t{0}));
+        }
+        std::println(
+            "{}\t{}\t{}\t{}", pool.value("name", ""), pool.value("kind", ""), pool.value("policy", ""), members
+        );
+      }
+      const auto printSlot = [](std::string_view owner, std::string_view kind, const nlohmann::json& slot) {
+        std::println(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}", owner, kind, slot.value("name", ""), slot.value("pool", ""),
+            slot.value("source", ""), slot.value("suppressed", false) ? "yes" : "no", slot.value("overlay", "")
+        );
+      };
+      std::println("\nCursor\nOWNER\tSLOT\tNAME\tPOOL\tSOURCE\tSUPPRESSED\tOVERLAY");
+      printSlot("cursor", "cursor", ok.at("cursor"));
+      std::println("\nOwners\nOWNER\tSLOT\tNAME\tPOOL\tSOURCE\tSUPPRESSED\tOVERLAY");
+      for (const auto& owner : ok.at("owners")) {
+        const std::string label = owner.value("type", "") == "window"
+            ? "window " + owner.value("id", "") + " (" + owner.value("app_id", "") + ")"
+            : "output " + owner.value("name", "");
+        for (const auto& [kind, slot] : owner.at("slots").items()) {
+          printSlot(label, kind, slot);
+        }
+      }
+    }
+
+    void printWorkspaces(const nlohmann::json& ok) {
+      for (const auto& entry : ok) {
+        const std::string output = entry.value("output", "");
+        const std::string name = entry.value("name", "");
+        const std::string layout = entry.value("layout", "unknown");
+        std::println(
+            "{} {}: {} [{}]{}", entry.value("active", false) ? "*" : " ", output.empty() ? "-" : output,
+            name.empty() ? "-" : name, layout, entry.value("focused", false) ? " (focused)" : ""
+        );
+      }
+    }
+
+    void printSubmap(const nlohmann::json& ok) {
+      if (!ok.is_string()) {
+        return;
+      }
+      const std::string name = ok.get<std::string>();
+      std::println("{}", name.empty() ? "unnamed" : name);
+    }
+
+    void printKeyboardLayouts(const nlohmann::json& ok) {
+      const size_t currentIndex = ok.value("current_index", size_t{0});
+      const auto& names = ok.at("names");
+      for (size_t index = 0; index < names.size(); ++index) {
+        const std::string name = names.at(index).get<std::string>();
+        std::println("{} {}", index == currentIndex ? "*" : " ", name.empty() ? "-" : name);
+      }
+    }
+
+    void printLayers(const nlohmann::json& ok) {
+      for (const auto& entry : ok) {
+        const std::string layer = entry.value("layer", "");
+        const std::string ns = entry.value("namespace", "");
+        const std::string output = entry.value("output", "");
+        bool mapped = entry.value("mapped", false);
+        std::println(
+            "{}\t{}\t{}\t{}", layer, ns.empty() ? "-" : ns, output.empty() ? "-" : output, mapped ? "yes" : "no"
+        );
+      }
+    }
+
+    void printOutputName(const nlohmann::json& ok) { std::println("{}", ok.get<std::string>()); }
+
+    const char* transformName(wl_output_transform transform) {
+      switch (transform) {
+      case WL_OUTPUT_TRANSFORM_NORMAL:
+        return "normal";
+      case WL_OUTPUT_TRANSFORM_90:
+        return "90";
+      case WL_OUTPUT_TRANSFORM_180:
+        return "180";
+      case WL_OUTPUT_TRANSFORM_270:
+        return "270";
+      case WL_OUTPUT_TRANSFORM_FLIPPED:
+        return "flipped";
+      case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+        return "flipped-90";
+      case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+        return "flipped-180";
+      case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+        return "flipped-270";
+      }
+      return "unknown";
+    }
+
+    void printOutputs(const nlohmann::json& ok) {
+      bool first = true;
+      for (const auto& output : ok) {
+        if (!first) {
+          std::println("");
+        }
+        first = false;
+        std::println("{} \"{}\"", output.value("name", ""), output.value("description", ""));
+        std::println("  Enabled: {}", output.value("enabled", false) ? "yes" : "no");
+        std::println("  Power: {}", output.value("powered", false) ? "on" : "off");
+        std::println("  Focused: {}", output.value("focused", false) ? "yes" : "no");
+        const std::string workspace = output.value("active_workspace", "");
+        std::println("  Active workspace: {}", workspace.empty() ? "-" : workspace);
+        if (output.at("config_name").is_string()) {
+          std::println("  Config name: \"{}\"", output.at("config_name").get<std::string>());
+          std::string identity;
+          for (const auto& [label, key] : {std::pair{"Make", "make"}, {"Model", "model"}, {"Serial", "serial"}}) {
+            const std::string value = output.value(key, "");
+            if (value.empty()) {
+              continue;
+            }
+            if (!identity.empty()) {
+              identity += "  ";
+            }
+            identity += std::format("{}: {}", label, value);
+          }
+          std::println("  {}", identity);
+        }
+        const auto& physical = output.at("physical_size");
+        const int widthMm = physical.value("width_mm", 0);
+        const int heightMm = physical.value("height_mm", 0);
+        if (widthMm > 0 || heightMm > 0) {
+          std::println("  Physical size: {}x{} mm", widthMm, heightMm);
+        }
+        const auto& position = output.at("position");
+        std::println("  Position: {},{}", position.value("x", 0), position.value("y", 0));
+        std::println("  Transform: {}", output.value("transform", "normal"));
+        std::println("  Scale: {:f}", output.value("scale", 1.0));
+        const auto& usable = output.at("usable_area");
+        std::println(
+            "  Usable area: {}x{}{:+}{:+}", usable.value("width", 0), usable.value("height", 0), usable.value("x", 0),
+            usable.value("y", 0)
+        );
+        if (output.at("adaptive_sync").is_boolean()) {
+          std::println("  Adaptive sync: {}", output.at("adaptive_sync").get<bool>() ? "enabled" : "disabled");
+        }
+        std::println("  HDR: {}", output.value("hdr_active", false) ? "on" : "off");
+        if (const auto scanout = output.find("direct_scanout"); scanout != output.end() && scanout->is_object()) {
+          if (scanout->value("active", false)) {
+            const auto& window = scanout->at("window");
+            if (window.is_object()) {
+              std::println(
+                  "  Direct scanout: active ({} \"{}\")", window.value("app_id", ""), window.value("title", "")
+              );
+            } else {
+              std::println("  Direct scanout: active");
+            }
+          } else {
+            std::string reason = scanout->value("reason", "");
+            std::ranges::replace(reason, '_', ' ');
+            std::println("  Direct scanout: inactive ({})", reason);
+          }
+        }
+        const auto& modes = output.at("modes");
+        if (modes.empty()) {
+          continue;
+        }
+        std::println("  Modes:");
+        for (const auto& mode : modes) {
+          const bool preferred = mode.value("preferred", false);
+          const bool current = mode.value("current", false);
+          std::print(
+              "    {}x{} @ {:.3f} Hz", mode.value("width", 0), mode.value("height", 0),
+              mode.value("refresh_mhz", 0) / 1000.0
+          );
+          if (preferred && current) {
+            std::print(" (preferred, current)");
+          } else if (preferred) {
+            std::print(" (preferred)");
+          } else if (current) {
+            std::print(" (current)");
+          }
+          std::println("");
+        }
+      }
+    }
+
+    std::string fourccName(uint32_t format) {
+      if (format == DRM_FORMAT_INVALID) {
+        return "invalid";
+      }
+      std::string name(4, '?');
+      for (size_t i = 0; i < name.size(); ++i) {
+        const auto value = static_cast<unsigned char>((format >> (i * 8)) & 0xFFU);
+        name[i] = std::isprint(value) != 0 ? static_cast<char>(value) : '?';
+      }
+      return name;
+    }
+
+    const char* transferFunctionName(wlr_color_transfer_function value) {
+      switch (value) {
+      case WLR_COLOR_TRANSFER_FUNCTION_SRGB:
+        return "sRGB";
+      case WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ:
+        return "PQ";
+      case WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR:
+        return "extended linear";
+      case WLR_COLOR_TRANSFER_FUNCTION_GAMMA22:
+        return "gamma 2.2";
+      case WLR_COLOR_TRANSFER_FUNCTION_BT1886:
+        return "BT.1886";
+      }
+      return "unknown";
+    }
+
+    const char* primariesName(wlr_color_named_primaries value) {
+      switch (value) {
+      case WLR_COLOR_NAMED_PRIMARIES_SRGB:
+        return "sRGB";
+      case WLR_COLOR_NAMED_PRIMARIES_BT2020:
+        return "BT.2020";
+      }
+      return "unknown";
+    }
+
+    const char* protocolTransferFunctionName(uint32_t value) {
+      switch (value) {
+      case 0:
+        return "none";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_BT1886:
+        return "BT.1886";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22:
+        return "gamma 2.2";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA28:
+        return "gamma 2.8";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST240:
+        return "ST 240";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR:
+        return "extended linear";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_LOG_100:
+        return "log 100";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_LOG_316:
+        return "log 316";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_XVYCC:
+        return "xvYCC";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB:
+        return "sRGB";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_SRGB:
+        return "extended sRGB";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ:
+        return "PQ";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST428:
+        return "ST 428";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG:
+        return "HLG";
+      case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_COMPOUND_POWER_2_4:
+        return "compound power 2.4";
+      default:
+        return "unknown";
+      }
+    }
+
+    const char* protocolPrimariesName(uint32_t value) {
+      switch (value) {
+      case 0:
+        return "none";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_SRGB:
+        return "sRGB";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_PAL_M:
+        return "PAL-M";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_PAL:
+        return "PAL";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_NTSC:
+        return "NTSC";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_GENERIC_FILM:
+        return "generic film";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_BT2020:
+        return "BT.2020";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_CIE1931_XYZ:
+        return "CIE 1931 XYZ";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_DCI_P3:
+        return "DCI-P3";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_DISPLAY_P3:
+        return "Display P3";
+      case WP_COLOR_MANAGER_V1_PRIMARIES_ADOBE_RGB:
+        return "Adobe RGB";
+      default:
+        return "unknown";
+      }
+    }
+
+    nlohmann::json supportedTransferFunctions(uint32_t supported) {
+      nlohmann::json names = nlohmann::json::array();
+      constexpr wlr_color_transfer_function values[] = {
+          WLR_COLOR_TRANSFER_FUNCTION_SRGB,       WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ,
+          WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR, WLR_COLOR_TRANSFER_FUNCTION_GAMMA22,
+          WLR_COLOR_TRANSFER_FUNCTION_BT1886,
+      };
+      for (const auto value : values) {
+        if ((supported & value) != 0) {
+          names.push_back(transferFunctionName(value));
+        }
+      }
+      return names;
+    }
+
+    nlohmann::json supportedPrimaries(uint32_t supported) {
+      nlohmann::json names = nlohmann::json::array();
+      constexpr wlr_color_named_primaries values[] = {
+          WLR_COLOR_NAMED_PRIMARIES_SRGB,
+          WLR_COLOR_NAMED_PRIMARIES_BT2020,
+      };
+      for (const auto value : values) {
+        if ((supported & value) != 0) {
+          names.push_back(primariesName(value));
+        }
+      }
+      return names;
+    }
+
+    nlohmann::json xy(const wlr_color_cie1931_xy& value) { return {{"x", value.x}, {"y", value.y}}; }
+
+    std::string joinNames(const nlohmann::json& names) {
+      std::string joined;
+      for (const auto& name : names) {
+        if (!joined.empty()) {
+          joined += ", ";
+        }
+        joined += name.get<std::string>();
+      }
+      return joined.empty() ? "none" : joined;
+    }
+
+    void printColor(const nlohmann::json& ok) {
+      const auto& renderer = ok.at("renderer");
+      std::println(
+          "color manager: {}, renderer input transform: {}, output transform: {}, timeline: {}",
+          ok.value("color_manager", false) ? "yes" : "no",
+          renderer.value("input_color_transform", false) ? "yes" : "no",
+          renderer.value("output_color_transform", false) ? "yes" : "no",
+          renderer.value("timeline", false) ? "yes" : "no"
+      );
+      for (const auto& output : ok.at("outputs")) {
+        const std::string fallback = output.value("fallback_reason", "");
+        std::println(
+            "output {}: HDR mode {}, requested {}, active {}, format {}, {}, {}, SDR white {} cd/m2, SDR transfer {}",
+            output.value("name", ""), output.value("hdr_mode", "off"),
+            output.value("hdr_requested", false) ? "yes" : "no", output.value("hdr_active", false) ? "yes" : "no",
+            output.value("render_format", "invalid"), output.value("transfer_function", "none"),
+            output.value("primaries", "none"), output.value("sdr_white", 0.0), output.value("sdr_transfer", "gamma22")
+        );
+
+        if (!fallback.empty()) {
+          std::println("  fallback: {}", fallback);
+        }
+
+        const int configuredDepth = output.value("bit_depth", 8);
+        const std::string format = output.value("render_format", "invalid");
+        const std::string_view activeDepth = !output.value("enabled", false) ? "none"
+            : format == "XR30" || format == "XB30"                           ? "10"
+            : format == "XR24" || format == "XB24"                           ? "8"
+                                                                             : "unknown";
+        std::println("  bit depth: {} (configured {})", activeDepth, configuredDepth);
+
+        if (output.value("enabled", false) && configuredDepth != 8) {
+          const std::string bitFallback = output.value("bit_depth_fallback_reason", "");
+          if (!bitFallback.empty()) {
+            std::println("  10-bit SDR unavailable: {}", bitFallback);
+          } else if (output.value("bit_depth_active", false)) {
+            std::println("  10-bit SDR: active");
+          }
+        }
+
+        std::println(
+            "  supported transfer functions: {}; primaries: {}", joinNames(output.at("supported_transfer_functions")),
+            joinNames(output.at("supported_primaries"))
+        );
+        if (output.at("mastering_luminance").is_object()) {
+          const auto& luminance = output.at("mastering_luminance");
+          std::println(
+              "  output metadata: {} to {} cd/m2; MaxCLL: {}; MaxFALL: {}", luminance.value("min", 0.0),
+              luminance.value("max", 0.0), output.value("max_cll", 0.0), output.value("max_fall", 0.0)
+          );
+        } else if (output.value("hdr_active", false)) {
+          std::println(
+              "  output metadata: luminance unavailable; MaxCLL: {}; MaxFALL: {}", output.value("max_cll", 0.0),
+              output.value("max_fall", 0.0)
+          );
+        }
+      }
+      for (const auto& surface : ok.at("surfaces")) {
+        std::println(
+            "surface {}: {} ({}) {}, {}", surface.value("id", ""), surface.value("title", ""),
+            surface.value("app_id", ""), surface.value("transfer_function", "none"), surface.value("primaries", "none")
+        );
+        if (surface.at("mastering_luminance").is_object()) {
+          const auto& luminance = surface.at("mastering_luminance");
+          std::println(
+              "  mastering luminance: {} to {} cd/m2; MaxCLL: {}; MaxFALL: {}", luminance.value("min", 0.0),
+              luminance.value("max", 0.0), surface.value("max_cll", 0), surface.value("max_fall", 0)
+          );
+        } else {
+          std::println(
+              "  mastering luminance: unset; MaxCLL: {}; MaxFALL: {}", surface.value("max_cll", 0),
+              surface.value("max_fall", 0)
+          );
+        }
+        std::println(
+            "  mastering display primaries: {}", surface.at("mastering_display_primaries").is_object() ? "set" : "unset"
+        );
+      }
+    }
+
+    void printTearing(const nlohmann::json& ok) {
+      std::println("tearing control: {}", ok.value("protocol", false) ? "yes" : "no");
+      for (const auto& output : ok.at("outputs")) {
+        const auto& presentationVsync = output.at("last_presentation_vsync");
+        const auto& presentationPresented = output.at("last_presentation_presented");
+        const std::string presentation = presentationPresented.is_boolean() && !presentationPresented.get<bool>()
+            ? "not presented"
+            : presentationVsync.is_boolean() ? (presentationVsync.get<bool>() ? "vsync" : "async")
+                                             : "unknown";
+        std::println(
+            "output {}: allowed {}, requested {}, last commit {}, last presentation {}", output.value("name", ""),
+            output.value("allowed", false) ? "yes" : "no", output.value("requested", false) ? "yes" : "no",
+            output.value("last_commit_tearing", false) ? "async" : "regular", presentation
+        );
+        if (const std::string fallback = output.value("fallback_reason", ""); !fallback.empty()) {
+          std::println("  fallback: {}", fallback);
+        }
+      }
+      for (const auto& surface : ok.at("surfaces")) {
+        std::string rule = "inherit";
+        if (surface.at("rule_override").is_boolean()) {
+          rule = surface.at("rule_override").get<bool>() ? "force" : "deny";
+        }
+        std::println(
+            "surface {}: {} ({}) output {}, hint {}, rule {}, fullscreen {}, eligible {}", surface.value("id", ""),
+            surface.value("title", ""), surface.value("app_id", ""), surface.value("output", ""),
+            surface.value("hint", "vsync"), rule, surface.value("fullscreen", false) ? "yes" : "no",
+            surface.value("eligible", false) ? "yes" : "no"
+        );
+      }
+    }
+
+    using PendingLayouts = std::map<const Workspace*, std::unique_ptr<Layout>>;
+
+    // One `windows` listing entry for `view`. `focused-window` shares this builder so its reply is
+    // byte-identical to the entry the listing prints for the same window.
+    nlohmann::json windowEntry(Server& server, View& view, PendingLayouts& pendingLayouts) {
+      nlohmann::json entry;
+      entry["id"] = view.extForeignIdentifier() != nullptr ? view.extForeignIdentifier() : "";
+      entry["workspace"] = view.workspace() != nullptr ? view.workspace()->id() : "";
+      const ScratchpadManager* scratchpads = server.scratchpadManager();
+      entry["scratchpad"] = scratchpads != nullptr ? std::string(scratchpads->nameFor(&view)) : std::string{};
+      // The workspace a parked window will return to. The shell uses it to keep
+      // the window's taskbar entry in place while it is minimized.
+      entry["scratchpad_return_index"] = 0;
+      entry["scratchpad_return_name"] = "";
+      if (scratchpads != nullptr) {
+        // Workspace indexes are 0-based internally and 1-based in the IPC
+        // `workspaces` listing. Shells key their taskbars by the published
+        // index, so publish the same 1-based value here.
+        if (const auto index = scratchpads->returnWorkspaceIndexFor(&view); index) {
+          entry["scratchpad_return_index"] = *index + 1;
+        }
+        entry["scratchpad_return_name"] = std::string(scratchpads->returnWorkspaceNameFor(&view));
+      }
+      entry["active"] = view.activated();
+      entry["app_id"] = view.appId() != nullptr ? view.appId() : "";
+      entry["title"] = view.title() != nullptr ? view.title() : "";
+      entry["xdg_tag"] = view.xdgTag().value_or("");
+      entry["content_type"] = contentTypeName(view.contentType());
+      entry["floating"] = view.floating();
+      entry["title_bar"] = view.titleBarChromeHeight() > 0;
+      entry["title_bar_overlay"] = view.titleBarOverlay();
+      entry["fullscreen"] = view.scheduledFullscreen();
+      entry["maximized"] = view.scheduledMaximized();
+      entry["maximized_to_edges"] = view.maximizedToEdges();
+      entry["pinned"] = view.pinned();
+      // Pinned windows show on every workspace of their output.
+      entry["visible"] = view.pinned() || (view.onActiveWorkspace() && !view.tabHidden() && !view.minimized());
+      const Output* output = view.currentOutput();
+      entry["output"] = output != nullptr ? output->wlr()->name : "";
+      const View* parent = view.shellParent();
+      entry["parent"] =
+          parent != nullptr && parent->extForeignIdentifier() != nullptr ? parent->extForeignIdentifier() : "";
+      // Membership of a tab group, the tab's place among its tabs, and whether the group shows another tab.
+      int tabIndex = -1;
+      int column = -1;
+      int row = -1;
+      if (const Workspace* home = view.workspace()) {
+        const Layout& layout = home->layout();
+        const int layoutColumn = layout.columnOf(&view);
+        const TabGroup* group =
+            layoutColumn >= 0 ? tabGroupOf(layout.columns()[static_cast<size_t>(layoutColumn)], &view) : nullptr;
+        if (group != nullptr) {
+          tabIndex = layout.rowOf(&view) - static_cast<int>(group->first);
+        }
+        // Only the scrolling strip has an order of columns and rows that holds still for clients.
+        if (layoutColumn >= 0 && home->scrollingLayout() != nullptr) {
+          column = layoutColumn;
+          row = layout.rowOf(&view);
+        }
+      }
+      entry["column"] = column;
+      entry["row"] = row;
+      entry["tabbed"] = tabIndex >= 0;
+      entry["tab_index"] = tabIndex;
+      entry["tab_hidden"] = view.tabHidden();
+      entry["minimizable"] = view.minimizable();
+      entry["minimized"] = view.minimized();
+      entry["region"] = view.region() ? nlohmann::json(windowRegionName(*view.region())) : nlohmann::json(nullptr);
+      entry["border_effect"] = effectSlotJson(view.effectSlot(EffectKind::Border), true);
+      entry["window_effect"] = effectSlotJson(view.effectSlot(EffectKind::Window));
+      // Workspace-local remembered focus. Seat-global activation is reported
+      // separately by `active`; scratchpad windows have no workspace focus.
+      entry["focused"] = view.workspace() != nullptr && view.workspace()->focusedView() == &view;
+      entry["urgent"] = view.urgent();
+      entry["xwayland"] = view.xwayland();
+      // -1 whenever the owning process is unknown: an X11 client that publishes no _NET_WM_PID.
+      entry["pid"] = view.pid();
+      // Tiled windows report their layout slot, which the layout computes even for hidden workspaces; floats report
+      // their own position. Ordering a listing by these positions then matches the strip (scrolling) or tile tree
+      // (dwindle) regardless of visibility or in-flight animations.
+      if (Workspace* workspace = view.workspace(); workspace != nullptr && workspace->layout().columnOf(&view) >= 0) {
+        // Preview stale targets without applying client configures, rules, or bindings.
+        const Layout* layout = &workspace->layout();
+        if (workspace->arrangePending()) {
+          auto [entry, inserted] = pendingLayouts.try_emplace(workspace);
+          if (inserted) {
+            entry->second = workspace->previewArrangedLayout();
+          }
+          if (entry->second != nullptr) {
+            layout = entry->second.get();
+          }
+        }
+        const wlr_box box = workspace->presentedTiledBox(&view, layout);
+        entry["x"] = box.x;
+        entry["y"] = box.y;
+      } else if (
+          (view.floating() && server.cursor()->isDraggingView(&view)) || server.cursor()->toplevelDragView() == &view
+      ) {
+        // Floating and data-device toplevel drags move the scene node before
+        // committing the saved target.
+        entry["x"] = view.layoutX();
+        entry["y"] = view.layoutY();
+      } else {
+        entry["x"] = view.layoutTargetX();
+        entry["y"] = view.layoutTargetY();
+      }
+      // The size the window covers, which is its committed window geometry unless the client left that box behind a
+      // configure it already redrew for. Reporting the stale box would disagree with what is on screen.
+      const wlr_box content = view.committedContentBox();
+      entry["w"] = content.width;
+      entry["h"] = content.height;
+      return entry;
+    }
+
+  } // namespace
+
+  nlohmann::json IpcCommands::windows(Server& server, IpcArgs /*args*/) {
+    nlohmann::json windows = nlohmann::json::array();
+    PendingLayouts pendingLayouts;
+    for (const auto& v : server.views()) {
+      if (!v->mapped()) {
+        continue;
+      }
+      windows.push_back(windowEntry(server, *v, pendingLayouts));
+    }
+    return nlohmann::json{{"ok", windows}};
+  }
+
+  // The view the window actions target. The qualified call keeps the shared
+  // focus policy distinct from this command's own name.
+  nlohmann::json IpcCommands::focusedWindow(Server& server, IpcArgs /*args*/) {
+    View* view = umbriel::focusedWindow(server);
+    if (view == nullptr) {
+      return nlohmann::json{{"err", "no focused window"}};
+    }
+    PendingLayouts pendingLayouts;
+    return nlohmann::json{{"ok", windowEntry(server, *view, pendingLayouts)}};
+  }
+
+  nlohmann::json IpcCommands::movedWindowMenu(Server& server, IpcArgs args) {
+    View* view = nullptr;
+    if (args.empty()) {
+      view = umbriel::focusedWindow(server);
+    } else {
+      for (const auto& candidate : server.views()) {
+        const char* id = candidate != nullptr ? candidate->extForeignIdentifier() : nullptr;
+        if (id != nullptr && args.front() == id) {
+          view = candidate.get();
+          break;
+        }
+      }
+    }
+    if (view == nullptr) {
+      return nlohmann::json{{"err", "move-menu: no such window"}};
+    }
+    wlr_cursor* cursor = server.cursor()->wlr();
+    server.showMoveMenu(view, cursor->x, cursor->y);
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  // Restore the exact window the shell asked for. A scratchpad member goes
+  // back to its saved workspace directly, without summoning the pad first:
+  // summoning would reveal every other parked window and leave them on the
+  // scratchpad overlay, where they cannot be used as normal windows.
+  nlohmann::json IpcCommands::restoreWindow(Server& server, IpcArgs args) {
+    if (args.empty() || args.front().empty()) {
+      return nlohmann::json{{"err", "usage: restore-window <window-id>"}};
+    }
+    View* view = nullptr;
+    for (const auto& candidate : server.views()) {
+      const char* id = candidate != nullptr ? candidate->extForeignIdentifier() : nullptr;
+      if (id != nullptr && args.front() == id) {
+        view = candidate.get();
+        break;
+      }
+    }
+    if (view == nullptr) {
+      return nlohmann::json{{"err", "restore-window: no such window"}};
+    }
+    if (ScratchpadManager* scratchpad = server.scratchpadManager();
+        scratchpad != nullptr && scratchpad->contains(view)) {
+      if (!scratchpad->restoreMember(view)) {
+        return nlohmann::json{{"err", "restore-window: unable to leave the scratchpad"}};
+      }
+      return nlohmann::json{{"ok", nullptr}};
+    }
+    // Natively minimized windows keep their workspace; focusing them shows
+    // them again through the normal focus path.
+    server.focusView(view, FocusReason::ForeignActivation);
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  // The shell's «Mostrar con Super» pin keeps the native resize handles and
+  // overlay title bars visible without holding Mod, and without shielding the
+  // window content from input.
+  nlohmann::json IpcCommands::overlayPin(Server& server, IpcArgs args) {
+    if (args.size() != 1 || args.front().empty()) {
+      return nlohmann::json{{"err", "usage: overlay-pin <on|off|toggle>"}};
+    }
+    const std::string& value = args.front();
+    if (value == "on") {
+      server.setOverlayPinned(true);
+    } else if (value == "off") {
+      server.setOverlayPinned(false);
+    } else if (value == "toggle") {
+      server.setOverlayPinned(!server.overlayPinned());
+    } else {
+      return nlohmann::json{{"err", "overlay-pin: expected on, off or toggle"}};
+    }
+    return nlohmann::json{{"ok", {{"pinned", server.overlayPinned()}}}};
+  }
+
+  nlohmann::json IpcCommands::effects(Server& server, IpcArgs /*args*/) {
+    nlohmann::json presets = nlohmann::json::array();
+    for (const auto& preset : config().effects.presets) {
+      nlohmann::json entry{
+          {"name", preset.name},
+          {"kind", effectKindName(preset.kind)},
+          {"state", server.effects().programState(preset.name)},
+      };
+      if (preset.kind == EffectKind::Border) {
+        entry["overlay"] = preset.overlay;
+      }
+      presets.push_back(std::move(entry));
+    }
+    nlohmann::json pools = nlohmann::json::array();
+    for (const auto& pool : config().effects.pools) {
+      const auto counts = server.effectHoldCounts(pool);
+      nlohmann::json members = nlohmann::json::array();
+      for (size_t index = 0; index < pool.members.size(); ++index) {
+        members.push_back({{"name", pool.members[index]}, {"held", counts[index]}});
+      }
+      pools.push_back(
+          {{"name", pool.name},
+           {"kind", effectKindName(pool.kind)},
+           {"policy", effectSelectionPolicyName(pool.selection)},
+           {"members", std::move(members)}}
+      );
+    }
+    nlohmann::json owners = nlohmann::json::array();
+    for (const View* view : server.sortedEffectViews()) {
+      const char* id = view->extForeignIdentifier();
+      owners.push_back({
+          {"type", "window"},
+          {"id", id != nullptr ? id : ""},
+          {"app_id", view->appId() != nullptr ? view->appId() : ""},
+          {"slots",
+           {{"border", effectSlotJson(view->effectSlot(EffectKind::Border), true)},
+            {"window", effectSlotJson(view->effectSlot(EffectKind::Window))}}},
+      });
+    }
+    std::vector<const Output*> outputs;
+    for (const auto& output : server.outputs()) {
+      outputs.push_back(output.get());
+    }
+    std::ranges::sort(outputs, {}, [](const Output* output) { return std::string_view(output->wlr()->name); });
+    for (const Output* output : outputs) {
+      owners.push_back(
+          {{"type", "output"},
+           {"name", output->wlr()->name},
+           {"slots", {{"screen", effectSlotJson(output->screenEffectSlot())}}}}
+      );
+    }
+    return nlohmann::json{
+        {"ok",
+         {{"presets", std::move(presets)},
+          {"pools", std::move(pools)},
+          {"cursor", effectSlotJson(server.cursorEffectSlot())},
+          {"owners", std::move(owners)}}}
+    };
+  }
+
+  nlohmann::json IpcCommands::workspaces(Server& server, IpcArgs /*args*/) {
+    nlohmann::json workspaces = nlohmann::json::array();
+    const Output* preferred = server.outputFromWlr(server.preferredOutput());
+    for (const auto& output : server.outputs()) {
+      WorkspaceGroup* group = output->workspaceGroup();
+      if (group == nullptr) {
+        continue;
+      }
+      for (size_t index = 0; index < group->workspaceCount(); ++index) {
+        Workspace* workspace = group->workspaceAt(index);
+        if (workspace == nullptr) {
+          continue;
+        }
+        const auto& views = workspace->allViews();
+        const View* focusedView = workspace->focusedView();
+        const char* focusedId =
+            focusedView != nullptr && focusedView->mapped() ? focusedView->extForeignIdentifier() : nullptr;
+        workspaces.push_back({
+            {"id", workspace->id()},
+            {"name", workspace->name()},
+            {"named", workspace->named()},
+            {"index", workspace->index() + 1},
+            {"output", output->wlr()->name},
+            {"active", workspace->active()},
+            {"focused", output.get() == preferred && workspace->active()},
+            {"occupied", workspace->occupied()},
+            {"window_count",
+             std::ranges::count_if(views, [](const View* view) { return view->mapped() && !view->pinned(); })},
+            {"focused_window", focusedId != nullptr ? focusedId : ""},
+            {"urgent", std::ranges::any_of(views, [](const View* view) { return view->urgent(); })},
+            {"layout", std::string(layoutModeName(workspace->layoutMode()))},
+            {"layout_override", workspace->layoutModeOverride().has_value()},
+        });
+      }
+    }
+    return nlohmann::json{{"ok", workspaces}};
+  }
+
+  nlohmann::json IpcCommands::submap(Server& server, IpcArgs /*args*/) {
+    nlohmann::json active = nullptr;
+    if (server.inSubmap()) {
+      active = server.activeSubmap();
+    }
+    return nlohmann::json{{"ok", std::move(active)}};
+  }
+
+  nlohmann::json IpcCommands::layers(Server& server, IpcArgs /*args*/) {
+    nlohmann::json layers = nlohmann::json::array();
+    for (const auto& l : server.layerSurfaces()) {
+      auto* s = l->layerSurface();
+      if (s == nullptr) {
+        continue;
+      }
+      nlohmann::json entry;
+      const wlr_layer_surface_v1_state& state = s->current;
+      entry["layer"] = layerName(state.layer);
+      entry["namespace"] = s->namespace_ != nullptr ? s->namespace_ : "";
+      entry["output"] = s->output != nullptr ? s->output->name : "";
+      entry["mapped"] = l->mapped();
+      entry["pid"] = surfaceClientPid(s->surface);
+      entry["keyboard_interactivity"] = keyboardInteractivityName(state.keyboard_interactive);
+      entry["focused"] = l->hasKeyboardFocus();
+      entry["exclusive_zone"] = state.exclusive_zone;
+      nlohmann::json anchor = nlohmann::json::array();
+      for (const auto& [edge, name] : kLayerAnchors) {
+        if ((state.anchor & edge) != 0) {
+          anchor.push_back(name);
+        }
+      }
+      entry["anchor"] = std::move(anchor);
+      entry["margin"] = {
+          {"top", state.margin.top},
+          {"right", state.margin.right},
+          {"bottom", state.margin.bottom},
+          {"left", state.margin.left},
+      };
+      // Layout coordinates of the arranged surface; zero until its first arrange.
+      int x = 0;
+      int y = 0;
+      if (l->scene() != nullptr) {
+        wlr_scene_node_coords(&l->scene()->tree->node, &x, &y);
+      }
+      entry["x"] = x;
+      entry["y"] = y;
+      entry["w"] = state.actual_width;
+      entry["h"] = state.actual_height;
+      layers.push_back(std::move(entry));
+    }
+    return nlohmann::json{{"ok", layers}};
+  }
+
+  nlohmann::json IpcCommands::outputs(Server& server, IpcArgs /*args*/) {
+    nlohmann::json outputs = nlohmann::json::array();
+    const Output* preferred = server.outputFromWlr(server.preferredOutput());
+    for (const auto& output : server.outputs()) {
+      wlr_output* wlrOutput = output->wlr();
+      nlohmann::json modes = nlohmann::json::array();
+      wlr_output_mode* mode = nullptr;
+      wl_list_for_each(mode, &wlrOutput->modes, link) {
+        modes.push_back({
+            {"width", mode->width},
+            {"height", mode->height},
+            {"refresh_mhz", mode->refresh},
+            {"preferred", mode->preferred},
+            {"current", mode == wlrOutput->current_mode},
+        });
+      }
+      // A custom mode (virtual outputs, `output-create` sizes) is listed as the current one.
+      if (wlrOutput->current_mode == nullptr && wlrOutput->width > 0 && wlrOutput->height > 0) {
+        modes.push_back({
+            {"width", wlrOutput->width},
+            {"height", wlrOutput->height},
+            {"refresh_mhz", wlrOutput->refresh},
+            {"preferred", false},
+            {"current", true},
+        });
+      }
+      // Unknown when the output can neither change nor report variable refresh.
+      nlohmann::json adaptiveSync = nullptr;
+      const bool adaptiveSyncEnabled = wlrOutput->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED;
+      if (wlrOutput->adaptive_sync_supported || adaptiveSyncEnabled) {
+        adaptiveSync = adaptiveSyncEnabled;
+      }
+      const OutputIdentity identity = output->identity();
+      const bool hasIdentity = !identity.make.empty() || !identity.model.empty() || !identity.serial.empty();
+      const bool desktopEnabled = output->desktopEnabled();
+      const wlr_box layoutBox = output->layoutBox();
+      const wlr_box usable = desktopEnabled ? output->usableArea() : wlr_box{};
+      const WorkspaceGroup* group = output->workspaceGroup();
+      const Workspace* activeWorkspace = group != nullptr ? group->active() : nullptr;
+      // Unknown while the output is off: nothing is drawn to scan out.
+      nlohmann::json directScanout = nullptr;
+      if (desktopEnabled && !output->dpmsOff()) {
+        const DirectScanoutState& scanout = output->directScanout();
+        const DirectScanoutTracker& tracker = output->directScanoutTracker();
+        nlohmann::json window = nullptr;
+        if (scanout.active && !scanout.windowId.empty()) {
+          window = {{"id", scanout.windowId}, {"app_id", scanout.appId}, {"title", scanout.title}};
+        }
+        directScanout = {
+            {"active", scanout.active},
+            {"reason", scanout.active ? nlohmann::json(nullptr) : nlohmann::json(scanout.reason)},
+            {"window", std::move(window)},
+            {"commits", tracker.commits()},
+            {"scanout_commits", tracker.scanoutCommits()},
+            {"commit_seq", tracker.commitSeq()},
+        };
+      }
+      outputs.push_back({
+          {"name", wlrOutput->name},
+          {"description", wlrOutput->description != nullptr ? wlrOutput->description : ""},
+          {"make", identity.make},
+          {"model", identity.model},
+          {"serial", identity.serial},
+          {"config_name", hasIdentity ? nlohmann::json(outputDescriptor(identity)) : nlohmann::json(nullptr)},
+          {"physical_size", {{"width_mm", wlrOutput->phys_width}, {"height_mm", wlrOutput->phys_height}}},
+          {"enabled", desktopEnabled},
+          {"powered", desktopEnabled && !output->dpmsOff()},
+          {"focused", output.get() == preferred},
+          {"active_workspace", activeWorkspace != nullptr ? activeWorkspace->id() : ""},
+          {"position", {{"x", layoutBox.x}, {"y", layoutBox.y}}},
+          {"logical_size",
+           {{"width", desktopEnabled ? layoutBox.width : 0}, {"height", desktopEnabled ? layoutBox.height : 0}}},
+          {"usable_area", {{"x", usable.x}, {"y", usable.y}, {"width", usable.width}, {"height", usable.height}}},
+          {"transform", transformName(wlrOutput->transform)},
+          {"scale", wlrOutput->scale},
+          {"adaptive_sync", std::move(adaptiveSync)},
+          {"hdr_active", output->hdrActive()},
+          {"direct_scanout", std::move(directScanout)},
+          {"modes", std::move(modes)},
+      });
+    }
+    return nlohmann::json{{"ok", outputs}};
+  }
+
+  nlohmann::json IpcCommands::color(Server& server, IpcArgs /*args*/) {
+    nlohmann::json outputs = nlohmann::json::array();
+    for (const auto& output : server.outputs()) {
+      const wlr_output* wlrOutput = output->wlr();
+      const wlr_output_image_description* description = wlrOutput->image_description;
+      const bool hdrRequested = output->hdrRequested();
+      nlohmann::json entry = {
+          {"name", wlrOutput->name},
+          {"enabled", wlrOutput->enabled},
+          {"hdr_mode", hdrModeName(output->hdrMode())},
+          {"hdr_requested", hdrRequested},
+          {"hdr_active", output->hdrActive()},
+          {"fallback_reason", hdrRequested ? output->hdrFallbackReason() : ""},
+          {"render_format", fourccName(wlrOutput->render_format)},
+          {"transfer_function", description != nullptr ? transferFunctionName(description->transfer_function) : "none"},
+          {"primaries", description != nullptr ? primariesName(description->primaries) : "none"},
+          {"sdr_white", output->sdrWhite()},
+          {"sdr_transfer", output->configuredSdrTransfer() == SdrTransfer::Srgb ? "srgb" : "gamma22"},
+          {"bit_depth", output->configuredBitDepth()},
+          {"bit_depth_active", output->bitDepthActive()},
+          {"bit_depth_fallback_reason", output->bitDepthFallbackReason()},
+          {"supported_transfer_functions", supportedTransferFunctions(wlrOutput->supported_transfer_functions)},
+          {"supported_primaries", supportedPrimaries(wlrOutput->supported_primaries)},
+          {"max_cll", description != nullptr ? description->max_cll : 0.0},
+          {"max_fall", description != nullptr ? description->max_fall : 0.0},
+      };
+      entry["mastering_display_primaries"] = nullptr;
+      entry["mastering_luminance"] = nullptr;
+      if (description != nullptr) {
+        const auto& primaries = description->mastering_display_primaries;
+        if (primaries.white.x != 0.0 || primaries.white.y != 0.0) {
+          entry["mastering_display_primaries"] = {
+              {"red", xy(primaries.red)},
+              {"green", xy(primaries.green)},
+              {"blue", xy(primaries.blue)},
+              {"white", xy(primaries.white)},
+          };
+        }
+        if (description->mastering_luminance.max > description->mastering_luminance.min) {
+          entry["mastering_luminance"] = {
+              {"min", description->mastering_luminance.min},
+              {"max", description->mastering_luminance.max},
+          };
+        }
+      }
+      outputs.push_back(std::move(entry));
+    }
+
+    nlohmann::json surfaces = nlohmann::json::array();
+    for (const auto& view : server.views()) {
+      if (!view->mapped()) {
+        continue;
+      }
+      wlr_surface* surface = view->rootSurface();
+      const wlr_image_description_v1_data* description = server.surfaceTreeHdrDescription(surface);
+      if (description == nullptr) {
+        description = server.surfaceImageDescription(surface);
+      }
+      nlohmann::json entry = {
+          {"id", view->extForeignIdentifier() != nullptr ? view->extForeignIdentifier() : ""},
+          {"app_id", view->appId() != nullptr ? view->appId() : ""},
+          {"title", view->title() != nullptr ? view->title() : ""},
+          {"transfer_function", protocolTransferFunctionName(description != nullptr ? description->tf_named : 0)},
+          {"primaries",
+           description != nullptr && description->primaries_named == 0
+               ? "custom"
+               : protocolPrimariesName(description != nullptr ? description->primaries_named : 0)},
+          {"max_cll", description != nullptr ? description->max_cll : 0},
+          {"max_fall", description != nullptr ? description->max_fall : 0},
+      };
+      entry["mastering_display_primaries"] = nullptr;
+      entry["mastering_luminance"] = nullptr;
+      if (description != nullptr && description->has_mastering_display_primaries) {
+        const auto& primaries = description->mastering_display_primaries;
+        entry["mastering_display_primaries"] = {
+            {"red", xy(primaries.red)},
+            {"green", xy(primaries.green)},
+            {"blue", xy(primaries.blue)},
+            {"white", xy(primaries.white)},
+        };
+      }
+      if (description != nullptr && description->has_mastering_luminance) {
+        entry["mastering_luminance"] = {
+            {"min", description->mastering_luminance.min},
+            {"max", description->mastering_luminance.max},
+        };
+      }
+      surfaces.push_back(std::move(entry));
+    }
+
+    return nlohmann::json{
+        {"ok",
+         {
+             {"color_manager", server.colorManager() != nullptr},
+             {"renderer",
+              {
+                  {"input_color_transform", server.renderer()->features.input_color_transform},
+                  {"output_color_transform", server.renderer()->features.output_color_transform},
+                  {"timeline", server.renderer()->features.timeline},
+              }},
+             {"outputs", std::move(outputs)},
+             {"surfaces", std::move(surfaces)},
+         }},
+    };
+  }
+
+  nlohmann::json IpcCommands::tearing(Server& server, IpcArgs /*args*/) {
+    nlohmann::json outputs = nlohmann::json::array();
+    for (const auto& output : server.outputs()) {
+      const bool requested = output->tearingRequested();
+      nlohmann::json entry = {
+          {"name", output->wlr()->name},
+          {"allowed", output->configuredTearingAllowed()},
+          {"requested", requested},
+          {"last_commit_tearing", output->lastCommitTearing()},
+          {"fallback_reason", requested ? output->tearingFallbackReason() : ""},
+      };
+      entry["last_presentation_flags"] = nullptr;
+      entry["last_presentation_presented"] = nullptr;
+      entry["last_presentation_vsync"] = nullptr;
+      if (output->lastPresentationPresented()) {
+        entry["last_presentation_presented"] = *output->lastPresentationPresented();
+      }
+      if (output->lastPresentationFlags()) {
+        entry["last_presentation_flags"] = *output->lastPresentationFlags();
+      }
+      if (const std::optional<bool> vsync = output->lastPresentationVsync()) {
+        entry["last_presentation_vsync"] = *vsync;
+      }
+      outputs.push_back(std::move(entry));
+    }
+
+    nlohmann::json surfaces = nlohmann::json::array();
+    for (const auto& view : server.views()) {
+      if (!view->mapped()) {
+        continue;
+      }
+      Output* output = view->currentOutput();
+      const bool asyncHint = output != nullptr
+          ? output->clientTearingHintAsync(view.get())
+          : wlr_tearing_control_manager_v1_surface_hint_from_surface(
+                server.tearingControlManager(), view->rootSurface()
+            ) == WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
+      nlohmann::json entry = {
+          {"id", view->extForeignIdentifier() != nullptr ? view->extForeignIdentifier() : ""},
+          {"app_id", view->appId() != nullptr ? view->appId() : ""},
+          {"title", view->title() != nullptr ? view->title() : ""},
+          {"output", output != nullptr ? output->wlr()->name : ""},
+          {"hint", asyncHint ? "async" : "vsync"},
+          {"fullscreen", view->currentFullscreen()},
+          {"eligible", output != nullptr && output->tearingEligible(view.get())},
+      };
+      entry["rule_override"] = nullptr;
+      if (const std::optional<bool> rule = view->tearingRuleOverride()) {
+        entry["rule_override"] = *rule;
+      }
+      surfaces.push_back(std::move(entry));
+    }
+
+    return nlohmann::json{
+        {"ok",
+         {
+             {"protocol", server.tearingControlManager() != nullptr},
+             {"outputs", std::move(outputs)},
+             {"surfaces", std::move(surfaces)},
+         }},
+    };
+  }
+
+  nlohmann::json IpcCommands::keyboardLayouts(Server& server, IpcArgs /*args*/) {
+    const auto state = server.keyboardLayoutState();
+    if (!state.has_value()) {
+      return nlohmann::json{{"err", "no keyboard"}};
+    }
+    return nlohmann::json{{"ok", {{"names", state->names}, {"current_index", state->currentIndex}}}};
+  }
+
+  nlohmann::json IpcCommands::action(Server& server, const nlohmann::json& request) {
+    std::string error;
+    const std::optional<Keybind> bind = actionFromRequest(request, error);
+    if (!bind) {
+      return nlohmann::json{{"err", error}};
+    }
+    server.executeAction(*bind, &error);
+    if (!error.empty()) {
+      return nlohmann::json{{"err", error}};
+    }
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::outputCreate(Server& server, IpcArgs args) {
+    std::string name;
+    std::optional<OutputMode> mode;
+    std::string error;
+    if (!parseOutputCreateArgs(args, name, mode, error)) {
+      return nlohmann::json{{"err", error}};
+    }
+    const std::string created = server.createHeadlessOutput(name, mode, &error);
+    if (!error.empty()) {
+      return nlohmann::json{{"err", error}};
+    }
+    return nlohmann::json{{"ok", created}};
+  }
+
+  nlohmann::json IpcCommands::outputDestroy(Server& server, IpcArgs args) {
+    if (args.size() != 1 || args.front().empty()) {
+      return nlohmann::json{{"err", "usage: output-destroy <name>"}};
+    }
+    std::string error;
+    if (!server.destroyOutput(args.front(), &error)) {
+      return nlohmann::json{{"err", error}};
+    }
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::configReplace(Server& server, IpcArgs args) {
+    if (args.size() != 1 || args.front().empty()) {
+      return nlohmann::json{{"err", "usage: config-replace <path>"}};
+    }
+    const std::filesystem::path path(args.front());
+
+    if (!path.is_absolute()) {
+      return nlohmann::json{{"err", "path must be an absolute path"}};
+    }
+
+    std::string errors;
+    const ConfigReloadResult result = replaceConfig(path, errors);
+
+    if (!result.success) {
+      return nlohmann::json{{"err", errors.empty() ? "config replace failed" : errors}};
+    }
+
+    server.handleConfigReload(result);
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::settle(Server& /*server*/, IpcArgs /*args*/) { return nlohmann::json{{"ok", nullptr}}; }
+
+  nlohmann::json IpcCommands::clockFreeze([[maybe_unused]] Server& server, IpcArgs /*args*/) {
+#ifdef UMBRIEL_HARNESS
+    server.freezeAnimationClock();
+#endif
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::clockAdvance(Server& /*server*/, IpcArgs /*args*/) {
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::clockResume([[maybe_unused]] Server& server, IpcArgs /*args*/) {
+#ifdef UMBRIEL_HARNESS
+    server.resumeAnimationClock();
+#endif
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+#ifdef UMBRIEL_HARNESS
+  namespace {
+    // The harness commands below parse their words as one whitespace-separated stream.
+    std::string joinArgs(IpcArgs args) {
+      std::string joined;
+      for (const auto& arg : args) {
+        if (!joined.empty()) {
+          joined += ' ';
+        }
+        joined += arg;
+      }
+      return joined;
+    }
+
+    bool onOrOff(IpcArgs args) { return args.size() == 1 && (args.front() == "on" || args.front() == "off"); }
+  } // namespace
+
+  nlohmann::json IpcCommands::swipeForTest(Server& server, IpcArgs args) {
+    std::istringstream input{joinArgs(args)};
+    std::string phase;
+    uint32_t time = 0;
+    double dx = 0, dy = 0;
+    int cancelled = 0;
+    input >> phase >> time;
+    if (phase == "update") {
+      input >> dx >> dy;
+    } else if (phase == "end") {
+      input >> cancelled;
+    }
+    std::string extra;
+    if (input.fail()
+        || (input >> extra)
+        || !std::isfinite(dx)
+        || !std::isfinite(dy)
+        || (phase != "begin" && phase != "update" && phase != "end")
+        || (cancelled != 0 && cancelled != 1)) {
+      return nlohmann::json{{"err", "expected begin <ms>, update <ms> <dx> <dy>, or end <ms> <cancelled:0|1>"}};
+    }
+    wlr_cursor* cursor = server.cursor()->wlr();
+    if (phase == "begin") {
+      wlr_pointer_swipe_begin_event event{.pointer = nullptr, .time_msec = time, .fingers = 3};
+      wl_signal_emit_mutable(&cursor->events.swipe_begin, &event);
+    } else if (phase == "update") {
+      wlr_pointer_swipe_update_event event{.pointer = nullptr, .time_msec = time, .fingers = 3, .dx = dx, .dy = dy};
+      wl_signal_emit_mutable(&cursor->events.swipe_update, &event);
+    } else {
+      wlr_pointer_swipe_end_event event{.pointer = nullptr, .time_msec = time, .cancelled = cancelled != 0};
+      wl_signal_emit_mutable(&cursor->events.swipe_end, &event);
+    }
+    Output* output = server.outputFromWlr(server.preferredOutput());
+    WorkspaceGroup* group = output != nullptr ? output->workspaceGroup() : nullptr;
+    return nlohmann::json{
+        {"ok",
+         {{"progress", group != nullptr ? group->slideProgress() : 0.0},
+          {"reveal", group != nullptr && group->revealActive()}}}
+    };
+  }
+
+  nlohmann::json IpcCommands::animationCaptureFail(Server& server, IpcArgs args) {
+    if (!onOrOff(args)) {
+      return nlohmann::json{{"err", "expected on or off"}};
+    }
+    fx_renderer_fail_animation_capture_for_test(server.renderer(), args.front() == "on");
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::blurCompositeSplit(Server& server, IpcArgs args) {
+    if (!onOrOff(args)) {
+      return nlohmann::json{{"err", "expected on or off"}};
+    }
+    fx_renderer_split_blur_composite_for_test(server.renderer(), args.front() == "on");
+    for (const auto& output : server.outputs()) {
+      output->scheduleFullFrame();
+    }
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::rendererRecover(Server& server, IpcArgs /*args*/) {
+    server.emitRendererLostForTest();
+    server.emitRendererLostForTest();
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::planeCursor(Server& server, IpcArgs args) {
+    std::string error;
+    if (!server.injectPlaneCursor(joinArgs(args), &error)) {
+      return nlohmann::json{{"err", error}};
+    }
+    return nlohmann::json{{"ok", nullptr}};
+  }
+
+  nlohmann::json IpcCommands::effectFrames(Server& server, IpcArgs /*args*/) {
+    nlohmann::json outputs = nlohmann::json::array();
+    for (const auto& output : server.outputs()) {
+      outputs.push_back({
+          {"name", output->wlr()->name},
+          {"effect_frames", output->effectFrames()},
+          {"eligible", output->effectEligible()},
+      });
+    }
+    return nlohmann::json{{"ok", {{"outputs", std::move(outputs)}}}};
+  }
+
+  nlohmann::json IpcCommands::cursorState(Server& server, IpcArgs /*args*/) {
+    const Cursor* cursor = server.cursor();
+    nlohmann::json image = nullptr;
+    if (const std::optional<Cursor::RenderedCursorStateForTest> rendered = cursor->renderedCursorStateForTest()) {
+      image = {
+          {"texture_width", rendered->textureWidth},
+          {"texture_height", rendered->textureHeight},
+          {"render_width", rendered->renderWidth},
+          {"render_height", rendered->renderHeight},
+      };
+    }
+    return nlohmann::json{{
+        "ok",
+        {
+            {"source", cursor->clientCursorSourceForTest()},
+            {"name", cursor->clientCursorNameForTest()},
+            {"xwayland", cursor->clientCursorFromXwaylandForTest()},
+            {"image", std::move(image)},
+        },
+    }};
+  }
+#endif
+
+  bool parseOutputCreateArgs(IpcArgs args, std::string& name, std::optional<OutputMode>& mode, std::string& error) {
+    if (args.empty() || args.size() > 2 || args.front().empty()) {
+      error = "usage: output-create <name> [mode]";
+      return false;
+    }
+    name = args.front();
+    if (args.size() == 1) {
+      return true;
+    }
+    OutputMode parsed;
+    if (!parseOutputMode(args[1], parsed)) {
+      error = "invalid mode: " + args[1] + " (use WIDTHxHEIGHT[@HZ])";
+      return false;
+    }
+    mode = parsed;
+    return true;
+  }
+
+  static constexpr IpcCommandSpec kIpcCommands[] = {
+      {"input-capture-permissions", "", "list remembered input capture grants", IpcCommandGroup::Inspect, false,
+       &IpcCommands::inputCapturePermissions, nullptr},
+      {"input-capture-revoke", "<id|all>", "forget capture permission and stop sessions using it",
+       IpcCommandGroup::Control, true, &IpcCommands::inputCaptureRevoke, nullptr},
+      {"output-create", "<name> [mode]", "create a virtual output (optional mode, as 1920x1080@60)",
+       IpcCommandGroup::Control, true, &IpcCommands::outputCreate, &printOutputName},
+      {"output-destroy", "<name>", "destroy a virtual output", IpcCommandGroup::Control, true,
+       &IpcCommands::outputDestroy, nullptr},
+      {"config-replace", "<path>", "load and watch a different config file", IpcCommandGroup::Control, true,
+       &IpcCommands::configReplace, nullptr},
+      {"effects", "", "inspect effect presets, pools, and owner selections", IpcCommandGroup::Inspect, false,
+       &IpcCommands::effects, &printEffects},
+      {"windows", "", "list windows (app id and title)", IpcCommandGroup::Inspect, false, &IpcCommands::windows,
+       &printWindows},
+      {"move-menu", "<window-id>", "open the native workspace picker for a window",
+       IpcCommandGroup::Control, true, &IpcCommands::movedWindowMenu, nullptr},
+      {"restore-window", "<window-id>", "restore a minimized or scratchpad window",
+       IpcCommandGroup::Control, true, &IpcCommands::restoreWindow, nullptr},
+      {"overlay-pin", "<on|off|toggle>", "keep the native window controls visible without holding Mod",
+       IpcCommandGroup::Control, true, &IpcCommands::overlayPin, nullptr},
+      {"focused-window", "", "print the focused window (app id and title)", IpcCommandGroup::Inspect, false,
+       &IpcCommands::focusedWindow, &printWindowRow},
+      {"workspaces", "", "list workspaces and their layouts", IpcCommandGroup::Inspect, false, &IpcCommands::workspaces,
+       &printWorkspaces},
+      {"submap", "", "show the active keybind submap", IpcCommandGroup::Inspect, false, &IpcCommands::submap,
+       &printSubmap},
+      {"layers", "", "list layer-shell surfaces", IpcCommandGroup::Inspect, false, &IpcCommands::layers, &printLayers},
+      {"outputs", "", "list outputs and modes", IpcCommandGroup::Inspect, false, &IpcCommands::outputs, &printOutputs},
+      {"color", "", "show color-management state", IpcCommandGroup::Inspect, false, &IpcCommands::color, &printColor},
+      {"tearing", "", "show tearing-control state", IpcCommandGroup::Inspect, false, &IpcCommands::tearing,
+       &printTearing},
+      {"keyboard-layouts", "", "list keyboard layouts", IpcCommandGroup::Inspect, false, &IpcCommands::keyboardLayouts,
+       &printKeyboardLayouts},
+#ifdef UMBRIEL_HARNESS
+      {"settle", "", "wait until no layout or animation is pending and every output has drawn a frame",
+       IpcCommandGroup::Harness, false, &IpcCommands::settle, nullptr, 35},
+      {"clock-freeze", "", "stop animation time", IpcCommandGroup::Harness, false, &IpcCommands::clockFreeze, nullptr},
+      {"clock-advance", "<ms>", "move frozen animation time forward and wait until every output has drawn it",
+       IpcCommandGroup::Harness, true, &IpcCommands::clockAdvance, nullptr, 35},
+      {"clock-resume", "", "let animation time follow the monotonic clock again, from where it stopped",
+       IpcCommandGroup::Harness, false, &IpcCommands::clockResume, nullptr},
+      {"swipe-test", "<begin|update|end> <ms> [dx dy|cancelled]", "inject three-finger swipe events (harness only)",
+       IpcCommandGroup::Harness, true, &IpcCommands::swipeForTest, nullptr},
+      {"animation-capture-fail", "<on|off>", "inject animation capture failure (harness only)",
+       IpcCommandGroup::Harness, true, &IpcCommands::animationCaptureFail, nullptr},
+      {"blur-composite-split", "<on|off>",
+       "composite backdrop blur through an effect buffer and wait until every output has drawn it (harness only)",
+       IpcCommandGroup::Harness, true, &IpcCommands::blurCompositeSplit, nullptr, 35},
+      {"renderer-recover", "", "emit renderer loss and exercise recovery", IpcCommandGroup::Harness, false,
+       &IpcCommands::rendererRecover, nullptr},
+      {"plane-cursor", "<output> <x> <y> <visible> <image> [width height hotspot_x hotspot_y]",
+       "synthesize a hardware cursor plane sample (harness only)", IpcCommandGroup::Harness, true,
+       &IpcCommands::planeCursor, nullptr},
+      {"effect-frames", "", "count frames drawn for persistent effects per output", IpcCommandGroup::Harness, false,
+       &IpcCommands::effectFrames, nullptr},
+      {"cursor-state", "", "inspect the current client cursor source (harness only)", IpcCommandGroup::Harness, false,
+       &IpcCommands::cursorState, nullptr},
+#endif
+  };
+
+  std::span<const IpcCommandSpec> ipcCommands() { return kIpcCommands; }
+
+  const IpcCommandSpec* findIpcCommand(std::string_view name) {
+    for (const auto& spec : kIpcCommands) {
+      if (name == spec.name) {
+        return &spec;
+      }
+    }
+    return nullptr;
+  }
+
+} // namespace umbriel

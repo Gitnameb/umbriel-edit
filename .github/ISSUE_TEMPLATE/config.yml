@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Umbriel scope
+    url: https://github.com/noctalia-dev/umbriel/blob/main/SCOPE.md
+    about: See which kinds of changes Umbriel is ready to take on.
+  - name: Noctalia Discord
+    url: https://discord.noctalia.dev
+    about: Questions, support, or early feature ideas. Come say hello.
+  - name: Umbriel docs
+    url: https://docs.noctalia.dev/umbriel/
+    about: Configuration reference, keybinds, window rules, and guides.
+  - name: Noctalia shell issues
+    url: https://github.com/noctalia-dev/noctalia/issues
+    about: Bar, launcher, notifications, widgets, and everything else in the desktop shell.
+  - name: Portal issues
+    url: https://github.com/noctalia-dev/xdg-desktop-portal-umbriel/issues
+    about: Screen sharing, screencasting, and portal screenshot problems.

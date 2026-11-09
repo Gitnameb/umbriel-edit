@@ -1,0 +1,96 @@
+name: Feature Request
+description: Propose an addition or change that fits Umbriel's scope
+title: "[FEATURE] "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing an idea. You do not need to arrive with a complete design: explaining the problem you run
+        into is the most useful place to start.
+
+        Umbriel focuses on improving the compositor features it already has. It is not currently adding tiling layouts,
+        desktop shell components, or plugins. The [scope guide](https://github.com/noctalia-dev/umbriel/blob/main/SCOPE.md)
+        explains those boundaries in more detail.
+
+        Not sure whether an idea fits? Ask in [Discord](https://discord.noctalia.dev). Early discussion is welcome, and
+        a scope decision is about the project's focus, not the value of your idea.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation you run into and how it affects you.
+      placeholder: When I ..., Umbriel ..., so I end up ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would a better experience look like?
+      description: Describe the result you hope for. A concrete implementation is optional.
+      placeholder: It would help if I could ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Possible approach
+      description: If you have an idea for how it could work, share it here. Configuration sketches, actions, and
+        mockups are all useful, but none are required.
+      placeholder: |
+        Perhaps Umbriel could ...
+
+  - type: textarea
+    id: attempts
+    attributes:
+      label: What have you tried?
+      description: Tell us about relevant configuration, window or layer rules, keybinds, submaps, or `umbriel msg`
+        actions you have already explored.
+      placeholder: |
+        I tried ..., but ...
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Umbriel seems most relevant?
+      options:
+        - Existing layout behavior (scrolling, dwindle, master)
+        - Floating, pinned, or fullscreen windows
+        - Workspaces or scratchpad
+        - Overview
+        - Window or layer rules
+        - Input (keyboard, pointer, touch, gestures, IME)
+        - Output or display
+        - Rendering (blur, shadows, borders, corners, animation)
+        - Configuration
+        - IPC or CLI
+        - Wayland protocol support
+        - Xwayland
+        - Packaging or session integration
+        - Documentation
+        - I am not sure
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Examples or references
+      description: Links, screenshots, recordings, or related discussions can help explain the request.
+
+  - type: checkboxes
+    id: participation
+    attributes:
+      label: How would you like to help?
+      options:
+        - label: I can test an implementation in my own session.
+        - label: I might be interested in implementing this after we discuss the scope.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
+      description: Add any context, constraints, or questions that would help the conversation.

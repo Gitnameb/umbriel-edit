@@ -1,0 +1,148 @@
+#pragma once
+
+#include "config/effects.h"
+#include "core/animation.h"
+#include "scene/effect_audio.h"
+#include "scene/effect_ledger.h"
+
+#include <array>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+struct fx_effect_shader;
+struct fx_effect_requirements;
+struct fx_animation_parameters;
+struct wlr_output;
+struct wlr_scene_node;
+struct wlr_renderer;
+
+namespace umbriel {
+
+  class Output;
+  class Server;
+
+  // One compiled program per referenced preset for the current renderer, plus
+  // the built-in lifecycle fade. Prepares at startup, on reload with the
+  // effects or animation flags, and after renderer recovery; never compiles in
+  // a render callback. Failures are cached as null with a diagnostic.
+  class EffectRegistry {
+  public:
+    explicit EffectRegistry(Server& server);
+    ~EffectRegistry();
+    EffectRegistry(const EffectRegistry&) = delete;
+    EffectRegistry& operator=(const EffectRegistry&) = delete;
+
+    void prepare(wlr_renderer* renderer);
+    void clear();
+    wlr_renderer* renderer() const { return m_renderer; }
+
+    // The program for `name`, or null when the preset is off, inert, of another kind, or failed to compile.
+    fx_effect_shader* preset(std::string_view name, EffectKind kind) const;
+    const EffectPreset* presetConfig(std::string_view name) const;
+    std::string_view programState(std::string_view name) const;
+    // The preset bound to an animation event through `effect =`, or null.
+    fx_effect_shader* animationEffect(AnimationEvent event) const;
+    // The program a lifecycle fade composes through: the event's preset, or for windows_in and windows_out without
+    // one, a built-in fade that applies the lifecycle alpha to the whole window at once. Null when buffers fade
+    // individually; prepare() compiles every program, never this lookup.
+    fx_effect_shader* lifecycleEffect(AnimationEvent event) const;
+    // The drag slot's built-in deformation program, compiled by prepare() for the current renderer. Null while
+    // animations or windows_drag.physics are off, or when it failed to compile.
+    fx_effect_shader* deformationShader() const;
+    // The built-in whole-output display filter, or null while every value is neutral.
+    fx_effect_shader* displayFilterEffect() const { return m_displayFilter.get(); }
+    // Built-in blur for the window under the pointer while Mod is held. Applies to the client content only, so the
+    // native title bar and its buttons stay sharp.
+    fx_effect_shader* modHoverBlurShader() const { return m_hoverBlur.get(); }
+    // Adds alba_brightness, alba_extra_dim, and alba_warm for displayFilterEffect().
+    void fillDisplayUniforms(fx_animation_parameters& parameters) const;
+    // The preset bound to an animation event through `effect =`, or null (also null for the built-in fade).
+    const EffectPreset* animationPreset(AnimationEvent event) const;
+    // The animation clock in seconds, read only when a program needs it. Measured from an epoch
+    // taken on the first call, so the millisecond count backing it can exceed a float's exact
+    // integer range without the returned value losing precision.
+    float clockSeconds() const;
+    // Adds `umbriel_time` when `shader` reads it, and the `[colors]` palette for palette presets.
+    void fillTimeUniforms(
+        fx_animation_parameters& parameters, float seconds, const EffectPreset& preset, const fx_effect_shader* shader
+    ) const;
+
+    bool active() const { return m_ledger.active() > 0; }
+    // Prepared programs and retained snapshots both keep rendering requirements alive.
+    bool persistentReferenced() const { return m_persistentReferenced || m_retainedPersistent > 0; }
+    bool inPlaceReferenced() const { return m_inPlaceReferenced || m_retainedInPlace > 0; }
+    // Pointer motion reaches outputs only while the selected cursor effect is active.
+    bool cursorEffectActive() const { return m_cursorActive; }
+    EffectLedger& ledger() { return m_ledger; }
+    void setSuspended(bool suspended);
+    void setAudio(const EffectAudio& audio);
+    const EffectAudio& audio() const { return m_audio; }
+    // Records an instance; schedules its output's effect frame when that output gains its first eligible instance.
+    void updateInstance(const void* owner, const EffectInstanceState& state);
+    void removeInstance(const void* owner);
+    void removeOutput(const Output* output);
+    // Keep the light layer while prepared programs or snapshots require it.
+    void syncLightLayer();
+    void retainRequirements(const fx_effect_requirements& requirements);
+    void releaseRequirements(const fx_effect_requirements& requirements);
+    // Pushes the output-level effect settings to every output.
+    void applyOutputEffects();
+    // Forwards the pointer to every output's cursor slot; call only while cursorEffectActive().
+    void pointerMoved(double lx, double ly, bool visible);
+    // The output layout changed: the next pointerMoved() re-applies every output.
+    void forgetPointerOutput() { m_pointerWlrOutput = nullptr; }
+
+  private:
+    struct Entry {
+      EffectKind kind = EffectKind::Animation;
+      std::string code;
+      std::shared_ptr<fx_effect_shader> shader; // null once compilation failed
+    };
+    void compile(const EffectPreset& preset);
+    void referencedNames(std::vector<std::string>& names) const;
+    void updateCursorActive();
+    // Forgets the deformation program so the next prepare() that needs it compiles afresh.
+    void dropDeformation();
+
+    Server* m_server = nullptr;
+    wlr_renderer* m_renderer = nullptr;
+    std::map<std::string, Entry, std::less<>> m_programs;
+    std::shared_ptr<fx_effect_shader> m_builtinFade;
+    std::shared_ptr<fx_effect_shader> m_displayFilter;
+    std::shared_ptr<fx_effect_shader> m_hoverBlur;
+    std::shared_ptr<fx_effect_shader> m_deformation; // null once compilation failed
+    bool m_deformationCompiled = false;
+    bool m_persistentReferenced = false;
+    bool m_inPlaceReferenced = false;
+    bool m_cursorActive = false;
+    unsigned m_retainedPersistent = 0;
+    unsigned m_retainedInPlace = 0;
+    unsigned m_retainedLight = 0;
+    const wlr_output* m_pointerWlrOutput = nullptr; // under the pointer at the last forward
+    bool m_pointerVisible = false;
+    EffectLedger m_ledger;
+    EffectAudio m_audio{}; // bands and availability
+    mutable uint64_t m_clockEpochMsec = 0;
+    mutable bool m_clockEpochSet = false;
+  };
+
+  // The Server's registry. Set in Server's constructor before any view exists.
+  EffectRegistry& effectRegistry();
+
+  // Binds `event`'s slot on `node` to its lifecycle effect while `value` animates, and clears it otherwise. For an
+  // AnimatedValue, a zero `direction` follows the sign of the value's travel.
+  void
+  bindAnimationEffect(wlr_scene_node* node, AnimationEvent event, const AnimatedValue& value, float direction = 0.0F);
+  void bindAnimationEffect(wlr_scene_node* node, AnimationEvent event, const AnimatedColor& value, float direction);
+
+  // Seconds elapsed from `epochMsec` to `nowMsec`, computed in double precision so the result keeps
+  // sub-millisecond resolution long after the raw millisecond count exceeds a float's exact range.
+  inline float effectClockSeconds(uint64_t nowMsec, uint64_t epochMsec) {
+    return static_cast<float>(static_cast<double>(nowMsec - epochMsec) / 1000.0);
+  }
+
+} // namespace umbriel

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# Built-in slide keeps more opacity than fade at the same point in the timeline, so its existing movement remains
+# visible during both window opening and closing. Built-in popin shrinks a closing snapshot toward its own centre.
+# Built-in fade applies one alpha to the whole window: a red parent fully covered by a blue subsurface never shows
+# through it while opening or closing, as it would if each buffer faded on its own.
+# A shown tab keeps its close snapshot over its red replacement; an already-hidden tab never contributes pixels.
+set -euo pipefail
+
+readonly CLIENT="${UMBRIEL_UNMAP_CLIENT:-./build-debug/tests/unmap-client}"
+readonly SUBSURFACE_CLIENT="${UMBRIEL_SUBSURFACE_CLIENT:-./build-debug/tests/subsurface-client}"
+readonly IMAGE="$UMBRIEL_RUNTIME_DIR/builtin-window-styles.png"
+readonly DURATION_MS=5000
+
+cat >> "$UMBRIEL_CONFIG" <<'EOF'
+
+[colors]
+backdrop = "#000000FF"
+
+[appearance]
+border_width = 0
+outer_border_width = 0
+corner_radius = 0
+
+[appearance.shadow]
+enabled = false
+
+[animation]
+duration_ms = 5000
+curve = "linear"
+
+[animation.windows_in]
+style = "fade" # OPEN_STYLE
+
+[animation.windows_out]
+style = "fade" # CLOSE_STYLE
+
+[animation.windows_move]
+enabled = false
+
+[animation.dim_unfocused]
+enabled = false
+
+[layout.tabs]
+default_display = "tabbed"
+
+[[window_rule]]
+match.title = "^style-tab-"
+default_scrolling_column = "style-tabs"
+
+[[window_rule]]
+match.title = "^style-fade$"
+default_floating = true
+default_floating_size_px = { width = 400, height = 240 }
+default_position = { x = 100, y = 180, anchor = "top_left" }
+
+[[window_rule]]
+match.title = "^style-slide$"
+default_floating = true
+default_floating_size_px = { width = 400, height = 240 }
+default_position = { x = 760, y = 180, anchor = "top_left" }
+
+[[window_rule]]
+match.title = "^style-group$"
+default_floating = true
+default_floating_size_px = { width = 400, height = 240 }
+default_position = { x = 760, y = 440, anchor = "top_left" }
+
+[[window_rule]]
+match.title = "^style-popin$"
+default_floating = true
+default_floating_size_px = { width = 400, height = 240 }
+default_position = { x = 100, y = 440, anchor = "top_left" }
+EOF
+"$UMBRIEL" msg config-reload > /dev/null
+
+wait_for_window() {
+  local title=$1
+  for _ in $(seq 100); do
+    if "$UMBRIEL" windows --json | jq -e --arg title "$title" '.[] | select(.title == $title)' > /dev/null; then
+      return 0
+    fi
+    sleep 0.025
+  done
+  echo "timed out waiting for $title"
+  return 1
+}
+
+spawn() {
+  local title=$1 color=${2:-0xFF0000FF}
+  FILL_COLOR="$color" "$CLIENT" "$title" 400 240 > "$UMBRIEL_RUNTIME_DIR/$title.log" 2>&1 &
+  wait_for_window "$title"
+}
+
+window_id() {
+  "$UMBRIEL" windows --json | jq -r --arg title "$1" '.[] | select(.title == $title) | .id'
+}
+
+wait_unmapped() {
+  local title=$1
+  for _ in $(seq 100); do
+    if grep -q '^unmapped$' "$UMBRIEL_RUNTIME_DIR/$title.log" \
+        && ! "$UMBRIEL" windows --json | jq -e --arg title "$title" 'any(.[]; .title == $title)' > /dev/null; then
+      return 0
+    fi
+    sleep 0.025
+  done
+  echo "timed out waiting for $title to unmap"
+  return 1
+}
+
+sample_rgb() {
+  local x=$1 y=$2
+  grim "$IMAGE"
+  "$UMBRIEL_PIXEL_PROBE" "$IMAGE" mean "40x40+$x+$y" | awk '{ print $1, $3 }'
+}
+
+assert_group_fade() {
+  local phase=$1 red=$2 blue=$3
+  if ! ((blue >= 90 && blue <= 165)); then
+    echo "$phase subsurface window was outside the middle of its fade: blue=$blue"
+    exit 1
+  fi
+  if ((red > 15)); then
+    echo "$phase covered parent showed through its subsurface: red=$red blue=$blue"
+    exit 1
+  fi
+}
+
+sample_blue() {
+  local x=$1 y=$2
+  grim "$IMAGE"
+  "$UMBRIEL_PIXEL_PROBE" "$IMAGE" mean "40x40+$x+$y" | awk '{ print $3 }'
+}
+
+blue_bounds() {
+  grim "$IMAGE"
+  "$UMBRIEL_PIXEL_PROBE" "$IMAGE" bbox 'b > 0.3 && r < 0.2 && g < 0.2'
+}
+
+assert_slide_brighter() {
+  local phase=$1 fade=$2 slide=$3
+  if ! (( fade >= 90 && fade <= 165 )); then
+    echo "$phase fade sample was outside the middle of its timeline: $fade"
+    exit 1
+  fi
+  if ! (( slide >= 150 && slide <= 215 && slide >= fade + 30 )); then
+    echo "$phase slide was not visibly more opaque than fade: fade=$fade slide=$slide"
+    exit 1
+  fi
+}
+
+# Animation time only moves by clock-advance: samples land at 2350 ms (0.47 of each 5000 ms timeline), and advancing
+# 5000 ms finishes every running animation.
+"$UMBRIEL" clock-freeze
+spawn style-fade
+"$UMBRIEL" clock-advance 2350
+fade_open=$(sample_blue 280 280)
+"$UMBRIEL" clock-advance 5000
+
+sed -i 's/^style = "fade" # OPEN_STYLE$/style = "slide" # OPEN_STYLE/' "$UMBRIEL_CONFIG"
+"$UMBRIEL" msg config-reload > /dev/null
+spawn style-slide
+"$UMBRIEL" clock-advance 2350
+slide_open=$(sample_blue 940 310)
+assert_slide_brighter opening "$fade_open" "$slide_open"
+"$UMBRIEL" clock-advance 5000
+
+"$UMBRIEL" msg window-close "$(window_id style-fade)" > /dev/null
+"$UMBRIEL" clock-advance 2350
+fade_close=$(sample_blue 280 280)
+"$UMBRIEL" clock-advance 5000
+
+sed -i 's/^style = "fade" # CLOSE_STYLE$/style = "slide" # CLOSE_STYLE/' "$UMBRIEL_CONFIG"
+"$UMBRIEL" msg config-reload > /dev/null
+"$UMBRIEL" msg window-close "$(window_id style-slide)" > /dev/null
+"$UMBRIEL" clock-advance 2350
+slide_close=$(sample_blue 940 310)
+assert_slide_brighter closing "$fade_close" "$slide_close"
+"$UMBRIEL" clock-advance 5000
+
+sed -i 's/^style = "slide" # CLOSE_STYLE$/style = "popin" # CLOSE_STYLE/' "$UMBRIEL_CONFIG"
+"$UMBRIEL" msg config-reload > /dev/null
+spawn style-popin
+"$UMBRIEL" clock-advance 5000
+read -r popin_x popin_y popin_w popin_h <<< "$(blue_bounds)"
+if ((popin_x < 98 || popin_x > 102 || popin_y < 438 || popin_y > 442 \
+    || popin_w < 398 || popin_w > 402 || popin_h < 238 || popin_h > 242)); then
+  echo "popin window did not settle at its configured box: $popin_x $popin_y $popin_w $popin_h"
+  exit 1
+fi
+"$UMBRIEL" msg window-close "$(window_id style-popin)" > /dev/null
+"$UMBRIEL" clock-advance 2350
+read -r mid_x mid_y mid_w mid_h <<< "$(blue_bounds)"
+# Linear 5000 ms close sampled near 0.47: scale is about 0.906 of the captured 400x240 box, centred on 300, 560.
+if ((mid_x < 108 || mid_x + mid_w > 492 || mid_y < 444 || mid_y + mid_h > 676)); then
+  echo "popin close snapshot did not shrink inside its captured box: $mid_x $mid_y $mid_w $mid_h"
+  exit 1
+fi
+mid_cx=$((2 * mid_x + mid_w))
+mid_cy=$((2 * mid_y + mid_h))
+if ((mid_cx < 594 || mid_cx > 606 || mid_cy < 1114 || mid_cy > 1126)); then
+  echo "popin close snapshot did not shrink toward its centre: centre=$((mid_cx / 2)) $((mid_cy / 2))"
+  exit 1
+fi
+
+"$UMBRIEL" clock-advance 5000
+
+sed -i 's/^style = "slide" # OPEN_STYLE$/style = "fade" # OPEN_STYLE/' "$UMBRIEL_CONFIG"
+sed -i 's/^style = "popin" # CLOSE_STYLE$/style = "fade" # CLOSE_STYLE/' "$UMBRIEL_CONFIG"
+"$UMBRIEL" msg config-reload > /dev/null
+"$SUBSURFACE_CLIENT" style-group 400 240 > "$UMBRIEL_RUNTIME_DIR/style-group.log" 2>&1 &
+group_pid=$!
+wait_for_window style-group
+"$UMBRIEL" clock-advance 2350
+read -r group_open_red group_open_blue <<< "$(sample_rgb 940 540)"
+assert_group_fade opening "$group_open_red" "$group_open_blue"
+"$UMBRIEL" clock-advance 5000
+kill "$group_pid"
+"$UMBRIEL" clock-advance 2350
+read -r group_close_red group_close_blue <<< "$(sample_rgb 940 540)"
+assert_group_fade closing "$group_close_red" "$group_close_blue"
+
+"$UMBRIEL" clock-advance 5000
+
+spawn style-tab-red 0xFFFF0000
+"$UMBRIEL" clock-advance 5000
+spawn style-tab-blue
+"$UMBRIEL" clock-advance 5000
+if ! "$UMBRIEL" windows --json | jq -e '
+  any(.[]; .title == "style-tab-blue" and .tabbed and (.tab_hidden | not) and .active)
+  and any(.[]; .title == "style-tab-red" and .tab_hidden)
+' > /dev/null; then
+  echo "expected the blue tab to show over its hidden red replacement"
+  exit 1
+fi
+read -r tab_x tab_y < <("$UMBRIEL" windows --json | jq -r '
+  .[] | select(.title == "style-tab-blue") | "\(.x + (.w / 2 | floor)) \(.y + (.h / 2 | floor))"
+')
+grim "$IMAGE"
+read -r red green blue < <("$UMBRIEL_PIXEL_PROBE" "$IMAGE" pixel "$tab_x" "$tab_y")
+if ((red > 15 || green > 15 || blue < 240)); then
+  echo "shown blue tab did not draw before closing: $red $green $blue"
+  exit 1
+fi
+"$UMBRIEL" msg window-close "$(window_id style-tab-blue)" > /dev/null
+wait_unmapped style-tab-blue
+"$UMBRIEL" clock-advance "$((DURATION_MS / 2))"
+grim "$IMAGE"
+read -r red green blue < <("$UMBRIEL_PIXEL_PROBE" "$IMAGE" pixel "$tab_x" "$tab_y")
+if ((red < 90 || red > 165 || green > 15 || blue < 90 || blue > 165)); then
+  echo "shown blue tab did not fade over its red replacement at midpoint: $red $green $blue"
+  exit 1
+fi
+"$UMBRIEL" clock-advance "$((DURATION_MS / 2))"
+grim "$IMAGE"
+read -r red green blue < <("$UMBRIEL_PIXEL_PROBE" "$IMAGE" pixel "$tab_x" "$tab_y")
+if ((red < 240 || green > 15 || blue > 15)); then
+  echo "red replacement did not remain after the shown tab finished closing: $red $green $blue"
+  exit 1
+fi
+
+spawn style-tab-hidden
+"$UMBRIEL" clock-advance 5000
+"$UMBRIEL" msg window-focus "$(window_id style-tab-red)" > /dev/null
+"$UMBRIEL" clock-advance 1
+if ! "$UMBRIEL" windows --json | jq -e '
+  any(.[]; .title == "style-tab-hidden" and .tab_hidden)
+  and any(.[]; .title == "style-tab-red" and (.tab_hidden | not) and .active)
+' > /dev/null; then
+  echo "expected the blue closer to be hidden before its close begins"
+  exit 1
+fi
+"$UMBRIEL" msg window-close "$(window_id style-tab-hidden)" > /dev/null
+wait_unmapped style-tab-hidden
+for advance in 1 "$((DURATION_MS / 2))"; do
+  "$UMBRIEL" clock-advance "$advance"
+  grim "$IMAGE"
+  read -r red green blue < <("$UMBRIEL_PIXEL_PROBE" "$IMAGE" pixel "$tab_x" "$tab_y")
+  if ((red < 240 || green > 15 || blue > 15)); then
+    echo "already-hidden blue tab contributed a close snapshot over red: $red $green $blue"
+    exit 1
+  fi
+done
+
+echo "built-in styles kept their lifecycle visuals, shown tabs faded over replacements, and hidden tabs stayed snapshot-free"

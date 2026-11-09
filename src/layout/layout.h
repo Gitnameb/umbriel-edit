@@ -1,0 +1,401 @@
+#pragma once
+
+#include "layout/tab_state.h"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <vector>
+
+struct wlr_box;
+
+namespace umbriel {
+
+  class View;
+  class Layout;
+  struct ResolvedLayoutConfig;
+
+  enum class LayoutMode {
+    Scrolling,
+    Dwindle,
+    Master,
+    Stacking,
+  };
+
+  enum class ScrollingDirection {
+    Horizontal,
+    Vertical,
+  };
+
+  enum class MasterPosition {
+    Left,
+    Right,
+    Center,
+  };
+
+  enum class CenterFocusedColumn {
+    Never,
+    Always,
+    OnOverflow,
+  };
+
+  struct LayoutStruts {
+    int left = 0;
+    int right = 0;
+    int top = 0;
+    int bottom = 0;
+    bool operator==(const LayoutStruts&) const = default;
+  };
+
+  struct LayoutStrutOverrides {
+    std::optional<int> left;
+    std::optional<int> right;
+    std::optional<int> top;
+    std::optional<int> bottom;
+    bool operator==(const LayoutStrutOverrides&) const = default;
+  };
+
+  // Apply the configured tiled-layout inset after layer-shell exclusive zones.
+  // Negative values deliberately expand the area beyond those bounds.
+  wlr_box applyLayoutStruts(const wlr_box& area, const LayoutStruts& struts);
+
+  using LayoutMemberId = uint32_t;
+
+  struct LayoutMember {
+    LayoutMemberId id = 0;
+    View* view = nullptr;
+  };
+
+  // Immutable, layout-owned state. Member ids keep snapshots independent of
+  // View lifetimes while a physical output is absent.
+  class LayoutSnapshot {
+  public:
+    virtual ~LayoutSnapshot() = default;
+    virtual LayoutMode mode() const = 0;
+    virtual size_t memberCount() const = 0;
+  };
+
+  struct LayoutCapture {
+    std::shared_ptr<const LayoutSnapshot> snapshot;
+    // View pointers are consumed immediately by the caller and are never kept
+    // in the immutable snapshot.
+    std::vector<LayoutMember> members;
+  };
+
+  std::optional<std::vector<View*>> resolveLayoutMembers(size_t memberCount, std::span<const LayoutMember> members);
+
+  // What a layout needs to know about a view in order to size it: the client's
+  // size hints plus whether it is going fullscreen.
+  struct LayoutConstraints {
+    int minWidth = 1;
+    int minHeight = 1;
+    int maxWidth = 0;  // 0 = unlimited
+    int maxHeight = 0; // 0 = unlimited
+    bool fullscreen = false;
+    bool maximizedToEdges = false;
+
+    int clampWidth(int width) const {
+      width = width < minWidth ? minWidth : width;
+      if (maxWidth > 0 && width > maxWidth) {
+        width = maxWidth;
+      }
+      return width < 1 ? 1 : width;
+    }
+
+    int clampHeight(int height) const {
+      height = height < minHeight ? minHeight : height;
+      if (maxHeight > 0 && height > maxHeight) {
+        height = maxHeight;
+      }
+      return height < 1 ? 1 : height;
+    }
+  };
+
+  // Layouts treat View as an opaque identity. They still need its constraints, so the owning Workspace supplies the
+  // lookup rather than layout/ depending on View's definition. Unset means unconstrained, which is what the geometry
+  // tests want.
+  using LayoutConstraintsFn = LayoutConstraints (*)(const View*);
+
+  // Scrolling interprets widthFrac as the primary-axis extent fraction.
+  // heightWeights and edge gap weights divide the cross-axis extent.
+  // Dwindle continues to use the fields in its native horizontal/vertical sense.
+  struct Column {
+    std::vector<View*> views;
+    std::vector<double> heightWeights;
+    double topGapWeight = 0.0;
+    double bottomGapWeight = 0.0;
+    double widthFrac = 0.5;
+    double savedWidthFrac = 0.0;
+    std::vector<double> rememberedScrollingExtents;
+    // Runs of rows shown as tabs, each one unit of the stack.
+    ColumnTabs tabs;
+  };
+
+  // The tab group holding `view`, else null.
+  const TabGroup* tabGroupOf(const Column& column, const View* view);
+  // The window the unit holding row `row` shows: the row itself, or the active tab of its group.
+  View* unitEntry(const Column& column, size_t row);
+  // Where focus enters a column from outside it: the window its first unit shows.
+  View* columnEntry(const Column& column);
+  // True for a tab its group is not showing.
+  bool hiddenTab(const Column& column, const View* view);
+  // Whether a tab group of `tabs` tabs draws its bar: its own choice when it has one, else the configuration's.
+  bool tabBarShown(const ResolvedLayoutConfig& config, size_t tabs, std::optional<bool> bar);
+
+  // Layouts whose columns can show runs of their rows as tabs. Layout::tabbedContainers() reaches it; a layout without
+  // multi-view containers has none. Every call names a tiled view and acts on the tab group around it.
+  class TabbedContainers {
+  public:
+    virtual ~TabbedContainers() = default;
+    // Show the rows around `view` as tabs, or stack its group's tabs again. False when nothing changed.
+    virtual bool setTabbed(const View* view, bool tabbed) = 0;
+    // Show `view` in its tab group. True only when the group now shows a different view.
+    virtual bool selectTab(const View* view) = 0;
+    // Add `view`, not yet in the layout, at row `row` of the group containing `member` in column `column`.
+    // Either boundary belongs to the named group. False, adding nothing, when the row lies outside that group.
+    virtual bool insertTab(View* view, int column, int row, const View* member) = 0;
+    // Move `view` one place among its tabs, `direction` negative for earlier. False at either end or outside a group.
+    virtual bool moveTab(const View* view, int direction) = 0;
+    // Draw or hide the bar of `view`'s tab group; nullopt toggles it. False outside a group.
+    virtual bool setTabBar(const View* view, std::optional<bool> shown) = 0;
+  };
+
+  struct LayoutTarget {
+    View* view = nullptr;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+  };
+
+  // Directional focus prefers the smallest nonnegative gap, then the greatest
+  // overlap, then the closest perpendicular center.
+  View* directionalNeighbor(std::span<const LayoutTarget> targets, const View* view, bool horizontal, int direction);
+
+  // Fractions this close count as the same size: looser than the ULP wobble a
+  // basis accumulates, tighter than any preset difference a user can perceive.
+  constexpr double kFractionEpsilon = 0.0001;
+
+  // Widest a scrolling column may span, in viewports. A constant rather than unbounded so one column cannot ask a
+  // client for an unreasonably huge buffer. Config and keybinds accept up to this; each layout clamps to what it
+  // realizes through Layout::maxExtentFraction, so shared presets stay usable in every layout.
+  constexpr double kMaxWideFraction = 4.0;
+
+  // Presets a layout capped at `max` can realize. Dropping the rest keeps a cycling step from stalling on a preset
+  // the layout would clamp away; the 100 % preset stays reachable.
+  inline std::vector<double> boundedPresets(const std::vector<double>& presets, double max) {
+    std::vector<double> out;
+    out.reserve(presets.size());
+    for (const double preset : presets) {
+      if (preset <= max + kFractionEpsilon) {
+        out.push_back(preset);
+      }
+    }
+    return out;
+  }
+
+  // The next preset from `current` in `direction` (negative shrinks), wrapping
+  // at the ends. Every layout's width and height cycle shares this rule, and so
+  // does the floating cycle. `current` must be an exact fraction: a basis
+  // recovered from pixels goes through `presetSnappedFraction` first. `presets`
+  // must be ascending, as config parsing leaves them.
+  inline double nextFractionPreset(const std::vector<double>& presets, double current, int direction) {
+    if (presets.empty()) {
+      return current;
+    }
+    if (direction < 0) {
+      for (const double preset : std::views::reverse(presets)) {
+        if (preset < current - kFractionEpsilon) {
+          return preset;
+        }
+      }
+      return presets.back();
+    }
+    for (const double preset : presets) {
+      if (preset > current + kFractionEpsilon) {
+        return preset;
+      }
+    }
+    return presets.front();
+  }
+
+  // Steps a layout extent to the next preset. `apply` sets a fraction, clamped to what the layout can realize, and
+  // returns false when the extent is not adjustable; `realized` reads the fraction back. A preset past that range
+  // leaves the extent where it was and would be picked again on every step, so a step that does not move the extent
+  // wraps instead.
+  template <typename Apply, typename Realized>
+  bool cycleFractionPreset(
+      const std::vector<double>& presets, double current, int direction, Apply&& apply, Realized&& realized
+  ) {
+    const double next = nextFractionPreset(presets, current, direction);
+    if (!apply(next)) {
+      return false;
+    }
+    const bool stepped = direction < 0 ? next < current : next > current;
+    const double now = realized();
+    const bool stalled = direction < 0 ? now >= current - kFractionEpsilon : now <= current + kFractionEpsilon;
+    if (stepped && stalled) {
+      apply(direction < 0 ? presets.back() : presets.front());
+    }
+    return true;
+  }
+
+  // Layout-owned interactive resize session. Cursor feeds a pointer delta; the session mutates only its layout's
+  // geometry state (split ratios, width fractions, row weights). Protocol calls and arrange() stay in Cursor.
+  struct ResizeGrab {
+    virtual ~ResizeGrab() = default;
+    virtual void applyDelta(double dx, double dy, const wlr_box& usable) = 0;
+    // Identity of the layout that created this session, for stale-pointer
+    // detection when a config reload swaps the workspace's layout mid-grab.
+    virtual const Layout* ownerLayout() const = 0;
+    // True when the layout cleared a maximized/full-width state at grab start,
+    // so Cursor should un-maximize the toplevel immediately.
+    virtual bool unmaximizeOnBegin() const { return false; }
+  };
+
+  class Layout {
+  public:
+    virtual ~Layout() = default;
+    void setConfig(const ResolvedLayoutConfig* config) { m_config = config; }
+    const ResolvedLayoutConfig* layoutConfig() const { return m_config; }
+
+    void setConstraints(LayoutConstraintsFn constraints) { m_constraints = constraints; }
+    LayoutConstraints constraintsFor(const View* view) const {
+      return m_constraints != nullptr && view != nullptr ? m_constraints(view) : LayoutConstraints{};
+    }
+
+    virtual LayoutMode mode() const = 0;
+
+    virtual int columnOf(const View* view) const = 0;
+    virtual int rowOf(const View* view) const = 0;
+
+    virtual LayoutCapture captureState() const = 0;
+    // Restores into an empty layout. Missing member ids represent views that
+    // closed, moved deliberately, or became floating while displaced.
+    virtual bool restoreState(const LayoutSnapshot& snapshot, std::span<const LayoutMember> members) = 0;
+
+    virtual void insertView(View* view, int columnIndex) = 0;
+    virtual void insertViewIntoColumn(View* view, int columnIndex, int rowIndex) = 0;
+    virtual bool consume(View* view, int direction) = 0;
+    virtual bool expel(View* view, int direction) = 0;
+    // The mirror of consume: pull the window the container `direction` away shows into the one holding `view`, without
+    // moving focus. The pulled window lands directly below `view`, or in its tab group when `view` is a tab. False when
+    // there is no container on that side, or the layout has no container to pull from.
+    virtual bool consumeFrom(View* view, int direction) = 0;
+    virtual bool moveViewVertical(View* view, int direction) = 0;
+    virtual bool swapViews(View* a, View* b) = 0;
+    virtual void removeView(View* view) = 0;
+    virtual void moveColumn(int from, int to) = 0;
+    virtual void arrange(const wlr_box& usable) = 0;
+
+    virtual wlr_box targetBox(const View* view) const = 0;
+
+    struct InitialSize {
+      int width = 0;
+      int height = 0;
+    };
+
+    // Size for the very first configure, before the view has joined the layout. It must agree with what arrange() will
+    // later assign, or the client's first buffer is the wrong size and the window visibly resizes on its first paint.
+    // Scrolling extents mean nothing to splitting layouts.
+    // `splitAnchor` is the view whose leaf a subsequent focused insert would split; nullptr means append.
+    virtual InitialSize initialSize(
+        const wlr_box& usable, bool wantMaximized, std::optional<double> ruleExtent, std::optional<int> ruleExtentPx,
+        const View* splitAnchor
+    ) const = 0;
+
+    virtual std::optional<View*> focusHorizontalLeaf(const View* /*view*/, int /*direction*/) const {
+      return std::nullopt;
+    }
+    virtual std::optional<View*> focusVerticalLeaf(const View* /*view*/, int /*direction*/) const {
+      return std::nullopt;
+    }
+
+    // Views a directional move from `from` could equally have landed on, with
+    // `target` the geometric answer: the target column in column layouts, the
+    // subtree the move enters in dwindle. Fewer than two entries means there
+    // is nothing to choose between, so the caller keeps `target`.
+    virtual std::vector<View*> focusPeers(const View* from, const View* target) const;
+
+    virtual bool cycleWidth(int columnIndex, int direction) = 0;
+    virtual bool toggleFullWidth(int columnIndex) = 0;
+    // Widest extent fraction this layout realizes. Scrolling columns span up to kMaxWideFraction viewports; splitting
+    // and floating extents stay within one.
+    virtual double maxExtentFraction() const { return 1.0; }
+
+    virtual bool setWidthFraction(int columnIndex, double fraction) = 0;
+    virtual void clearFullWidthState(int columnIndex) = 0;
+    virtual double widthFraction(int columnIndex) const = 0;
+
+    // Height of `view` as a fraction of its column's stacking extent. A layout whose lone row can still be shrunk by
+    // pointer resize reports and accepts that same fraction (scrolling shrinks it against the column's edge gaps);
+    // where a lone row has no resizable stacking edges, the fraction is 1.0 and the setter refuses.
+    virtual double heightFraction(const View* view) const = 0;
+    // Returns false when the view is not tiled here, or when the layout cannot size it on the stacking axis.
+    virtual bool setHeightFraction(View* view, double fraction) = 0;
+
+    // Interactive resize
+    // Edges grabbable at a pointer position (0 = none). Base = not resizable.
+    virtual uint32_t resizeEdgesAt(const View* /*view*/, double /*cx*/, double /*cy*/) const { return 0; }
+    // Drop edges this layout cannot resize. Base = unchanged.
+    virtual uint32_t sanitizeResizeEdges(const View* /*view*/, uint32_t edges) const { return edges; }
+    // Resolve the final resize edges: an explicit request is sanitized; an empty
+    // request (or one sanitized to nothing) falls back to the pointer proposal.
+    uint32_t resolveResizeEdges(const View* view, uint32_t requested, double cx, double cy) const {
+      uint32_t edges = requested != 0 ? sanitizeResizeEdges(view, requested) : resizeEdgesAt(view, cx, cy);
+      if (edges == 0) {
+        edges = resizeEdgesAt(view, cx, cy);
+      }
+      return edges;
+    }
+    // Begin an interactive resize with already-resolved edges; null = not resizable.
+    virtual std::unique_ptr<ResizeGrab> beginResize(View* /*view*/, uint32_t /*edges*/, const wlr_box& /*usable*/) {
+      return nullptr;
+    }
+
+    // Every layout presents its contents as columns. Scrolling owns them
+    // directly, dwindle flattens its tree, and master exposes its occupied areas.
+    virtual const std::vector<Column>& columns() const = 0;
+    // Whether a column occupies the full viewport, however each layout gets there.
+    virtual bool isFullWidth(int columnIndex) const = 0;
+
+    // Null for a layout whose columns cannot be tabbed.
+    virtual TabbedContainers* tabbedContainers() { return nullptr; }
+
+    // The usable area minus edge padding on both axes: the box the layout has
+    // to fill.
+    wlr_box contentArea(const wlr_box& usable) const;
+    // Space a tab group of `tabs` tabs gives its bar on the bar's edge: the bar and one gap, or nothing while its bar
+    // is hidden.
+    int tabBarReserve(size_t tabs, std::optional<bool> bar) const;
+
+    // Anything only one layout can answer lives on that layout. Reach it through the single downcast seam,
+    // Workspace::scrollingLayout(), rather than by asking every layout a question most of them have no answer to.
+
+  protected:
+    // The box every tab of a group shares: `box`, the group's unit, less the bar's reserve on the bar's edge.
+    wlr_box tabbedBox(const wlr_box& box, size_t tabs, std::optional<bool> bar) const;
+    // Whether a column created now starts with its window as a tab.
+    bool opensTabbed() const;
+    // The display an area created now starts with.
+    TabState initialTabState() const;
+
+    // Gap-aware width of a column occupying `fraction` of the viewport. Solving sum(w) + (N-1)g = V with w = p*(V+g) -
+    // g makes N columns whose fractions sum to 1 tile the viewport exactly.
+    int fractionalWidth(int viewportPrimary, double fraction) const;
+
+    const ResolvedLayoutConfig* m_config = nullptr;
+    LayoutConstraintsFn m_constraints = nullptr;
+  };
+
+  // Single source of truth for the pointer-to-edge proposal shared by every layout and by floating resize:
+  // the outer thirds of the box propose that side's edge per axis, the middle third proposes none, and a
+  // corner ninth proposes both axes. Callers guard degenerate boxes; layouts mask via sanitizeResizeEdges.
+  uint32_t resizeEdgesForPoint(const wlr_box& box, double cx, double cy);
+
+  [[nodiscard]] std::unique_ptr<Layout> createLayout(LayoutMode mode);
+
+} // namespace umbriel

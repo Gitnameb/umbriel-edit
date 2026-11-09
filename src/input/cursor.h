@@ -1,0 +1,578 @@
+#pragma once
+#include "layout/drop_target.h"
+#include "scene/ssd_frame_geometry.h"
+#include "view/window_region.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+#include <wayland-server-core.h>
+
+struct wlr_buffer;
+struct wlr_cursor;
+struct wl_event_source;
+struct wlr_input_device;
+struct wlr_output;
+struct wlr_pointer_axis_event;
+struct wlr_pointer_constraint_v1;
+struct wlr_seat_client;
+struct wlr_surface;
+struct wlr_tablet;
+struct wlr_tablet_tool;
+struct wlr_tablet_v2_tablet_tool;
+struct wlr_xcursor_manager;
+
+namespace umbriel {
+
+  class LayerSurface;
+  class Layout;
+  class Output;
+  class Server;
+  class View;
+  class Workspace;
+  struct Keybind;
+  struct ResizeGrab;
+
+  class Cursor {
+    struct PassthroughGrab {};
+    // What the drop does with the dragged window. A press of the free mouse
+    // button retargets it (input.window_drag_toggle). The window's own state is
+    // only changed at the drop, so a transition the window refuses (a
+    // fullscreen window cannot be pinned) cannot strand it outside the layout.
+    enum class DragTarget : uint8_t { Tiled, Floating, Pinned };
+    struct MoveGrab {
+      View* view = nullptr;
+      double offsetX = 0;
+      double offsetY = 0;
+      DragTarget target = DragTarget::Tiled;
+      // Stacking workspace moves commit each pointer position instead of holding a layout slot until release.
+      bool stackingLayout = false;
+      // Where a pin toggle sends the window when it turns pinning off: back to
+      // the layout when that is where the window was pinned from, otherwise
+      // floating.
+      DragTarget unpinned = DragTarget::Tiled;
+      // Layout bookkeeping for a drop back into the strip. It survives a
+      // retarget, so toggling out and back restores the source column width.
+      Workspace* sourceWorkspace = nullptr;
+      int sourceColumn = -1;
+      std::optional<DropColumnWidth> sourceWidth;
+      DropTarget drop;
+      std::optional<WindowRegion> region;
+      Output* regionOutput = nullptr;
+      int preDragX = 0;
+      int preDragY = 0;
+      wlr_box preDragArea{};
+      Output* dwellOutput = nullptr;
+      uint32_t dwellEdges = 0;
+      bool dwellReady = false;
+      // Tiled and title bar moves wait for the drag threshold before taking over presentation.
+      bool pending = true;
+      double startX = 0;
+      double startY = 0;
+      // The pointer at the last drag physics update.
+      double lastX = 0;
+      double lastY = 0;
+      // The view's drag physics took the grab; without it the drag makes no drag physics calls.
+      bool physics = false;
+      // A Mod-drag on a tab carries its whole group.
+      bool carryTabGroup = false;
+      LiftedTabGroup tabGroup;
+    };
+    struct FloatingResizeGrab {
+      View* view = nullptr;
+      double offsetX = 0;
+      double offsetY = 0;
+      int geometryX = 0;
+      int geometryY = 0;
+      int geometryWidth = 0;
+      int geometryHeight = 0;
+      uint32_t edges = 0;
+    };
+    struct TiledResizeGrab {
+      View* view = nullptr;
+      Workspace* workspace = nullptr;
+      double startX = 0;
+      double startY = 0;
+      uint32_t edges = 0;
+      std::unique_ptr<ResizeGrab> session;
+    };
+    struct ScrollDragGrab {
+      uint32_t button = 0;
+      double lastX = 0;
+      double lastY = 0;
+    };
+    // Mod+left drag on a tiled window swaps it with the tile under the
+    // pointer, like the shell mockup. The source dims and the target is
+    // highlighted only once the pointer leaves the click slop; a plain click
+    // just focuses. Right drag keeps the native move and border resize.
+    struct SwapGrab {
+      View* view = nullptr;
+      View* target = nullptr;
+      uint32_t button = 0;
+      double startX = 0;
+      double startY = 0;
+      bool active = false;
+    };
+    // A Mod+right-click awaiting enough pointer motion to become a resize. The
+    // real grab would drop the maximize bookkeeping the double-click toggle
+    // restores from (scrolling clears the saved width fraction at grab start);
+    // as a grab state the press still sits behind the release, swallow,
+    // isPassthrough() and reset paths. The edges are the press point's, since
+    // the thirds zones make them position-sensitive.
+    struct PendingResizeGrab {
+      View* view = nullptr;
+      uint32_t button = 0;
+      double startX = 0;
+      double startY = 0;
+      uint32_t edges = 0;
+      // Where the edges were resolved; a layout or axis change invalidates them
+      // (a floating press keeps nullptr: its edges are plain flags).
+      Workspace* workspace = nullptr;
+      Layout* layout = nullptr;
+    };
+    using GrabState = std::variant<
+        PassthroughGrab,
+        MoveGrab,
+        FloatingResizeGrab,
+        TiledResizeGrab,
+        PendingResizeGrab,
+        ScrollDragGrab,
+        SwapGrab>;
+
+    struct TabletToolState {
+      Cursor* cursor = nullptr;
+      wlr_tablet_tool* tool = nullptr;
+      wlr_tablet_v2_tablet_tool* v2 = nullptr;
+      // Deliver via wl_pointer instead of tablet-v2.
+      bool emulating = false;
+      bool tipDown = false;
+      bool inProximity = false;
+      // Last absolute position, 0..1.
+      double x = 0;
+      double y = 0;
+      // Last tilt pair.
+      double tiltX = 0;
+      double tiltY = 0;
+      wl_listener destroy{};
+      wl_listener setCursor{};
+
+      TabletToolState() = default;
+      TabletToolState(const TabletToolState&) = delete;
+      TabletToolState& operator=(const TabletToolState&) = delete;
+
+      ~TabletToolState() {
+        if (destroy.link.next != nullptr) {
+          wl_list_remove(&destroy.link);
+        }
+        if (setCursor.link.next != nullptr) {
+          wl_list_remove(&setCursor.link);
+        }
+      }
+    };
+
+  public:
+    explicit Cursor(Server& server);
+    ~Cursor();
+
+    Cursor(const Cursor&) = delete;
+    Cursor& operator=(const Cursor&) = delete;
+
+    wlr_cursor* wlr() const { return m_cursor; }
+    bool visible() const { return !m_cursorHidden; }
+    // Re-sends the pointer to the cursor effect after outputs were added, moved or removed. wlr_cursor must have
+    // clamped the pointer onto the new layout first.
+    void handleOutputLayoutChange() const;
+    wlr_xcursor_manager* xcursorManager() const { return m_xcursorManager; }
+    bool isPassthrough() const;
+    bool canCaptureInput() const;
+    void setInputCaptured(bool captured);
+    View* grabbedView() const;
+    // True while `view` is under an interactive move and spans outputs
+    // unclipped. Layout code must not re-clip it during the drag.
+    bool isDraggingView(const View* view) const;
+    // True while an interactive move will drop its window back into the tiled
+    // layout, so layout-directed input (wheel scrolling, insert hints) applies
+    // to the drag.
+    bool isDraggingIntoLayout() const;
+    // Pending presses do not own geometry until they become an actual resize.
+    bool isResizingView(const View* view) const;
+    // A tiled resize updates every view in its workspace without size
+    // animations trailing the pointer.
+    bool isResizingWorkspace(const Workspace* workspace) const;
+
+    void attachInputDevice(wlr_input_device* device);
+    void applyConfig();
+    // Recheck a stationary drag when its workspace layout or drop-zone policy changes.
+    void refreshDropZonePreview();
+    // Discard partial notches when compositor-owned wheel input changes context.
+    void resetWheelAccumulation();
+    // Data-device drags can scroll a scrolling workspace while held at its
+    // primary-axis edge. Seat owns the drag lifecycle; Cursor owns its pointer
+    // position and timer-driven motion.
+    void beginToplevelDrag(View* view, int x, int y, bool tileOnDrop);
+    void finishToplevelDrag(bool place);
+    View* toplevelDragView() const { return m_toplevelDrag ? grabbedView() : nullptr; }
+    void handleDataDragStarted();
+    void handleDataDragEnded();
+    void setCursorSurface(wlr_surface* surface, int32_t hotspotX, int32_t hotspotY, wl_client* owner);
+    void setXcursor(const char* name);
+    void noteActivity();
+    void hideCursor();
+    bool beginMove(View* view, uint32_t button, bool deferUntilThreshold = false);
+    bool beginResize(View* view, uint32_t edges, uint32_t button);
+    bool beginSwap(View* view, uint32_t button);
+    // A null seat client is an X11 move/resize request, which carries no serial.
+    void beginClientMove(View* view, wlr_seat_client* seatClient, uint32_t serial);
+    void beginClientResize(View* view, wlr_seat_client* seatClient, uint32_t serial, uint32_t edges);
+    // A view is going away: drop the click-pair record that references it. The
+    // grab reset paths cover any deferred or promoted press.
+    void forgetView(const View* view);
+    void resetMode();
+    // Warp the cursor to a layout position and run the motion pipeline (pointer focus, xcursor, pointer-output
+    // tracking, idle). Output actions use it so focus follows the cursor onto the target monitor.
+    void warpTo(double lx, double ly);
+    // Run the same motion pipeline without letting pointer crossing replace an explicit keyboard-focus choice.
+    void warpToPreservingFocus(double lx, double ly);
+    // Warp to the visible logical center of a view after flushing any pending tiled arrangement. The explicit focus
+    // choice is preserved while the cursor crosses other surfaces on its way there.
+    bool warpToView(View& view);
+    // A layout-mode reload can replace the layout that owns a tiled resize.
+    void cancelStaleTiledResize();
+    // End the pointer grabs whose meaning depends on the workspace axis before a
+    // layout change: pointer strip scrolling and a tiled resize session. Move and
+    // floating resize keep running.
+    void cancelLayoutInteraction();
+    void handleNewConstraint(wlr_pointer_constraint_v1* constraint);
+    void clearConstraint(bool warp = true);
+    // Mod-held window management: stop delivering pointer input to window
+    // content and release any client lock. Native chrome and layer surfaces
+    // stay interactive.
+    void setModInputShield(bool enabled);
+    // Recompute compositor cursor (mod-held resize/move affordance, or active grab).
+    void refreshInteractiveCursor();
+    // Re-resolve what lies under a stationary cursor on `output` once its content has settled, so the client under it
+    // sees the pointer where it is drawn.
+    void refreshPointerContents(const Output* output);
+    // Hide immediately after a non-modifier key press when configured.
+    void noteTyping();
+    // A logical focus change can leave the pointer over a different window without crossing a scene boundary. Let the
+    // next eligible pointer or tablet hover re-evaluate focus once.
+    void invalidateHoverFocus() { m_hoverFocusInvalidated = true; }
+    // A keyboard escape from confinement must wait for an actual pointer re-entry before hover can refocus it.
+    void releaseRuleConfinement(View& view);
+    // Compositor-owned cursor override for grabs the Cursor does not track
+    // (overview drag). nullptr restores the client cursor.
+    void overrideCursor(const char* name) { setCompositorCursor(name); }
+    bool compositorOwnsCursor() const { return m_compositorOwnsCursor; }
+#ifdef UMBRIEL_HARNESS
+    struct RenderedCursorStateForTest {
+      uint32_t textureWidth = 0;
+      uint32_t textureHeight = 0;
+      uint32_t renderWidth = 0;
+      uint32_t renderHeight = 0;
+    };
+
+    std::string_view clientCursorSourceForTest() const;
+    std::string clientCursorNameForTest() const { return m_clientCursorShape; }
+    bool clientCursorFromXwaylandForTest() const { return m_clientCursorFromXwayland; }
+    std::optional<RenderedCursorStateForTest> renderedCursorStateForTest() const;
+#endif
+
+    // The only ways compositor code may change pointer focus. While a client holds an implicit grab (any button down,
+    // no client drag) focus stays on the surface that received the press: wlroots drops its pressed-button bookkeeping
+    // on every focus change, which would leave the client with a button held forever. An already focused surface
+    // receives a motion instead, so a press never uses a position from before the surface moved under the cursor.
+    void setPointerFocus(wlr_surface* surface, double sx, double sy, uint32_t timeMsec);
+    void clearPointerFocus();
+    // Clear pointer focus even while a client holds a button: a session lock
+    // takes the seat away entirely, and a tablet handing a stroke back to
+    // tablet-v2 must not leave the surface receiving doubled input.
+    void clearPointerFocusOverridingGrab();
+    // Record the cursor shape the focused client asked for, so a compositor
+    // override can hand it back without making the client resend it.
+    void setCursorShape(const char* name, wl_client* owner);
+    // Pointer focus moved: keep cursor state while focus remains within its
+    // owning Wayland client. Otherwise forget it, and let an empty focus fall
+    // back to the default cursor.
+    void notePointerFocusChange(wlr_surface* newSurface);
+
+  private:
+    static void onMotion(wl_listener* listener, void* data);
+    static void onMotionAbsolute(wl_listener* listener, void* data);
+    static void onButton(wl_listener* listener, void* data);
+    static void onAxis(wl_listener* listener, void* data);
+    static void onFrame(wl_listener* listener, void* data);
+    static void onConstraintDestroy(wl_listener* listener, void* data);
+    static void onTouchDown(wl_listener* listener, void* data);
+    static void onTouchUp(wl_listener* listener, void* data);
+    static void onTouchMotion(wl_listener* listener, void* data);
+    static void onTouchCancel(wl_listener* listener, void* data);
+    static void onTouchFrame(wl_listener* listener, void* data);
+    static void onTabletToolAxis(wl_listener* listener, void* data);
+    static void onTabletToolProximity(wl_listener* listener, void* data);
+    static void onTabletToolTip(wl_listener* listener, void* data);
+    static void onTabletToolButton(wl_listener* listener, void* data);
+    static void onToolDestroy(wl_listener* listener, void* data);
+    static void onToolSetCursor(wl_listener* listener, void* data);
+
+    void handleMotion(void* data);
+    void handleMotionAbsolute(void* data);
+    void handleButton(void* data);
+    void handleAxis(void* data);
+    // Step through the tabs of the bar under the pointer by the wheel's notches. False when no bar that takes the
+    // wheel is there.
+    bool scrollTabBar(const wlr_pointer_axis_event* event, int orientation);
+    void handleFrame();
+    void handleConstraintDestroy();
+    void handleTouchDown(void* data);
+    void handleTouchUp(void* data);
+    void handleTouchMotion(void* data);
+    void handleTouchCancel(void* data);
+    void handleTouchFrame();
+    void handleTabletToolAxis(void* data);
+    void handleTabletToolProximity(void* data);
+    void handleTabletToolTip(void* data);
+    void handleTabletToolButton(void* data);
+
+    void warpTo(double lx, double ly, bool allowFocusChange);
+    void processMotion(uint32_t timeMsec, double oldX, double oldY, bool allowFocusChange = true);
+    void processButton(uint32_t timeMsec, uint32_t button, wl_pointer_button_state state);
+    void updatePointerOutput(bool allowFocusChange = true);
+    View* hoverFocus(
+        View* view, wlr_surface** surface, double* sx, double* sy, LayerSurface** layer, double oldX, double oldY
+    );
+    void processMove();
+    void presentGrabbedViewSpanning();
+    // Take the window out of the layout and into the drag presentation, once
+    // the pointer has committed to the drag.
+    void beginDrag(MoveGrab& grab);
+    void updateDropTarget();
+    void updateDropZonePreview();
+    void clearDropZonePreview();
+    static int onDropZoneDwellTimer(void* data);
+    // Present the size the drop will land on, so the drag is already the right
+    // shape when it gets there.
+    void retargetDragSize(MoveGrab& grab);
+    void finishMove();
+    // Move the window to the drag's target state. Best effort: the window may
+    // refuse, and the drop places it by what it actually became.
+    void applyDragTarget(const MoveGrab& grab);
+    void finishTileMove();
+    // `x`/`y` is where the drag left the window, captured before its state
+    // changed.
+    void finishFloatMove(int x, int y);
+    void toggleDragTarget(uint32_t button);
+    void processResize();
+    void processResizeTile();
+    void processSwap();
+    void updateSwapTarget(SwapGrab& grab);
+    void finishSwap();
+    std::optional<uint32_t>
+    clientPointerGrabButton(const View* view, wlr_seat_client* seatClient, uint32_t serial) const;
+    uint32_t floatResizeEdges(View* view) const;
+    // Edges of a floating window that the pointer is close enough to grab. Unlike
+    // floatResizeEdges, which divides the window into thirds, this matches the
+    // visible corner dots and edge bands drawn by the shell.
+    uint32_t floatingBorderEdges(View* view, double x, double y) const;
+    uint32_t hoverResizeEdges(View* view) const;
+    // Resalta el divisor nativo bajo el puntero. Solo uno puede estar activo:
+    // el propietario dibuja la línea, así que el vecino no la duplica.
+    void setDividerHover(View* owner, bool vertical);
+    void clearDividerHover();
+    // The tiled window whose border is under (x, y), and the resizable edges
+    // there. A point in the gap between two tiles lands on the nearest one.
+    View* tiledBorderTarget(View* under, double x, double y, uint32_t* edges) const;
+    // True when this press completes a Mod+double-right-click with the
+    // recorded one (same window, within the time window and pointer slop).
+    bool isModRightDoubleClick(uint32_t timeMsec, const View* view) const;
+    // Record a Mod+right-click as the pair's first press.
+    void recordModRightClick(uint32_t timeMsec, View* view);
+    // Promote a deferred Mod+right resize to a real grab once the pointer is
+    // about to leave the click's slop. Runs before the cursor moves so the grab
+    // starts at the press-side position: beginResize derives its resize edges
+    // and grab offsets from the pointer, and a jump-then-grab would propose the
+    // wrong edges.
+    void promotePendingModRightResize(double nextX, double nextY);
+    // The resize edges a press point proposes (0 = none): thirds zones over the
+    // presented box intersected with the usable area, minus the edges the
+    // layout cannot resize. Shared with beginResize so a deferred grab and a
+    // live one cannot drift apart.
+    uint32_t tiledResizeEdges(View* view, double x, double y) const;
+    // A Mod+right click that resized nothing still reveals the focused tile,
+    // since a grab focus skips the reveal.
+    void revealClickedTile(View* view);
+    void updateInteractiveCursor(View* under, bool overPanel = false);
+    void setCompositorCursor(const char* name);
+    void restoreClientCursor();
+    // True while a client owns an implicit pointer grab, which pins focus.
+    bool pointerFocusPinned() const;
+    // The pointer would land on a different surface or position than the focused client last saw.
+    bool pointerContentsStale(const wlr_surface* surface, double sx, double sy) const;
+    // Re-resolve pointer focus against the surface under the cursor.
+    void refreshPointerFocus();
+    void applyClientCursor();
+    void handleClientCursorCommit();
+    void captureXwaylandCursorImage(wlr_buffer* buffer);
+    std::optional<std::string> matchXwaylandCursor() const;
+    void finishClientCursorFrame() const;
+    void forgetClientCursor();
+    static void onClientCursorOwnerDestroy(wl_listener* listener, void* data);
+    static void onClientCursorDestroy(wl_listener* listener, void* data);
+    static void onClientCursorClientCommit(wl_listener* listener, void* data);
+    static void onClientCursorCommit(wl_listener* listener, void* data);
+    void updateHideTimer();
+    // Sends the pointer and its visibility to the cursor effect, only while one is active.
+    void forwardEffectPointer() const;
+    static int onHideTimer(void* data);
+    void updateHotCorner();
+    void cancelHotCorner();
+    const Keybind* hotCornerAction(size_t* index = nullptr) const;
+    static int onHotCornerTimer(void* data);
+    bool tiledMoveDragActive() const;
+    // What the edge auto-scroll may move right now (input.drag_edge_scroll drives both sinks from one
+    // mechanism): the active workspace's scrolling layout along its scrolling axis (data drags, tiled moves,
+    // overview card drags), and, during an overview card drag, the overview's workspace filmstrip along the
+    // workspace axis. Each sink takes the signed edge ramp's speed in screen px/s; the strip consumes it as
+    // layout px/s, the filmstrip converts it to rows through the preview step. Either may be null when that
+    // dimension has nothing left to scroll.
+    struct EdgeScrollTargets {
+      Workspace* workspace = nullptr;
+      double workspaceSpeed = 0;
+      Output* filmstrip = nullptr;
+      double filmstripSpeed = 0;
+    };
+    EdgeScrollTargets edgeScrollTargets() const;
+    void updateDataDragEdgeScroll();
+    void cancelDataDragEdgeScroll();
+    static int onDataDragEdgeScrollTimer(void* data);
+    int handleDataDragEdgeScrollTimer();
+    void setActiveConstraint(wlr_pointer_constraint_v1* constraint, bool warp = true);
+    void updateConstraintForSurface(wlr_surface* surface);
+    bool constraintSurfaceActive() const;
+    void warpToConstraintHint(wlr_pointer_constraint_v1* constraint);
+    bool confineDelta(double* dx, double* dy) const;
+    // Surface-local units per layout unit in `surface`: above 1 for an X11 window drawn at native resolution.
+    double surfaceScale(wlr_surface* surface) const;
+    bool ruleConstraintApplies(View& view) const;
+    bool ruleConstraintEligible(View& view) const;
+    void confineRuleDelta(double* dx, double* dy);
+    TabletToolState* toolState(wlr_tablet_tool* tool);
+    void setToolEmulating(TabletToolState* state, bool emulating);
+    void processTabletMotion(uint32_t timeMsec, double oldX, double oldY, TabletToolState* state, wlr_tablet* tablet);
+
+    Server* m_server = nullptr;
+    wlr_cursor* m_cursor = nullptr;
+    wlr_xcursor_manager* m_xcursorManager = nullptr;
+    wlr_xcursor_manager* m_activeXcursorManager = nullptr;
+    std::string m_xcursorTheme;
+    std::string m_activeXcursorName;
+    int m_xcursorSize = 0;
+    wlr_pointer_constraint_v1* m_activeConstraint = nullptr;
+    bool m_modInputShield = false;
+    // A stable map ID preserves keyboard escape when a focus-sensitive rule stops matching, without retaining a
+    // View pointer across unmap. Reloading config retires the escape so disabled rules cannot affect native input.
+    std::string m_ruleConfinementView;
+    uint64_t m_ruleConfinementGeneration = 0;
+
+    bool m_toplevelDrag = false;
+    GrabState m_grab;
+    // Physical button that owns the current interactive pointer operation.
+    uint32_t m_grabButton = 0;
+    // Origin of the client-delivered press, tied to the implicit grab's serial so delayed move requests share its slop.
+    struct ClientPointerPress {
+      uint32_t button;
+      uint32_t serial;
+      double x;
+      double y;
+    };
+    std::optional<ClientPointerPress> m_clientPointerPress;
+    // Last layout output under the pointer; crossing heads updates seat focus like workspace switch.
+    wlr_output* m_pointerOutput = nullptr;
+    double m_wheelAccum[2]{};
+    // Presses consumed by config binds or ignored during an interactive move;
+    // their release is swallowed too, even if the grab ended first.
+    std::vector<uint32_t> m_swallowedButtons;
+    // Previous Mod+right-click, for the double-click that toggles maximize.
+    struct ModRightClick {
+      uint32_t timeMsec = 0;
+      double x = 0;
+      double y = 0;
+      View* view = nullptr;
+    };
+    ModRightClick m_lastModRightClick;
+    struct TitleBarClick {
+      uint32_t timeMsec = 0;
+      double x = 0;
+      double y = 0;
+      View* view = nullptr;
+    } m_lastTitleBarClick;
+    struct SsdButtonPress {
+      View* view = nullptr;
+      SsdFramePart part = SsdFramePart::None;
+    } m_ssdButtonPress;
+    View* m_ssdHoverView = nullptr;
+    // Divisor nativo bajo el puntero mientras se mantiene Mod.
+    View* m_hoverDividerView = nullptr;
+    bool m_hoverDividerVertical = false;
+    std::vector<std::unique_ptr<TabletToolState>> m_tools;
+    bool m_hoverFocusInvalidated = false;
+    bool m_compositorOwnsCursor = false;
+    bool m_cursorHidden = false;
+    std::string m_compositorCursorName;
+    // What the focused client last asked the cursor to be, replayed when a
+    // compositor override ends. Wayland scopes a cursor to the pointer focus,
+    // so this is forgotten when focus moves to another client.
+    bool m_clientCursorKnown = false;
+    wl_client* m_clientCursorOwner = nullptr;
+    // Set for a client cursor surface, empty for a cursor-shape name. A known
+    // client cursor with neither is the client hiding the cursor.
+    wlr_surface* m_clientCursorSurface = nullptr;
+    int32_t m_clientCursorHotspotX = 0;
+    int32_t m_clientCursorHotspotY = 0;
+    std::string m_clientCursorShape;
+    bool m_clientCursorFromXwayland = false;
+    std::vector<uint8_t> m_clientCursorPixels;
+    uint32_t m_clientCursorImageWidth = 0;
+    uint32_t m_clientCursorImageHeight = 0;
+    wl_event_source* m_hideTimer = nullptr;
+    wl_event_source* m_hotCornerTimer = nullptr;
+    wl_event_source* m_dropZoneDwellTimer = nullptr;
+    wl_event_source* m_dataDragEdgeScrollTimer = nullptr;
+    // Both sinks share one delay/advance timeline (input.drag_edge_scroll's mechanic): a sink appearing or an
+    // active sink flipping direction re-arms the configured delay for the set, and each tick advances whichever
+    // sinks are live from the elapsed time.
+    Workspace* m_dataDragEdgeScrollWorkspace = nullptr;
+    Output* m_dataDragEdgeScrollFilmstrip = nullptr;
+    double m_dataDragEdgeScrollSpeed = 0;
+    double m_dataDragEdgeScrollFilmstripSpeed = 0;
+    uint32_t m_dataDragEdgeScrollLastMsec = 0;
+    bool m_dataDragEdgeScrollPending = false;
+    bool m_hotCornerPending = false;
+    bool m_hotCornerTriggered = false;
+    size_t m_hotCornerIndex = 4;
+
+    wl_listener m_motion{};
+    wl_listener m_motionAbsolute{};
+    wl_listener m_button{};
+    wl_listener m_axis{};
+    wl_listener m_frame{};
+    wl_listener m_constraintDestroy{};
+    wl_listener m_touchDown{};
+    wl_listener m_touchUp{};
+    wl_listener m_touchMotion{};
+    wl_listener m_touchCancel{};
+    wl_listener m_touchFrame{};
+    wl_listener m_tabletToolAxis{};
+    wl_listener m_tabletToolProximity{};
+    wl_listener m_tabletToolTip{};
+    wl_listener m_tabletToolButton{};
+    wl_listener m_clientCursorOwnerDestroy{};
+    wl_listener m_clientCursorDestroy{};
+    wl_listener m_clientCursorClientCommit{};
+    wl_listener m_clientCursorCommit{};
+  };
+
+} // namespace umbriel

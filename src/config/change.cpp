@@ -1,0 +1,407 @@
+#include "config/change.h"
+
+#include "output/identity.h"
+
+#include <algorithm>
+#include <string_view>
+
+namespace umbriel {
+  namespace {
+
+    const OutputRule* findOutputRule(const Config& config, const std::string& name) {
+      const auto rule = std::ranges::find_if(config.outputs, [&](const OutputRule& candidate) {
+        return outputNamesEqual(candidate.name, name);
+      });
+      return rule != config.outputs.end() ? &*rule : nullptr;
+    }
+
+    bool outputRuleNamesChanged(const Config& before, const Config& after) {
+      if (before.outputs.size() != after.outputs.size()) {
+        return true;
+      }
+      return std::ranges::any_of(before.outputs, [&](const OutputRule& rule) {
+        return findOutputRule(after, rule.name) == nullptr;
+      });
+    }
+
+    template <typename Equal> bool outputProjectionChanged(const Config& before, const Config& after, Equal equal) {
+      for (const OutputRule& rule : before.outputs) {
+        if (!equal(&rule, findOutputRule(after, rule.name))) {
+          return true;
+        }
+      }
+      for (const OutputRule& rule : after.outputs) {
+        if (findOutputRule(before, rule.name) == nullptr && !equal(nullptr, &rule)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool sameOutputState(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.enabled == rhs.enabled
+          && lhs.mode == rhs.mode
+          && lhs.position == rhs.position
+          && lhs.scale == rhs.scale
+          && lhs.transform == rhs.transform
+          && lhs.vrr == rhs.vrr
+          && lhs.hdr == rhs.hdr
+          && lhs.sdrWhite == rhs.sdrWhite
+          && lhs.sdrTransfer == rhs.sdrTransfer
+          && lhs.bitDepth == rhs.bitDepth;
+    }
+
+    bool sameOutputTearingPolicy(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.allowTearing == rhs.allowTearing;
+    }
+
+    bool sameOutputScreenEffect(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.screenEffect == rhs.screenEffect && lhs.screenCastEffect == rhs.screenCastEffect;
+    }
+
+    bool selectsScreenEffect(const Config& settings) {
+      return std::ranges::any_of(settings.outputs, [](const OutputRule& rule) {
+        return rule.screenEffect.has_value() || rule.screenCastEffect.has_value();
+      });
+    }
+
+    bool sameAnimationEffects(const Config::Animation& before, const Config::Animation& after) {
+      // Overview is the last event.
+      for (unsigned slot = 0; slot <= static_cast<unsigned>(AnimationEvent::Overview); ++slot) {
+        const auto event = static_cast<AnimationEvent>(slot);
+        const std::string* lhs = before.eventEffect(event).effect;
+        if (lhs != nullptr && *lhs != *after.eventEffect(event).effect) {
+          return false;
+        }
+      }
+      return before.windowsDrag == after.windowsDrag;
+    }
+
+    bool selectsEffect(const std::vector<WindowRule>& rules) {
+      return std::ranges::any_of(rules, [](const WindowRule& rule) {
+        return rule.borderEffect.has_value() || rule.windowEffect.has_value();
+      });
+    }
+
+    bool decidesAttachment(const std::vector<WindowRule>& rules) {
+      return std::ranges::any_of(rules, [](const WindowRule& rule) { return rule.attachToParent.has_value(); });
+    }
+
+    bool sameOutputDirectScanoutPolicy(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.directScanout == rhs.directScanout;
+    }
+
+    bool sameOutputLayout(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.layout == rhs.layout && lhs.workspaceAxis == rhs.workspaceAxis;
+    }
+
+    bool sameWindowTearingPolicy(const Config& before, const Config& after) {
+      size_t beforeIndex = 0;
+      size_t afterIndex = 0;
+      while (true) {
+        while (beforeIndex < before.windowRules.size() && !before.windowRules[beforeIndex].allowTearing.has_value()) {
+          ++beforeIndex;
+        }
+        while (afterIndex < after.windowRules.size() && !after.windowRules[afterIndex].allowTearing.has_value()) {
+          ++afterIndex;
+        }
+        const bool beforeEnd = beforeIndex == before.windowRules.size();
+        const bool afterEnd = afterIndex == after.windowRules.size();
+        if (beforeEnd || afterEnd) {
+          return beforeEnd && afterEnd;
+        }
+
+        const WindowRule& lhs = before.windowRules[beforeIndex++];
+        const WindowRule& rhs = after.windowRules[afterIndex++];
+        if (lhs.appIdPatterns != rhs.appIdPatterns
+            || lhs.titlePatterns != rhs.titlePatterns
+            || lhs.xdgTagPatterns != rhs.xdgTagPatterns
+            || lhs.matchContentType != rhs.matchContentType
+            || lhs.matchFocused != rhs.matchFocused
+            || lhs.matchFloating != rhs.matchFloating
+            || lhs.matchMaximizedToEdges != rhs.matchMaximizedToEdges
+            || lhs.matchPinned != rhs.matchPinned
+            || lhs.matchScratchpad != rhs.matchScratchpad
+            || lhs.matchAlone != rhs.matchAlone
+            || lhs.matchOnlyWindow != rhs.matchOnlyWindow
+            || lhs.matchDialog != rhs.matchDialog
+            || lhs.matchCastTarget != rhs.matchCastTarget
+            || lhs.matchAtStartup != rhs.matchAtStartup
+            || lhs.allowTearing != rhs.allowTearing) {
+          return false;
+        }
+      }
+    }
+
+    bool sameWorkspaceInventory(const OutputRule* before, const OutputRule* after) {
+      static const OutputRule defaults;
+      const OutputRule& lhs = before != nullptr ? *before : defaults;
+      const OutputRule& rhs = after != nullptr ? *after : defaults;
+      return lhs.workspaces == rhs.workspaces && lhs.minWorkspaces == rhs.minWorkspaces;
+    }
+
+    bool sameDynamicWorkspaceDeclarations(const Config& before, const Config& after) {
+      size_t beforeIndex = 0;
+      size_t afterIndex = 0;
+      while (true) {
+        while (beforeIndex < before.workspaceRules.size() && before.workspaceRules[beforeIndex].index) {
+          ++beforeIndex;
+        }
+        while (afterIndex < after.workspaceRules.size() && after.workspaceRules[afterIndex].index) {
+          ++afterIndex;
+        }
+        const bool beforeEnd = beforeIndex == before.workspaceRules.size();
+        const bool afterEnd = afterIndex == after.workspaceRules.size();
+        if (beforeEnd || afterEnd) {
+          return beforeEnd && afterEnd;
+        }
+
+        const WorkspaceConfig& lhs = before.workspaceRules[beforeIndex++];
+        const WorkspaceConfig& rhs = after.workspaceRules[afterIndex++];
+        if (lhs.name != rhs.name || !outputNamesEqual(lhs.output, rhs.output)) {
+          return false;
+        }
+      }
+    }
+
+  } // namespace
+
+  std::vector<std::string> configuredEffectActionRoots(const Config& config) {
+    std::vector<std::string> roots;
+    const auto add = [&roots](const Keybind& bind) {
+      if (const auto reference = effectActionReference(bind)) {
+        roots.emplace_back(reference->name);
+      }
+    };
+    for (const auto& bind : config.keybinds) {
+      add(bind);
+    }
+    for (const auto& corner : config.hotCorners.corners) {
+      if (corner.enabled && corner.action) {
+        add(*corner.action);
+      }
+    }
+    std::ranges::sort(roots);
+    roots.erase(std::ranges::unique(roots).begin(), roots.end());
+    return roots;
+  }
+
+  ConfigEffects ConfigEffects::between(const Config& before, const Config& after) {
+    // A new descriptor rule can override an existing connector rule for a live
+    // output. Without runtime identities here, a name-set change must
+    // conservatively refresh every output projection.
+    const bool outputNamesChanged = outputRuleNamesChanged(before, after);
+    const bool outputState = outputNamesChanged || outputProjectionChanged(before, after, sameOutputState);
+    const bool tearingPolicy = outputNamesChanged
+        || outputProjectionChanged(before, after, sameOutputTearingPolicy)
+        || !sameWindowTearingPolicy(before, after);
+    const bool directScanoutPolicy =
+        outputNamesChanged || outputProjectionChanged(before, after, sameOutputDirectScanoutPolicy);
+    const bool workspaceInventory = outputNamesChanged
+        || outputProjectionChanged(before, after, sameWorkspaceInventory)
+        || before.workspaces.emptyAbove != after.workspaces.emptyAbove
+        || !sameDynamicWorkspaceDeclarations(before, after);
+    const bool outputLayout = outputNamesChanged || outputProjectionChanged(before, after, sameOutputLayout);
+    const bool sceneBlur =
+        before.appearance.blur != after.appearance.blur || before.optimizedBlurNeeded() != after.optimizedBlurNeeded();
+    const bool focusAppearance = before.animation.enabled != after.animation.enabled
+        || before.animation.dimUnfocused != after.animation.dimUnfocused
+        || before.animation.windowsOpacity != after.animation.windowsOpacity;
+    const bool effectsChanged = before.effects != after.effects
+        || configuredEffectActionRoots(before) != configuredEffectActionRoots(after)
+        || (outputNamesChanged && (selectsScreenEffect(before) || selectsScreenEffect(after)))
+        || outputProjectionChanged(before, after, sameOutputScreenEffect)
+        || !sameAnimationEffects(before.animation, after.animation)
+        || (before.windowRules != after.windowRules
+            && (selectsEffect(before.windowRules) || selectsEffect(after.windowRules)));
+    // Sources that decide which layout a workspace gets. Changing the title
+    // bar, the colours or the display filter only re-arranges the current
+    // layout; it must not pull every workspace back to the configured mode.
+    const bool layoutSourcesChanged = workspaceInventory
+        || outputLayout
+        || before.layout.mode != after.layout.mode
+        || before.workspaceRules != after.workspaceRules;
+    return {
+        .outputState = outputState,
+        .displayFilter = before.display != after.display,
+        .tearingPolicy = tearingPolicy,
+        .directScanoutPolicy = directScanoutPolicy,
+        .workspaceInventory = workspaceInventory,
+        .workspaceLayout = layoutSourcesChanged
+            || before.layout != after.layout
+            || before.appearance.totalBorderWidth() != after.appearance.totalBorderWidth()
+            || before.appearance.tabBar != after.appearance.tabBar
+            || before.appearance.titleBar != after.appearance.titleBar,
+        .reassertLayoutModes = layoutSourcesChanged,
+        .sceneBlur = sceneBlur,
+        // [colors] owns the border, backdrop, insert-hint, and shadow colors, so
+        // any color edit refreshes window chrome.
+        .viewChrome = before.appearance != after.appearance
+            || before.colors != after.colors
+            || before.windowRules != after.windowRules
+            || focusAppearance,
+        .layerEffects = sceneBlur || before.layerRules != after.layerRules,
+        .animation = before.animation != after.animation,
+        .input = before.input != after.input || before.hotCorners != after.hotCorners,
+        .overviewPresentation = before.overview != after.overview || before.colors != after.colors,
+        .internalUi = before.colors != after.colors || before.general.modKey != after.general.modKey,
+        .effects = effectsChanged,
+        .dialogAttachment = before.general.attachModalDialogs != after.general.attachModalDialogs
+            || (before.windowRules != after.windowRules
+                && (decidesAttachment(before.windowRules) || decidesAttachment(after.windowRules))),
+    };
+  }
+
+  ConfigEffects ConfigEffects::everything() {
+    return {
+        .outputState = true,
+        .displayFilter = true,
+        .tearingPolicy = true,
+        .directScanoutPolicy = true,
+        .workspaceInventory = true,
+        .workspaceLayout = true,
+        .reassertLayoutModes = true,
+        .sceneBlur = true,
+        .viewChrome = true,
+        .layerEffects = true,
+        .animation = true,
+        .input = true,
+        .overviewPresentation = true,
+        .internalUi = true,
+        .effects = true,
+        .dialogAttachment = true,
+    };
+  }
+
+  ConfigChange ConfigChange::everything() {
+    return {
+        .colors = true,
+        .appearance = true,
+        .display = true,
+        .animation = true,
+        .overview = true,
+        .hotCorners = true,
+        .layout = true,
+        .workspaces = true,
+        .general = true,
+        .drm = true,
+        .environment = true,
+        .events = true,
+        .input = true,
+        .keybinds = true,
+        .outputs = true,
+        .windowRules = true,
+        .layerRules = true,
+        .securityContextRules = true,
+        .scratchpads = true,
+        .workspaceRules = true,
+        .effects = true,
+    };
+  }
+
+  ConfigChange ConfigChange::between(const Config& before, const Config& after) {
+    return {
+        .colors = before.colors != after.colors,
+        .appearance = before.appearance != after.appearance,
+        .display = before.display != after.display,
+        .animation = before.animation != after.animation,
+        .overview = before.overview != after.overview,
+        .hotCorners = before.hotCorners != after.hotCorners,
+        .layout = before.layout != after.layout,
+        .workspaces = before.workspaces != after.workspaces,
+        .general = before.general != after.general,
+        .drm = before.drm != after.drm,
+        .environment = before.environment != after.environment,
+        .events = before.events != after.events,
+        .input = before.input != after.input,
+        .keybinds = before.keybinds != after.keybinds,
+        .outputs = before.outputs != after.outputs,
+        .windowRules = before.windowRules != after.windowRules,
+        .layerRules = before.layerRules != after.layerRules,
+        .securityContextRules = before.securityContextRules != after.securityContextRules,
+        .scratchpads = before.scratchpads != after.scratchpads,
+        .workspaceRules = before.workspaceRules != after.workspaceRules,
+        .effects = before.effects != after.effects,
+    };
+  }
+
+  std::string ConfigChange::summary() const {
+    std::string out;
+    const auto add = [&out](bool changed, std::string_view name) {
+      if (!changed) {
+        return;
+      }
+      if (!out.empty()) {
+        out += ", ";
+      }
+      out += name;
+    };
+    add(colors, "colors");
+    add(appearance, "appearance");
+    add(display, "display");
+    add(animation, "animation");
+    add(overview, "overview");
+    add(hotCorners, "hot corners");
+    add(layout, "layout");
+    add(workspaces, "workspaces");
+    add(general, "general");
+    add(drm, "drm");
+    add(environment, "environment");
+    add(events, "events");
+    add(input, "input");
+    add(keybinds, "keybinds");
+    add(outputs, "outputs");
+    add(windowRules, "window rules");
+    add(layerRules, "layer rules");
+    add(securityContextRules, "security context rules");
+    add(scratchpads, "scratchpads");
+    add(workspaceRules, "workspace rules");
+    add(effects, "effects");
+    return out;
+  }
+
+  std::string ConfigEffects::summary() const {
+    std::string out;
+    const auto add = [&out](bool changed, std::string_view name) {
+      if (!changed) {
+        return;
+      }
+      if (!out.empty()) {
+        out += ", ";
+      }
+      out += name;
+    };
+    add(outputState, "output state");
+    add(displayFilter, "display filter");
+    add(tearingPolicy, "tearing policy");
+    add(directScanoutPolicy, "direct scanout policy");
+    add(workspaceInventory, "workspace inventory");
+    add(workspaceLayout, "workspace layout");
+    add(reassertLayoutModes, "workspace modes");
+    add(sceneBlur, "scene blur");
+    add(viewChrome, "view chrome");
+    add(internalUi, "internal UI");
+    add(animation, "animation state");
+    add(layerEffects, "layer effects");
+    add(input, "input");
+    add(overviewPresentation, "overview presentation");
+    add(effects, "effects");
+    add(dialogAttachment, "dialog attachment");
+    return out;
+  }
+} // namespace umbriel

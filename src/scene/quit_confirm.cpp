@@ -1,0 +1,191 @@
+#include "scene/quit_confirm.h"
+
+#include "config/config.h"
+#include "input/input_capture.h"
+#include "scene/border_rect.h"
+#include "scene/color.h"
+#include "scene/text_buffer.h"
+#include "server/server.h"
+#include "wlr.h"
+
+#include <algorithm>
+#include <cmath>
+#include <format>
+#include <string>
+#include <string_view>
+
+namespace {
+
+  constexpr int kPadding = 22;
+  constexpr int kBorderWidth = 2;
+  constexpr int kDefaultMaxWidth = 800;
+  constexpr int kAbsMaxWidth = 960;
+  constexpr int kMargin = 24;
+
+} // namespace
+
+namespace umbriel {
+
+  QuitConfirm::QuitConfirm(Server& server, wlr_scene_tree* parent) : m_server(server), m_parent(parent) {}
+
+  QuitConfirm::~QuitConfirm() { hide(); }
+
+  void QuitConfirm::show(Kind kind) {
+    if (InputCapture* capture = m_server.inputCapture(); capture != nullptr && capture->active()) {
+      capture->suspend();
+    }
+    m_kind = kind;
+    render();
+  }
+
+  void QuitConfirm::showInputEmulation(std::string_view application) {
+    m_application = application;
+    show(Kind::InputEmulation);
+  }
+
+  void QuitConfirm::showInputCapture(std::string_view application, uint32_t persistMode) {
+    m_application = application;
+    m_inputCapturePersistMode = persistMode;
+    show(Kind::InputCapture);
+  }
+
+  void QuitConfirm::hide() {
+    if (m_tree != nullptr) {
+      m_shadow.reset();
+      wlr_scene_node_destroy(&m_tree->node);
+      m_tree = nullptr;
+    }
+  }
+
+  void QuitConfirm::relayout() {
+    if (m_tree != nullptr) {
+      render();
+    }
+  }
+
+  void QuitConfirm::render() {
+    // Destroy previous subtree.
+    if (m_tree != nullptr) {
+      m_shadow.reset();
+      wlr_scene_node_destroy(&m_tree->node);
+      m_tree = nullptr;
+    }
+
+    // Determine output scale and dimensions.
+    wlr_output* output = m_server.preferredOutput();
+    double scale = 1.0;
+    int outputLogicalWidth = 0;
+    wlr_box outputBox{};
+    bool haveOutput = false;
+    if (output != nullptr) {
+      scale = std::max(1.0, std::ceil(static_cast<double>(output->scale)));
+      wlr_output_layout_get_box(m_server.outputLayout(), output, &outputBox);
+      outputLogicalWidth = outputBox.width;
+      haveOutput = true;
+    }
+
+    int maxTextWidth = kDefaultMaxWidth;
+    if (outputLogicalWidth > 0) {
+      maxTextWidth = std::min(outputLogicalWidth - 80, kAbsMaxWidth);
+      maxTextWidth = std::max(maxTextWidth, 200);
+    }
+
+    const auto& colors = config().colors;
+    const auto& accent = m_kind == Kind::SessionQuit ? colors.error : colors.warning;
+    const std::string headingColor = rgbaHex(accent);
+    const std::string textColor = rgbaHex(colors.textPrimary);
+
+    const std::string_view heading = m_kind == Kind::InputCapture ? "Allow input capture?"
+        : m_kind == Kind::InputEmulation                          ? "Allow desktop control?"
+        : m_kind == Kind::SessionQuit                             ? "Quit Umbriel?"
+                                                                  : "Allow screencast target changes?";
+    std::string_view captureChoices = "Enter allows this capture session.\n"
+                                      "Any other key or click denies it.";
+    if (m_inputCapturePersistMode == 1) {
+      captureChoices = "Enter allows once.\n"
+                       "R remembers approval while the application runs.\n"
+                       "Any other key or click denies it.";
+    } else if (m_inputCapturePersistMode == 2) {
+      captureChoices = "Enter allows once.\n"
+                       "R remembers approval until you revoke it.\n"
+                       "Any other key or click denies it.";
+    }
+    const std::string detail = m_kind == Kind::InputCapture
+        ? std::format(
+              "A client requesting capture for '{}' wants to send your input to another application.\n"
+              "The application label is supplied by the requester.\n\n"
+              "{}\n\n"
+              "Press Ctrl+Alt+Escape to stop capture and restore local control.",
+              m_application, captureChoices
+          )
+        : m_kind == Kind::InputEmulation
+        ? std::format(
+              "An X11 application claiming to be '{}' wants to control your pointer and keyboard.\n"
+              "Enter allows it for this Umbriel session; any other key or click denies it.",
+              m_application
+          )
+        : m_kind == Kind::SessionQuit
+        ? "Enter confirms; any other key or click cancels"
+        : "This can reveal another window or screen. Enter confirms; any other key or click cancels";
+    std::string markup =
+        std::format("<span size='14pt' weight='bold' foreground='{}'>{}</span>", headingColor, heading);
+    markup += std::format(
+        "{}<span foreground='{}'>{}</span>", m_kind == Kind::InputCapture ? "\n\n" : "\n", textColor,
+        escapeMarkup(detail)
+    );
+    TextBufferResult rendered = renderTextBuffer({
+        .markup = std::move(markup),
+        .font = "monospace 11",
+        .maxWidth = maxTextWidth,
+        .padding = kPadding,
+        .scale = scale,
+        .bgR = 0.0,
+        .bgG = 0.0,
+        .bgB = 0.0,
+        .bgA = 0.0,
+    });
+    if (rendered.buffer == nullptr) {
+      return;
+    }
+
+    m_tree = wlr_scene_tree_create(m_parent);
+
+    // Shadow, colored border, rounded panel, then text.
+    const int cornerRadius = config().appearance.cornerRadius;
+    m_shadow.update(m_tree, rendered.logicalWidth, rendered.logicalHeight, kBorderWidth, cornerRadius);
+
+    float borderColor[4]{};
+    premultiplied(borderColor, accent, 1.0F);
+    wlr_scene_border* panelBorder = wlr_scene_border_create(m_tree, borderColor, borderColor);
+    applyBorderGeometry(
+        panelBorder, makeBorderRing(rendered.logicalWidth, rendered.logicalHeight, cornerRadius, kBorderWidth, 0),
+        kBorderWidth, 0
+    );
+
+    float panelColor[4]{};
+    premultiplied(panelColor, colors.background, 1.0F);
+    wlr_scene_rect* panelRect =
+        wlr_scene_rect_create(m_tree, rendered.logicalWidth, rendered.logicalHeight, panelColor);
+    wlr_scene_rect_set_corner_radius(panelRect, nestedRadius(cornerRadius, kBorderWidth));
+    (void)panelRect;
+
+    wlr_scene_buffer* sceneBuf = wlr_scene_buffer_create(m_tree, rendered.buffer);
+    wlr_buffer_drop(rendered.buffer); // scene holds the lock
+    if (sceneBuf != nullptr) {
+      // Map device-pixel buffer to logical output size; pass clicks through
+      // (the click-cancel is global in Cursor::handleButton).
+      wlr_scene_buffer_set_dest_size(sceneBuf, rendered.logicalWidth, rendered.logicalHeight);
+      sceneBuf->point_accepts_input = [](wlr_scene_buffer*, double*, double*) -> bool { return false; };
+    }
+
+    // Position: centered on both axes of the preferred output.
+    if (haveOutput) {
+      const int x = outputBox.x + (outputBox.width - rendered.logicalWidth) / 2;
+      const int y = outputBox.y + (outputBox.height - rendered.logicalHeight) / 2;
+      wlr_scene_node_set_position(&m_tree->node, x, y);
+    } else {
+      wlr_scene_node_set_position(&m_tree->node, kMargin, kMargin);
+    }
+  }
+
+} // namespace umbriel

@@ -1,0 +1,591 @@
+#include "layer/layer_surface.h"
+
+#include "scene/effect_registry.h"
+extern "C" {
+#include <umbrielfx/render/effect.h>
+}
+
+#include "config/resolve.h"
+#include "core/dirty.h"
+#include "core/log.h"
+#include "input/seat.h"
+#include "output/output.h"
+#include "overview/overview.h"
+#include "server/server.h"
+#include "view/popup.h"
+#include "wlr.h"
+
+#include <algorithm>
+#include <cstdlib>
+
+namespace umbriel {
+
+  namespace {
+    constexpr Logger kLog("layer");
+
+    // Unknown values fall back to the top layer, matching Output::layerTree.
+    LayerShellLayer layerOf(uint32_t layer) {
+      switch (layer) {
+      case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+        return LayerShellLayer::Background;
+      case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+        return LayerShellLayer::Bottom;
+      case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+        return LayerShellLayer::Top;
+      case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+        return LayerShellLayer::Overlay;
+      default:
+        return LayerShellLayer::Top;
+      }
+    }
+  } // namespace
+
+  LayerSurface* LayerSurface::fromSurface(wlr_surface* surface) {
+    wlr_surface* walk = surface;
+    while (walk != nullptr) {
+      walk = wlr_surface_get_root_surface(walk);
+      if (wlr_layer_surface_v1* layer = wlr_layer_surface_v1_try_from_wlr_surface(walk)) {
+        return static_cast<LayerSurface*>(layer->data);
+      }
+      if (wlr_xdg_popup* popup = wlr_xdg_popup_try_from_wlr_surface(walk)) {
+        walk = popup->parent;
+        continue;
+      }
+      break;
+    }
+    return nullptr;
+  }
+
+  LayerSurface::LayerSurface(Server& server, wlr_layer_surface_v1* layerSurface)
+      : SceneNode(SceneNodeKind::LayerSurface), m_server(&server), m_layerSurface(layerSurface) {
+    if (m_layerSurface->output == nullptr) {
+      m_layerSurface->output = m_server->preferredOutput();
+    }
+    if (m_layerSurface->output == nullptr) {
+      kLog.error("no output for layer surface, destroying");
+      wlr_layer_surface_v1_destroy(m_layerSurface);
+      m_layerSurface = nullptr;
+      return;
+    }
+
+    Output* out = output();
+    if (out == nullptr) {
+      kLog.error("layer surface output has no Output wrapper, destroying");
+      wlr_layer_surface_v1_destroy(m_layerSurface);
+      m_layerSurface = nullptr;
+      return;
+    }
+
+    const auto layer = m_layerSurface->pending.layer;
+    kLog.debug(
+        "new layer surface ns={} layer={} output={} exclusive={}",
+        m_layerSurface->namespace_ != nullptr ? m_layerSurface->namespace_ : "", static_cast<unsigned>(layer),
+        m_layerSurface->output->name, m_layerSurface->pending.exclusive_zone
+    );
+
+    m_scene = wlr_scene_layer_surface_v1_create(out->layerTree(layer), m_layerSurface);
+    if (m_scene == nullptr) {
+      kLog.error("failed to create scene layer surface");
+      wlr_layer_surface_v1_destroy(m_layerSurface);
+      m_layerSurface = nullptr;
+      return;
+    }
+    m_popupTree = wlr_scene_tree_create(out->layerPopupTree(layer));
+    if (m_popupTree == nullptr) {
+      kLog.error("failed to create layer popup tree");
+      wlr_layer_surface_v1_destroy(m_layerSurface);
+      m_scene = nullptr;
+      m_layerSurface = nullptr;
+      return;
+    }
+    m_popupTree->node.data = sceneNodeData(this);
+    syncPopupTree();
+    m_sceneUpdate.notify = onSceneUpdate;
+    if (!wlr_scene_node_add_update_listener(&m_scene->tree->node, &m_sceneUpdate)) {
+      kLog.error("failed to watch layer popup geometry");
+      std::abort();
+    }
+    m_sceneDestroy.notify = onSceneDestroy;
+    wl_signal_add(&m_scene->tree->node.events.destroy, &m_sceneDestroy);
+
+    m_rule = resolveLayerRules(config(), ruleText(m_layerSurface->namespace_), layerOf(layer), m_server->uptimeMs());
+    m_scene->tree->node.data = sceneNodeData(this);
+    m_layerSurface->data = this;
+
+    m_map.notify = onMap;
+    wl_signal_add(&m_layerSurface->surface->events.map, &m_map);
+    m_unmap.notify = onUnmap;
+    // Snapshot before the scene helper disables its subsurface tree. The normal
+    // buffer iterator intentionally skips disabled trees.
+    wl_list_insert(&m_layerSurface->surface->events.unmap.listener_list, &m_unmap.link);
+    m_commit.notify = onCommit;
+    wl_signal_add(&m_layerSurface->surface->events.commit, &m_commit);
+    m_destroy.notify = onDestroy;
+    wl_signal_add(&m_layerSurface->events.destroy, &m_destroy);
+    m_newPopup.notify = onNewPopup;
+    wl_signal_add(&m_layerSurface->events.new_popup, &m_newPopup);
+
+    m_server->registerAnimatable(this);
+    notifyOutputScale();
+  }
+
+  LayerSurface::~LayerSurface() {
+    m_server->unregisterAnimatable(this);
+    if (m_sceneDestroy.link.next != nullptr) {
+      wl_list_remove(&m_sceneUpdate.link);
+      wl_list_remove(&m_sceneDestroy.link);
+      wlr_scene_node_destroy(&m_popupTree->node);
+    }
+    if (m_map.link.next != nullptr) {
+      wl_list_remove(&m_map.link);
+      wl_list_remove(&m_unmap.link);
+      wl_list_remove(&m_commit.link);
+      wl_list_remove(&m_destroy.link);
+      wl_list_remove(&m_newPopup.link);
+    }
+  }
+
+  bool LayerSurface::tickAnimations(double nowMsec) {
+    const bool ticked = m_fade.tick(nowMsec);
+    if (m_scene != nullptr) {
+      bindAnimationEffect(&m_scene->tree->node, AnimationEvent::Layers, m_fade);
+      bindAnimationEffect(&m_popupTree->node, AnimationEvent::Layers, m_fade);
+    }
+    if (!ticked) {
+      return false;
+    }
+    applyFadeAlpha();
+    if (m_layerSurface != nullptr && m_layerSurface->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+      if (Output* out = output()) {
+        out->markBlurBackgroundDirty();
+      }
+    }
+    return true;
+  }
+
+  bool LayerSurface::animatesOn(const Output* out) const { return output() == out; }
+
+  void LayerSurface::applyFadeAlpha() {
+    if (m_scene == nullptr) {
+      return;
+    }
+    // Overshooting curves can push this out of range; wlr_scene_buffer_set_opacity asserts opacity is in [0, 1].
+    float alpha = m_fade.animating() && effectRegistry().animationEffect(AnimationEvent::Layers) != nullptr
+        ? 1.0F
+        : std::clamp(static_cast<float>(m_fade.current()), 0.0F, 1.0F);
+    for (auto* tree : {m_scene->tree, m_popupTree}) {
+      wlr_scene_node_for_each_buffer(
+          &tree->node,
+          [](wlr_scene_buffer* buffer, int /*sx*/, int /*sy*/, void* data) {
+            wlr_scene_buffer_set_opacity(buffer, *static_cast<float*>(data));
+          },
+          &alpha
+      );
+    }
+  }
+
+  void LayerSurface::beginCloseAnimation(wlr_scene_tree* tree) {
+    Output* out = output();
+    const auto& animation = config().animation;
+    const auto& layers = animation.layers;
+    if (out == nullptr || m_scene == nullptr || !animation.enabled || !layers.enabled) {
+      return;
+    }
+
+    const uint32_t layer = m_layerSurface->current.layer;
+    wlr_scene_tree* parentTree = tree == m_popupTree ? out->layerPopupTree(layer) : out->layerTree(layer);
+    wlr_scene_tree* snap = wlr_scene_tree_create(parentTree);
+    if (snap == nullptr) {
+      return;
+    }
+    wlr_scene_node_set_position(&snap->node, tree->node.x, tree->node.y);
+
+    struct CopyCtx {
+      wlr_scene_tree* snap;
+      int rootX;
+      int rootY;
+      int buffersCopied;
+    };
+    CopyCtx ctx{snap, tree->node.x, tree->node.y, 0};
+    wlr_scene_node_for_each_buffer(
+        &tree->node,
+        [](wlr_scene_buffer* src, int sx, int sy, void* data) {
+          auto* c = static_cast<CopyCtx*>(data);
+          if (src->buffer == nullptr || !src->node.enabled) {
+            return;
+          }
+          wlr_scene_buffer* copy = wlr_scene_buffer_create(c->snap, src->buffer);
+          if (copy == nullptr) {
+            return;
+          }
+          wlr_scene_node_set_position(&copy->node, sx - c->rootX, sy - c->rootY);
+          if (src->dst_width > 0 && src->dst_height > 0) {
+            wlr_scene_buffer_set_dest_size(copy, src->dst_width, src->dst_height);
+          }
+          if (src->src_box.width > 0 && src->src_box.height > 0) {
+            wlr_scene_buffer_set_source_box(copy, &src->src_box);
+          }
+          wlr_scene_buffer_set_transform(copy, src->transform);
+          wlr_scene_buffer_set_corner_radii(copy, src->corners);
+          wlr_scene_buffer_set_corner_box(copy, &src->corner_box);
+          wlr_scene_buffer_set_opacity(copy, src->opacity);
+          wlr_scene_buffer_copy_color(copy, src);
+          ++c->buffersCopied;
+        },
+        &ctx
+    );
+
+    if (ctx.buffersCopied == 0) {
+      wlr_scene_node_destroy(&snap->node);
+      return;
+    }
+
+    wlr_scene_node_copy_animations_for_snapshot(&snap->node, &tree->node);
+    (void)m_server->animateCloseSnapshot(
+        out, snap, snap, {}, {},
+        Server::CloseSnapshotOverrides{
+            .durationMs = layers.durationMs, .curve = layers.curve, .style = "fade", .event = AnimationEvent::Layers
+        }
+    );
+    wlr_output_schedule_frame(out->wlr());
+  }
+
+  Output* LayerSurface::output() const {
+    if (m_layerSurface == nullptr || m_layerSurface->output == nullptr) {
+      return nullptr;
+    }
+    return static_cast<Output*>(m_layerSurface->output->data);
+  }
+
+  void LayerSurface::notifyOutputScale() {
+    Output* out = output();
+    if (out == nullptr || m_layerSurface == nullptr) {
+      return;
+    }
+    wlr_layer_surface_v1_for_each_surface(m_layerSurface, &Output::notifySurfaceScaleIter, out);
+    wlr_layer_surface_v1_for_each_popup_surface(m_layerSurface, &Output::notifySurfaceScaleIter, out);
+  }
+
+  bool LayerSurface::exclusiveKeyboard() const {
+    return acceptsKeyboard()
+        && m_layerSurface->current.keyboard_interactive == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE;
+  }
+
+  bool LayerSurface::acceptsKeyboard() const {
+    if (!m_mapped || m_layerSurface == nullptr) {
+      return false;
+    }
+    if (m_layerSurface->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP) {
+      if (Output* out = output(); out != nullptr && out->fullscreenAboveTopLayer()) {
+        return false;
+      }
+    }
+    const auto interactivity = m_layerSurface->current.keyboard_interactive;
+    return interactivity == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
+        || interactivity == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND;
+  }
+
+  bool LayerSurface::hasKeyboardFocus() const {
+    return m_layerSurface != nullptr && fromSurface(m_server->seat()->wlr()->keyboard_state.focused_surface) == this;
+  }
+
+  void LayerSurface::reparentToLayer(uint32_t layer) {
+    Output* out = output();
+    if (out == nullptr || m_scene == nullptr) {
+      return;
+    }
+    wlr_scene_node_reparent(&m_popupTree->node, out->layerPopupTree(layer));
+    wlr_scene_node_reparent(&m_scene->tree->node, out->layerTree(layer));
+  }
+
+  void LayerSurface::syncPopupTree() {
+    wlr_scene_node_set_position(&m_popupTree->node, m_scene->tree->node.x, m_scene->tree->node.y);
+    wlr_scene_node_set_enabled(&m_popupTree->node, m_mapped && m_scene->tree->node.enabled);
+  }
+
+  void LayerSurface::onSceneUpdate(wl_listener* listener, void* data) {
+    LayerSurface* self = wl_container_of(listener, self, m_sceneUpdate); // NOLINT(modernize-use-auto)
+    if (data == &self->m_scene->tree->node) {
+      self->syncPopupTree();
+    }
+  }
+
+  void LayerSurface::onSceneDestroy(wl_listener* listener, void* /*data*/) {
+    LayerSurface* self = wl_container_of(listener, self, m_sceneDestroy); // NOLINT(modernize-use-auto)
+    wl_list_remove(&self->m_sceneUpdate.link);
+    wl_list_remove(&self->m_sceneDestroy.link);
+    self->m_sceneUpdate.link.next = nullptr;
+    self->m_sceneDestroy.link.next = nullptr;
+    wlr_scene_node_destroy(&self->m_popupTree->node);
+    self->m_popupTree = nullptr;
+  }
+
+  void LayerSurface::focus() {
+    if (m_server->sessionLocked() || !acceptsKeyboard()) {
+      return;
+    }
+
+    wlr_seat* seat = m_server->seat()->wlr();
+    wlr_surface* surface = m_layerSurface->surface;
+    // Layers take the seat: drop every window's activated/border so none stay "focused".
+    m_server->deactivateViews(nullptr);
+    if (seat->keyboard_state.focused_surface == surface) {
+      return;
+    }
+
+    // End any keyboard grab (e.g. xdg_popup) that would intercept the enter and block focus from reaching this layer
+    // surface. Pointer/touch grabs remain intact so the popup stays visually mapped.
+    wlr_seat_keyboard_end_grab(seat);
+
+    // Give the layer seat keyboard focus so clients (e.g. Noctalia) receive Escape.
+    m_server->notifyKeyboardEnter(surface);
+    m_server->refreshOutputPolicies();
+  }
+
+  void LayerSurface::focusForPopupGrab() {
+    if (m_server->sessionLocked() || !acceptsKeyboard() || hasKeyboardFocus()) {
+      return;
+    }
+    if (const LayerSurface* exclusive = m_server->exclusiveKeyboardLayer(); exclusive != nullptr && exclusive != this) {
+      return;
+    }
+
+    m_server->deactivateViews(nullptr);
+    // focus() would end the popup's keyboard grab, and wlroots answers that by dismissing the popup. Enter past it.
+    m_server->notifyKeyboardEnter(m_layerSurface->surface, Server::KeyboardGrab::Bypass);
+    m_server->refreshOutputPolicies();
+  }
+
+  SurfaceBlurOptions LayerSurface::blurOptions() const {
+    return SurfaceBlurOptions{
+        .ignoreAlpha = static_cast<float>(m_rule.ignoreAlpha.value_or(0.0)),
+        .enabled = m_rule.blur.value_or(false),
+        .optimized = m_rule.optimized,
+        .strength = static_cast<float>(m_rule.strength.value_or(1.0)),
+    };
+  }
+
+  SurfaceBlurOptions LayerSurface::popupBlurOptions() const {
+    return SurfaceBlurOptions{
+        .ignoreAlpha = static_cast<float>(m_rule.ignoreAlpha.value_or(0.0)),
+        .enabled = m_rule.blurPopups.value_or(false),
+        .optimized = m_rule.optimized,
+        .strength = static_cast<float>(m_rule.strength.value_or(1.0)),
+    };
+  }
+
+  void LayerSurface::unconstrainPopup(wlr_xdg_popup* popup) {
+    Output* out = output();
+    if (out == nullptr || m_scene == nullptr) {
+      return;
+    }
+
+    int width = 0;
+    int height = 0;
+    wlr_output_effective_resolution(m_layerSurface->output, &width, &height);
+
+    // wlroots expects the box in the root layer surface coordinate system and
+    // translates it through every ancestor popup itself.
+    const wlr_box box = {
+        .x = -m_scene->tree->node.x,
+        .y = -m_scene->tree->node.y,
+        .width = width,
+        .height = height,
+    };
+    wlr_xdg_popup_unconstrain_from_box(popup, &box);
+  }
+
+  void LayerSurface::updateBlur() {
+    const wlr_box box{0, 0, m_layerSurface->surface->current.width, m_layerSurface->surface->current.height};
+    m_blur.update(m_scene->tree, m_layerSurface->surface, box, box, corner_radii_none(), nullptr, blurOptions());
+  }
+
+  void LayerSurface::applyConfig() {
+    m_rule = resolveLayerRules(
+        config(), ruleText(m_layerSurface->namespace_), layerOf(m_layerSurface->current.layer), m_server->uptimeMs()
+    );
+    updateBlur();
+  }
+
+  void LayerSurface::refreshStartupRuleEffects() {
+    m_rule = resolveLayerRules(
+        config(), ruleText(m_layerSurface->namespace_), layerOf(m_layerSurface->current.layer), m_server->uptimeMs()
+    );
+    if (m_mapped) {
+      updateBlur();
+    }
+  }
+
+  void LayerSurface::onMap(wl_listener* listener, void* /*data*/) {
+    LayerSurface* self;
+    self = wl_container_of(listener, self, m_map);
+    self->handleMap();
+  }
+
+  void LayerSurface::onUnmap(wl_listener* listener, void* /*data*/) {
+    LayerSurface* self;
+    self = wl_container_of(listener, self, m_unmap);
+    self->handleUnmap();
+  }
+
+  void LayerSurface::onCommit(wl_listener* listener, void* /*data*/) {
+    LayerSurface* self;
+    self = wl_container_of(listener, self, m_commit);
+    self->handleCommit();
+  }
+
+  void LayerSurface::onDestroy(wl_listener* listener, void* /*data*/) {
+    LayerSurface* self;
+    self = wl_container_of(listener, self, m_destroy);
+    self->handleDestroy();
+  }
+
+  void LayerSurface::onNewPopup(wl_listener* listener, void* data) {
+    LayerSurface* self;
+    self = wl_container_of(listener, self, m_newPopup);
+    self->handleNewPopup(data);
+  }
+
+  void LayerSurface::handleMap() {
+    m_mapped = true;
+    syncPopupTree();
+    m_server->scheduleIpcLayersEvent();
+    m_server->updateIdleInhibit();
+    if (Output* out = output()) {
+      out->markDirty(Dirty::LayerArrange);
+      if (m_layerSurface->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+        out->markBlurBackgroundDirty();
+      }
+    }
+    // Protocol requires focus for exclusive. On-demand layers also take it as they map: launchers,
+    // quick terminals and panels expect the keyboard right away.
+    // A click or a focus action moves focus off them again, unlike an exclusive layer.
+    if (acceptsKeyboard()) {
+      focus();
+    }
+    updateBlur();
+    notifyDesktopStack();
+
+    const auto& animation = config().animation;
+    const auto& layers = animation.layers;
+    if (animation.enabled && layers.enabled) {
+      m_fade.snap(0.0);
+      applyFadeAlpha();
+      m_fade.retarget(1.0, layers.durationMs, layers.curve);
+      if (Output* out = output()) {
+        wlr_output_schedule_frame(out->wlr());
+      }
+    } else {
+      m_fade.snap(1.0);
+      applyFadeAlpha();
+    }
+  }
+
+  void LayerSurface::handleUnmap() {
+    // Snapshot before any other unmap bookkeeping runs: the live buffer is still valid here.
+    beginCloseAnimation(m_scene->tree);
+    beginCloseAnimation(m_popupTree);
+    wlr_scene_node_clear_animations(&m_scene->tree->node);
+    wlr_scene_node_clear_animations(&m_popupTree->node);
+    const bool hadFocus = hasKeyboardFocus();
+    m_mapped = false;
+    syncPopupTree();
+    m_server->scheduleIpcLayersEvent();
+    m_server->updateIdleInhibit();
+    m_blur.hide();
+    m_fade.snap(1.0);
+    // Avoid sending configures while unmapping (wrong serial / client abort).
+    m_arrangingOut = true;
+    if (Output* out = output()) {
+      out->markDirty(Dirty::LayerArrange);
+      if (m_layerSurface->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+        out->markBlurBackgroundDirty();
+      }
+    }
+    m_arrangingOut = false;
+    notifyDesktopStack();
+    if (hadFocus) {
+      m_server->refocus();
+    }
+  }
+
+  void LayerSurface::notifyDesktopStack() {
+    const uint32_t layer = m_layerSurface->current.layer;
+    if (layer != ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND && layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
+      return;
+    }
+    if (Overview* overview = m_server->overview()) {
+      overview->onDesktopLayerChanged(output());
+    }
+  }
+
+  void LayerSurface::handleCommit() {
+    updateBlur();
+    if (m_layerSurface->initial_commit) {
+      if (Output* out = output()) {
+        out->arrangeLayers();
+        out->markDirty(Dirty::LayerArrange);
+      }
+      return;
+    }
+
+    if ((m_layerSurface->current.committed & WLR_LAYER_SURFACE_V1_STATE_LAYER) != 0) {
+      m_rule = resolveLayerRules(
+          config(), ruleText(m_layerSurface->namespace_), layerOf(m_layerSurface->current.layer), m_server->uptimeMs()
+      );
+      updateBlur();
+      reparentToLayer(m_layerSurface->current.layer);
+      notifyDesktopStack();
+    }
+
+    if ((m_layerSurface->current.committed
+         & (WLR_LAYER_SURFACE_V1_STATE_KEYBOARD_INTERACTIVITY | WLR_LAYER_SURFACE_V1_STATE_LAYER))
+        != 0) {
+      if (exclusiveKeyboard()) {
+        focus();
+      } else if (hasKeyboardFocus() && !acceptsKeyboard()) {
+        m_server->refocus();
+      }
+    }
+
+    if (m_layerSurface->current.committed != 0) {
+      if (Output* out = output()) {
+        out->markDirty(Dirty::LayerArrange);
+      }
+    }
+  }
+
+  void LayerSurface::handleDestroy() {
+    Server* server = m_server;
+    wlr_output* wlrOutput = m_layerSurface != nullptr ? m_layerSurface->output : nullptr;
+    kLog.debug("destroy layer surface output={}", wlrOutput != nullptr ? wlrOutput->name : "(none)");
+
+    wl_list_remove(&m_map.link);
+    wl_list_remove(&m_unmap.link);
+    wl_list_remove(&m_commit.link);
+    wl_list_remove(&m_destroy.link);
+    wl_list_remove(&m_newPopup.link);
+    m_map.link.next = nullptr;
+    m_unmap.link.next = nullptr;
+    m_commit.link.next = nullptr;
+    m_destroy.link.next = nullptr;
+    m_newPopup.link.next = nullptr;
+
+    // m_scene is already freed: wlr_scene_layer_surface_v1_create registers its own destroy listener on
+    // m_layerSurface->events.destroy before ours, and that handler destroys the tree and frees the helper.
+    m_scene = nullptr;
+    if (m_layerSurface != nullptr) {
+      m_layerSurface->data = nullptr;
+    }
+    // removeLayerSurface deletes this. Arrange after erase, never via this->m_server.
+    server->removeLayerSurface(this, wlrOutput);
+  }
+
+  void LayerSurface::handleNewPopup(void* data) {
+    auto* popup = static_cast<wlr_xdg_popup*>(data);
+    // The popup tree shares the surface origin and stacks above its shell layer's regular surfaces.
+    wlr_scene_node_raise_to_top(&m_popupTree->node);
+    new Popup(popup, m_popupTree);
+  }
+
+} // namespace umbriel

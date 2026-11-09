@@ -1,0 +1,1434 @@
+// Maps an xdg toplevel, then on a compositor close request unmaps it without destroying the surface. The View stays
+// registered and unmapped and never reaches Server::removeView, so focus reassignment must happen at unmap time.
+// Prints "mapped" once the toplevel is up and "unmapped" once the close
+// request lands, then keeps the connection alive until the harness kills it. Usage: unmap-client [title [width
+// height]]. The optional dimensions let pointer checks expose a surface that fills its assigned tile. With
+// REMAP_ON_STDIN set, reading any byte performs a fresh initial commit and maps the same toplevel again.
+// With ACTIVATION_TOKEN_FILE set, an `a` command reads and uses that token. A `c` command requests an ordinary client
+// token instead. An `i` command requests a token from the latest focused key press and writes it to that file. When the
+// surface is hidden, `a` or `c` queues activation before the remap commit.
+// ACTIVATE_ON_START uses the inherited XDG_ACTIVATION_TOKEN before the initial surface commit.
+// MAP_ON_STDIN creates the toplevel role, prints "map-pending", then waits for one byte before its initial commit.
+// CONTENT_TYPE sets a surface hint before its initial commit. CONTENT_TYPE_ON_SUBSURFACE places it on a rendering
+// child. With only CONTENT_TYPE_AFTER_MAP, that child is created when stdin triggers the update, matching Wine's
+// late rendering-surface attachment. XDG_TAG sets a toplevel tag before the initial commit.
+// CONTENT_TYPE_AFTER_MAP, XDG_TAG_AFTER_MAP, and TITLE_AFTER_MAP update their metadata on a `u` command. A `t` command
+// updates only TITLE_AFTER_MAP, allowing checks to sequence title and content hints. NO_TITLE never sets a title at
+// all. With TRANSIENT_SUITE, TRANSIENT_PARENT_SIZE=<width>x<height> gives the parent its own size,
+// TRANSIENT_MODAL makes this toplevel a modal dialog of it, and EXPORT_PARENT exports the parent through xdg-foreign
+// and prints the handle. TRANSIENT_DIALOG_ON_STDIN gives this toplevel an xdg-dialog-v1 object, modal only with
+// TRANSIENT_MODAL, that `m` on stdin makes modal, `n` makes non-modal, and `x` destroys. TRANSIENT_NESTED_ON_STDIN
+// maps a modal dialog titled transient-nested before this toplevel, without a parent until `p` on stdin sets this one
+// and prints "nested-parent-set" once the compositor has it.
+// TRANSIENT_SUITE=mapped-together maps the parent and this toplevel in one flush, parenting from the first configure
+// so the compositor maps both in the same dispatch. TRANSIENT_FOREIGN_HANDLE=<handle> parents this toplevel to another
+// client's exported toplevel, the way a portal dialog is parented.
+// TRANSIENT_FOREIGN_PARENT_ON_STDIN delays that parent request until `p` is read
+// from stdin, after the child has mapped.
+// FOLLOW_CONFIGURES maps at its own size, then redraws at every later configured size, as a real client would; by
+// default the window keeps its own size.
+// FULLSCREEN_ON_STDIN makes `f` request fullscreen and `u` request windowed state.
+// REPAINT_ON_STDIN makes R/G/B request a frame callback, then commit a fresh red/green/blue buffer.
+// FILL_COLOR=<ARGB> paints the buffer that colour (default 0xFF5577AA), so screenshots can tell windows apart.
+// OPAQUE_BUFFER uses XRGB so the compositor can cull completely covered clients.
+// RESIZE_FILL_COLOR=<ARGB> maps at the first configured size, then redraws at every later configured size in that
+// colour, the way a real client follows its tile.
+// LOG_SUSPENDED binds xdg-shell at version 6 and prints "suspended" and "resumed" whenever the toplevel's suspended
+// state changes.
+
+#include "color-management-v1-client-protocol.h"
+#include "content-type-v1-client-protocol.h"
+#include "parse_ints.h"
+#include "tearing-control-v1-client-protocol.h"
+#include "xdg-activation-v1-client-protocol.h"
+#include "xdg-dialog-v1-client-protocol.h"
+#include "xdg-foreign-unstable-v2-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
+#include "xdg-toplevel-tag-v1-client-protocol.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <poll.h>
+#include <print>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <wayland-client.h>
+
+namespace {
+
+#ifdef WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION
+  constexpr uint32_t kColorManagerVersion = WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION;
+#else
+  constexpr uint32_t kColorManagerVersion = 2;
+#endif
+
+  int parseContentType(const char* value) {
+    if (value == nullptr || std::strcmp(value, "none") == 0) {
+      return WP_CONTENT_TYPE_V1_TYPE_NONE;
+    }
+    if (std::strcmp(value, "photo") == 0) {
+      return WP_CONTENT_TYPE_V1_TYPE_PHOTO;
+    }
+    if (std::strcmp(value, "video") == 0) {
+      return WP_CONTENT_TYPE_V1_TYPE_VIDEO;
+    }
+    if (std::strcmp(value, "game") == 0) {
+      return WP_CONTENT_TYPE_V1_TYPE_GAME;
+    }
+    return -1;
+  }
+
+  struct Buffer {
+    wl_buffer* resource = nullptr;
+    void* pixels = MAP_FAILED;
+    size_t size = 0;
+  };
+
+  struct State {
+    wl_display* display = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
+    wl_shm* shm = nullptr;
+    xdg_wm_base* wmBase = nullptr;
+    xdg_activation_v1* activation = nullptr;
+    xdg_toplevel_tag_manager_v1* xdgTagManager = nullptr;
+    xdg_wm_dialog_v1* dialogManager = nullptr;
+    zxdg_exporter_v2* exporter = nullptr;
+    zxdg_importer_v2* importer = nullptr;
+    wp_content_type_manager_v1* contentTypeManager = nullptr;
+    wp_content_type_v1* contentType = nullptr;
+    wl_surface* contentTypeSurface = nullptr;
+    wl_surface* surface = nullptr;
+    xdg_surface* xdgSurface = nullptr;
+    xdg_toplevel* toplevel = nullptr;
+    wl_seat* seat = nullptr;
+    wl_keyboard* keyboard = nullptr;
+    wp_color_manager_v1* colorManager = nullptr;
+    wp_color_management_surface_v1* colorSurface = nullptr;
+    wp_image_description_v1* imageDescription = nullptr;
+    wp_tearing_control_manager_v1* tearingManager = nullptr;
+    wp_tearing_control_v1* tearingControl = nullptr;
+    Buffer buffer;
+    wl_surface* colorChildSurface = nullptr;
+    wl_subsurface* colorChildSubsurface = nullptr;
+    Buffer colorChildBuffer;
+    int width = 64;
+    int height = 64;
+    bool mapped = false;
+    wl_callback* repaintFrame = nullptr;
+    uint32_t repaintColor = 0;
+    bool closed = false;
+    bool redrawOnClose = false;
+    bool redrawOnceOnClose = false;
+    bool keyboardFocused = false;
+    uint32_t inputSerial = 0;
+    bool requestMaximized = false;
+    bool requestMaximizedAfterConfigure = false;
+    bool requestMaximizedAfterMap = false;
+    bool requestMaximizedAfterFrame = false;
+    bool maximizeRequested = false;
+    bool logConfigures = false;
+    bool logSuspended = false;
+    bool logWmCapabilities = false;
+    bool suspended = false;
+    xdg_toplevel* parentOnFirstConfigure = nullptr;
+    bool followConfigures = false;
+    bool requestFullscreen = false;
+    bool fullscreenRequested = false;
+    bool requestHdr = false;
+    bool requestWindowsScrgb = false;
+    bool requestWindowsBt2100 = false;
+    bool colorOnSubsurface = false;
+    bool contentTypeOnSubsurface = false;
+    bool colorChildLifecycle = false;
+    uint32_t colorChildLifecyclePhase = 0;
+    bool hasExtendedTargetVolume = false;
+    bool hasWindowsScrgb = false;
+#ifdef WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION
+    bool hasWindowsBt2100 = false;
+#endif
+    bool colorManagerDone = false;
+    bool imageDescriptionReady = false;
+    bool imageDescriptionFailed = false;
+    bool contentTypeUpdated = false;
+    bool xdgTagUpdated = false;
+    bool titleUpdated = false;
+    int tearingHint = -1;
+    uint32_t fillColor = 0xFF5577AA;
+    std::optional<uint32_t> resizeFillColor;
+    int configuredWidth = 0;
+    int configuredHeight = 0;
+    const char* title = "unmap-client";
+    const char* appId = nullptr;
+    const char* remapAppId = nullptr;
+    const char* activationTokenFile = nullptr;
+  };
+
+  struct AuxiliaryToplevel {
+    wl_surface* surface = nullptr;
+    xdg_surface* xdgSurface = nullptr;
+    xdg_toplevel* toplevel = nullptr;
+    Buffer buffer;
+    int width = 0;
+    int height = 0;
+    bool mapped = false;
+  };
+
+  void colorManagerSupportedIntent(void*, wp_color_manager_v1*, uint32_t) {}
+
+  void colorManagerSupportedFeature(void* data, wp_color_manager_v1*, uint32_t feature) {
+    auto& state = *static_cast<State*>(data);
+    if (feature == WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME) {
+      state.hasExtendedTargetVolume = true;
+    } else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB) {
+      state.hasWindowsScrgb = true;
+#ifdef WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION
+    } else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100) {
+      state.hasWindowsBt2100 = true;
+#endif
+    }
+  }
+
+  void colorManagerSupportedTransferFunction(void*, wp_color_manager_v1*, uint32_t) {}
+  void colorManagerSupportedPrimaries(void*, wp_color_manager_v1*, uint32_t) {}
+
+  void colorManagerDone(void* data, wp_color_manager_v1*) { static_cast<State*>(data)->colorManagerDone = true; }
+
+  constexpr wp_color_manager_v1_listener kColorManagerListener = {
+      .supported_intent = colorManagerSupportedIntent,
+      .supported_feature = colorManagerSupportedFeature,
+      .supported_tf_named = colorManagerSupportedTransferFunction,
+      .supported_primaries_named = colorManagerSupportedPrimaries,
+      .done = colorManagerDone,
+  };
+
+  void imageDescriptionFailed(void* data, wp_image_description_v1*, uint32_t, const char* message) {
+    auto& state = *static_cast<State*>(data);
+    state.imageDescriptionFailed = true;
+    std::println(stderr, "unmap-client: HDR image description failed: {}", message);
+  }
+
+  void imageDescriptionReady(void* data, wp_image_description_v1*, uint32_t) {
+    static_cast<State*>(data)->imageDescriptionReady = true;
+  }
+
+  void imageDescriptionReady2(void* data, wp_image_description_v1*, uint32_t, uint32_t) {
+    static_cast<State*>(data)->imageDescriptionReady = true;
+  }
+
+  constexpr wp_image_description_v1_listener kImageDescriptionListener = {
+      .failed = imageDescriptionFailed,
+      .ready = imageDescriptionReady,
+      .ready2 = imageDescriptionReady2,
+  };
+
+  void keyboardKeymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) {
+    close(fd);
+    if (std::getenv("UMBRIEL_LOG_KEYMAPS") != nullptr) {
+      std::println("keymap");
+      std::fflush(stdout);
+    }
+  }
+
+  void keyboardEnter(void* data, wl_keyboard*, uint32_t, wl_surface* surface, wl_array*) {
+    auto& state = *static_cast<State*>(data);
+    state.keyboardFocused = surface == state.surface;
+    if (state.keyboardFocused) {
+      std::println("keyboard-enter");
+      std::fflush(stdout);
+    }
+  }
+
+  void keyboardLeave(void* data, wl_keyboard*, uint32_t, wl_surface* surface) {
+    auto& state = *static_cast<State*>(data);
+    if (surface == state.surface) {
+      state.keyboardFocused = false;
+      std::println("keyboard-leave");
+      std::fflush(stdout);
+    }
+  }
+
+  void keyboardKey(void* data, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key, uint32_t keyState) {
+    auto& state = *static_cast<State*>(data);
+    if (state.keyboardFocused) {
+      if (keyState == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        state.inputSerial = serial;
+      }
+      std::println("key {} {}", key, keyState);
+      std::fflush(stdout);
+    }
+  }
+
+  void keyboardModifiers(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
+  void keyboardRepeatInfo(void*, wl_keyboard*, int32_t, int32_t) {}
+
+  constexpr wl_keyboard_listener kKeyboardListener = {
+      .keymap = keyboardKeymap,
+      .enter = keyboardEnter,
+      .leave = keyboardLeave,
+      .key = keyboardKey,
+      .modifiers = keyboardModifiers,
+      .repeat_info = keyboardRepeatInfo,
+  };
+
+  void seatCapabilities(void* data, wl_seat* seat, uint32_t capabilities) {
+    auto& state = *static_cast<State*>(data);
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0 && state.keyboard == nullptr) {
+      state.keyboard = wl_seat_get_keyboard(seat);
+      wl_keyboard_add_listener(state.keyboard, &kKeyboardListener, &state);
+    }
+  }
+
+  void seatName(void*, wl_seat*, const char*) {}
+
+  constexpr wl_seat_listener kSeatListener = {
+      .capabilities = seatCapabilities,
+      .name = seatName,
+  };
+
+  Buffer createBuffer(State& state, int width, int height) {
+    Buffer buffer;
+    const int stride = width * 4;
+    buffer.size = static_cast<size_t>(stride * height);
+    const int fd = memfd_create("umbriel-unmap-client", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, static_cast<off_t>(buffer.size)) < 0) {
+      if (fd >= 0) {
+        close(fd);
+      }
+      return buffer;
+    }
+
+    buffer.pixels = mmap(nullptr, buffer.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (buffer.pixels == MAP_FAILED) {
+      close(fd);
+      return buffer;
+    }
+    std::fill_n(static_cast<uint32_t*>(buffer.pixels), buffer.size / sizeof(uint32_t), state.fillColor);
+
+    wl_shm_pool* pool = wl_shm_create_pool(state.shm, fd, static_cast<int>(buffer.size));
+    const uint32_t format = std::getenv("OPAQUE_BUFFER") != nullptr ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
+    buffer.resource = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return buffer;
+  }
+
+  void destroyBuffer(Buffer& buffer);
+
+  void repaintFrameDone(void* data, wl_callback* callback, uint32_t /*time*/) {
+    auto& state = *static_cast<State*>(data);
+    wl_callback_destroy(callback);
+    state.repaintFrame = nullptr;
+    state.fillColor = state.repaintColor;
+    Buffer next = createBuffer(state, state.width, state.height);
+    if (next.resource == nullptr) {
+      std::exit(EXIT_FAILURE);
+    }
+    wl_surface_attach(state.surface, next.resource, 0, 0);
+    wl_surface_damage_buffer(state.surface, 0, 0, state.width, state.height);
+    wl_surface_commit(state.surface);
+    destroyBuffer(state.buffer);
+    state.buffer = next;
+    wl_display_flush(state.display);
+    std::println("repainted {}", state.fillColor);
+    std::fflush(stdout);
+  }
+
+  constexpr wl_callback_listener kRepaintListener = {.done = repaintFrameDone};
+
+  void auxiliaryXdgSurfaceConfigure(void* data, xdg_surface* xdgSurface, uint32_t serial) {
+    auto& window = *static_cast<AuxiliaryToplevel*>(data);
+    xdg_surface_ack_configure(xdgSurface, serial);
+    if (window.mapped) {
+      wl_surface_commit(window.surface);
+      return;
+    }
+    window.mapped = true;
+    wl_surface_attach(window.surface, window.buffer.resource, 0, 0);
+    wl_surface_damage_buffer(window.surface, 0, 0, window.width, window.height);
+    wl_surface_commit(window.surface);
+  }
+
+  constexpr xdg_surface_listener kAuxiliaryXdgSurfaceListener = {
+      .configure = auxiliaryXdgSurfaceConfigure,
+  };
+
+  void auxiliaryToplevelConfigure(void*, xdg_toplevel*, int32_t, int32_t, wl_array*) {}
+
+  void auxiliaryToplevelClose(void* data, xdg_toplevel*) {
+    auto& window = *static_cast<AuxiliaryToplevel*>(data);
+    if (!window.mapped) {
+      return;
+    }
+    window.mapped = false;
+    wl_surface_attach(window.surface, nullptr, 0, 0);
+    wl_surface_commit(window.surface);
+  }
+
+  // Sent only to a toplevel bound at version 4 and 5 or later, which LOG_SUSPENDED asks for.
+  void toplevelConfigureBounds(void*, xdg_toplevel*, int32_t, int32_t) {}
+  void auxiliaryToplevelWmCapabilities(void*, xdg_toplevel*, wl_array*) {}
+  void toplevelWmCapabilities(void* data, xdg_toplevel*, wl_array* capabilities) {
+    auto& state = *static_cast<State*>(data);
+    if (!state.logWmCapabilities) {
+      return;
+    }
+    const auto* values = static_cast<const uint32_t*>(capabilities->data);
+    const size_t count = capabilities->size / sizeof(uint32_t);
+    for (size_t index = 0; index < count; ++index) {
+      switch (values[index]) {
+      case XDG_TOPLEVEL_WM_CAPABILITIES_WINDOW_MENU:
+        std::println("wm-capability=window-menu");
+        break;
+      case XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE:
+        std::println("wm-capability=maximize");
+        break;
+      case XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN:
+        std::println("wm-capability=fullscreen");
+        break;
+      case XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE:
+        std::println("wm-capability=minimize");
+        break;
+      }
+    }
+    std::println("wm-capabilities-done");
+    std::fflush(stdout);
+  }
+
+  constexpr xdg_toplevel_listener kAuxiliaryToplevelListener = {
+      .configure = auxiliaryToplevelConfigure,
+      .close = auxiliaryToplevelClose,
+      .configure_bounds = toplevelConfigureBounds,
+      .wm_capabilities = auxiliaryToplevelWmCapabilities,
+  };
+
+  bool createAuxiliaryToplevel(State& state, AuxiliaryToplevel& window, const char* title, int width, int height) {
+    window.width = width;
+    window.height = height;
+    window.buffer = createBuffer(state, width, height);
+    if (window.buffer.resource == nullptr) {
+      return false;
+    }
+    window.surface = wl_compositor_create_surface(state.compositor);
+    window.xdgSurface = xdg_wm_base_get_xdg_surface(state.wmBase, window.surface);
+    xdg_surface_add_listener(window.xdgSurface, &kAuxiliaryXdgSurfaceListener, &window);
+    window.toplevel = xdg_surface_get_toplevel(window.xdgSurface);
+    xdg_toplevel_add_listener(window.toplevel, &kAuxiliaryToplevelListener, &window);
+    xdg_toplevel_set_title(window.toplevel, title);
+    return true;
+  }
+
+  bool waitForAuxiliaryToplevel(State& state, AuxiliaryToplevel& window) {
+    while (!window.mapped) {
+      if (wl_display_dispatch(state.display) < 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool mapAuxiliaryToplevel(State& state, AuxiliaryToplevel& window, const char* title, int width, int height) {
+    if (!createAuxiliaryToplevel(state, window, title, width, height)) {
+      return false;
+    }
+    wl_surface_commit(window.surface);
+    return waitForAuxiliaryToplevel(state, window);
+  }
+
+  // Sends the restored maximize one compositor dispatch after the mapping commit and before acknowledging the
+  // configure that answers it, the order kitty uses.
+  void maximizeAfterFrameDone(void* data, wl_callback* callback, uint32_t /*time*/) {
+    auto& state = *static_cast<State*>(data);
+    wl_callback_destroy(callback);
+    xdg_toplevel_set_maximized(state.toplevel);
+    wl_surface_commit(state.surface);
+    wl_display_flush(state.display);
+    std::println("maximize-after-frame");
+    std::fflush(stdout);
+  }
+
+  constexpr wl_callback_listener kMaximizeAfterFrameListener = {.done = maximizeAfterFrameDone};
+
+  void exportedHandle(void*, zxdg_exported_v2*, const char* handle) { std::println("exported handle={}", handle); }
+  constexpr zxdg_exported_v2_listener kExportedListener = {.handle = exportedHandle};
+
+  void xdgSurfaceConfigure(void* data, xdg_surface* xdgSurface, uint32_t serial) {
+    auto& state = *static_cast<State*>(data);
+    xdg_surface_ack_configure(xdgSurface, serial);
+    const bool followSize = (state.resizeFillColor || (state.followConfigures && state.mapped))
+        && state.configuredWidth > 0
+        && state.configuredHeight > 0
+        && (state.configuredWidth != state.width || state.configuredHeight != state.height);
+    if (followSize) {
+      if (state.mapped && state.resizeFillColor) {
+        state.fillColor = *state.resizeFillColor;
+      }
+      state.width = state.configuredWidth;
+      state.height = state.configuredHeight;
+      state.buffer = createBuffer(state, state.width, state.height);
+    }
+    if (state.mapped) {
+      if (followSize) {
+        wl_surface_attach(state.surface, state.buffer.resource, 0, 0);
+        wl_surface_damage_buffer(state.surface, 0, 0, state.width, state.height);
+      }
+      // Apply later toplevel state transitions, such as leaving fullscreen. Acknowledging the configure without a
+      // surface commit leaves the requested state pending forever.
+      wl_surface_commit(state.surface);
+      return;
+    }
+    if (state.closed) {
+      return;
+    }
+    if (state.requestMaximizedAfterConfigure && !state.maximizeRequested) {
+      xdg_toplevel_set_maximized(state.toplevel);
+      wl_surface_commit(state.surface);
+      state.maximizeRequested = true;
+      return;
+    }
+    if (state.parentOnFirstConfigure != nullptr) {
+      // The parent's map commit is queued ahead of this one in the same flush, so the compositor has it mapped by the
+      // time it reads this request.
+      xdg_toplevel_set_parent(state.toplevel, state.parentOnFirstConfigure);
+    }
+    state.mapped = true;
+    wl_surface_attach(state.surface, state.buffer.resource, 0, 0);
+    wl_surface_damage_buffer(state.surface, 0, 0, state.width, state.height);
+    wl_surface_commit(state.surface);
+    if (state.requestMaximizedAfterMap && !state.maximizeRequested) {
+      // Queue the mapping commit first so the compositor observes this as a
+      // post-map session-state re-assertion in the same opening batch.
+      xdg_toplevel_set_maximized(state.toplevel);
+      wl_surface_commit(state.surface);
+      state.maximizeRequested = true;
+    }
+    if (state.requestMaximizedAfterFrame && !state.maximizeRequested) {
+      wl_callback_add_listener(wl_display_sync(state.display), &kMaximizeAfterFrameListener, &state);
+      state.maximizeRequested = true;
+    }
+    if (state.requestFullscreen && !state.fullscreenRequested) {
+      xdg_toplevel_set_fullscreen(state.toplevel, nullptr);
+      wl_surface_commit(state.surface);
+      state.fullscreenRequested = true;
+    }
+    std::println("mapped");
+    std::fflush(stdout);
+  }
+
+  constexpr xdg_surface_listener kXdgSurfaceListener = {
+      .configure = xdgSurfaceConfigure,
+  };
+
+  void toplevelConfigure(void* data, xdg_toplevel*, int32_t width, int32_t height, wl_array* states) {
+    auto& state = *static_cast<State*>(data);
+    state.configuredWidth = width;
+    state.configuredHeight = height;
+    bool fullscreen = false;
+    if (state.logConfigures) {
+      std::println("configured-size={}x{}", width, height);
+    }
+    const auto* configured = static_cast<const uint32_t*>(states->data);
+    const size_t count = states->size / sizeof(uint32_t);
+    bool suspended = false;
+    for (size_t index = 0; index < count; ++index) {
+      fullscreen = fullscreen || configured[index] == XDG_TOPLEVEL_STATE_FULLSCREEN;
+      suspended = suspended || configured[index] == XDG_TOPLEVEL_STATE_SUSPENDED;
+      if (configured[index] == XDG_TOPLEVEL_STATE_MAXIMIZED) {
+        std::println("configured-maximized");
+      }
+    }
+    if (state.logConfigures) {
+      std::println("configured-state={}x{} {}", width, height, fullscreen ? "fullscreen" : "windowed");
+    }
+    if (state.logSuspended && suspended != state.suspended) {
+      state.suspended = suspended;
+      std::println("{}", suspended ? "suspended" : "resumed");
+    }
+    std::fflush(stdout);
+  }
+
+  void toplevelClose(void* data, xdg_toplevel*) {
+    auto& state = *static_cast<State*>(data);
+    if (!state.mapped) {
+      return;
+    }
+    if (state.redrawOnClose) {
+      wl_surface_damage_buffer(state.surface, 0, 0, state.width, state.height);
+      wl_surface_commit(state.surface);
+      if (state.redrawOnceOnClose) {
+        state.redrawOnClose = false;
+      }
+      std::println("redrawn");
+      std::fflush(stdout);
+      return;
+    }
+    if (state.colorChildLifecycle) {
+      if (state.colorChildLifecyclePhase == 0) {
+        wl_surface_attach(state.colorChildSurface, state.colorChildBuffer.resource, 0, 0);
+        wl_surface_damage_buffer(state.colorChildSurface, 0, 0, state.width, state.height);
+        wl_surface_commit(state.colorChildSurface);
+        ++state.colorChildLifecyclePhase;
+        std::println("color-child-mapped");
+        std::fflush(stdout);
+        return;
+      }
+      if (state.colorChildLifecyclePhase == 1) {
+        wp_color_management_surface_v1_set_image_description(
+            state.colorSurface, state.imageDescription, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL
+        );
+        wl_surface_commit(state.colorChildSurface);
+        ++state.colorChildLifecyclePhase;
+        std::println("color-child-hdr");
+        std::fflush(stdout);
+        return;
+      }
+      if (state.colorChildLifecyclePhase == 2) {
+        wl_surface_attach(state.colorChildSurface, nullptr, 0, 0);
+        wl_surface_commit(state.colorChildSurface);
+        ++state.colorChildLifecyclePhase;
+        std::println("color-child-unmapped");
+        std::fflush(stdout);
+        return;
+      }
+    }
+    state.mapped = false;
+    state.closed = true;
+    // Attaching a null buffer unmaps the surface; the toplevel stays alive.
+    wl_surface_attach(state.surface, nullptr, 0, 0);
+    wl_surface_commit(state.surface);
+    std::println("unmapped");
+    std::fflush(stdout);
+  }
+
+  constexpr xdg_toplevel_listener kToplevelListener = {
+      .configure = toplevelConfigure,
+      .close = toplevelClose,
+      .configure_bounds = toplevelConfigureBounds,
+      .wm_capabilities = toplevelWmCapabilities,
+  };
+
+  void wmBasePing(void*, xdg_wm_base* wmBase, uint32_t serial) { xdg_wm_base_pong(wmBase, serial); }
+
+  constexpr xdg_wm_base_listener kWmBaseListener = {
+      .ping = wmBasePing,
+  };
+
+  void registryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
+    auto& state = *static_cast<State*>(data);
+    if (std::strcmp(interface, wl_compositor_interface.name) == 0) {
+      state.compositor = static_cast<wl_compositor*>(wl_registry_bind(registry, name, &wl_compositor_interface, 4));
+    } else if (std::strcmp(interface, wl_subcompositor_interface.name) == 0) {
+      state.subcompositor =
+          static_cast<wl_subcompositor*>(wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+    } else if (std::strcmp(interface, wl_shm_interface.name) == 0) {
+      state.shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+    } else if (std::strcmp(interface, xdg_wm_base_interface.name) == 0) {
+      const uint32_t wanted = state.logSuspended ? 6U : (state.logWmCapabilities ? 5U : 1U);
+      state.wmBase = static_cast<xdg_wm_base*>(
+          wl_registry_bind(registry, name, &xdg_wm_base_interface, std::min(version, wanted))
+      );
+      xdg_wm_base_add_listener(state.wmBase, &kWmBaseListener, &state);
+    } else if (std::strcmp(interface, xdg_activation_v1_interface.name) == 0) {
+      state.activation = static_cast<xdg_activation_v1*>(
+          wl_registry_bind(registry, name, &xdg_activation_v1_interface, std::min(version, 1U))
+      );
+    } else if (std::strcmp(interface, xdg_toplevel_tag_manager_v1_interface.name) == 0) {
+      state.xdgTagManager = static_cast<xdg_toplevel_tag_manager_v1*>(
+          wl_registry_bind(registry, name, &xdg_toplevel_tag_manager_v1_interface, std::min(version, 1U))
+      );
+    } else if (std::strcmp(interface, xdg_wm_dialog_v1_interface.name) == 0) {
+      state.dialogManager = static_cast<xdg_wm_dialog_v1*>(
+          wl_registry_bind(registry, name, &xdg_wm_dialog_v1_interface, std::min(version, 1U))
+      );
+    } else if (std::strcmp(interface, zxdg_exporter_v2_interface.name) == 0) {
+      state.exporter = static_cast<zxdg_exporter_v2*>(wl_registry_bind(registry, name, &zxdg_exporter_v2_interface, 1));
+    } else if (std::strcmp(interface, zxdg_importer_v2_interface.name) == 0) {
+      state.importer = static_cast<zxdg_importer_v2*>(wl_registry_bind(registry, name, &zxdg_importer_v2_interface, 1));
+    } else if (std::strcmp(interface, wp_content_type_manager_v1_interface.name) == 0) {
+      state.contentTypeManager = static_cast<wp_content_type_manager_v1*>(
+          wl_registry_bind(registry, name, &wp_content_type_manager_v1_interface, std::min(version, 1U))
+      );
+    } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
+      state.seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 2U)));
+      wl_seat_add_listener(state.seat, &kSeatListener, &state);
+    } else if (std::strcmp(interface, wp_color_manager_v1_interface.name) == 0) {
+      state.colorManager = static_cast<wp_color_manager_v1*>(
+          wl_registry_bind(registry, name, &wp_color_manager_v1_interface, std::min(version, kColorManagerVersion))
+      );
+      wp_color_manager_v1_add_listener(state.colorManager, &kColorManagerListener, &state);
+    } else if (std::strcmp(interface, wp_tearing_control_manager_v1_interface.name) == 0) {
+      state.tearingManager = static_cast<wp_tearing_control_manager_v1*>(
+          wl_registry_bind(registry, name, &wp_tearing_control_manager_v1_interface, std::min(version, 1U))
+      );
+    }
+  }
+
+  void registryGlobalRemove(void*, wl_registry*, uint32_t) {}
+
+  constexpr wl_registry_listener kRegistryListener = {
+      .global = registryGlobal,
+      .global_remove = registryGlobalRemove,
+  };
+
+  void destroyBuffer(Buffer& buffer) {
+    if (buffer.resource != nullptr) {
+      wl_buffer_destroy(buffer.resource);
+    }
+    if (buffer.pixels != MAP_FAILED) {
+      munmap(buffer.pixels, buffer.size);
+    }
+  }
+
+  bool activateWithToken(State& state, const char* token) {
+    if (state.activation == nullptr) {
+      std::println(stderr, "unmap-client: compositor is missing xdg_activation_v1");
+      return false;
+    }
+    if (token == nullptr || token[0] == '\0') {
+      std::println(stderr, "unmap-client: activation token is empty");
+      return false;
+    }
+    xdg_activation_v1_activate(state.activation, token, state.surface);
+    std::println("activation-sent");
+    std::fflush(stdout);
+    return true;
+  }
+
+  bool activateFromFile(State& state, const char* path) {
+    if (path == nullptr) {
+      std::println(stderr, "unmap-client: activation command needs ACTIVATION_TOKEN_FILE");
+      return false;
+    }
+    FILE* file = std::fopen(path, "r");
+    if (file == nullptr) {
+      std::println(stderr, "unmap-client: cannot open activation token file");
+      return false;
+    }
+    char token[256]{};
+    const bool readToken = std::fgets(token, sizeof(token), file) != nullptr;
+    std::fclose(file);
+    token[std::strcspn(token, "\r\n")] = '\0';
+    if (!readToken || token[0] == '\0') {
+      std::println(stderr, "unmap-client: activation token file is empty");
+      return false;
+    }
+    return activateWithToken(state, token);
+  }
+
+  void queueRemap(State& state) {
+    state.closed = false;
+    xdg_toplevel_set_title(state.toplevel, state.title);
+    if (state.remapAppId != nullptr) {
+      xdg_toplevel_set_app_id(state.toplevel, state.remapAppId);
+    }
+    wl_surface_attach(state.surface, nullptr, 0, 0);
+    wl_surface_commit(state.surface);
+    std::println("remap-requested");
+    std::fflush(stdout);
+  }
+
+  void clientActivationTokenDone(void* data, xdg_activation_token_v1* activationToken, const char* token) {
+    auto& state = *static_cast<State*>(data);
+    xdg_activation_v1_activate(state.activation, token, state.surface);
+    xdg_activation_token_v1_destroy(activationToken);
+    std::println("activation-sent");
+    std::fflush(stdout);
+    if (!state.mapped) {
+      queueRemap(state);
+    }
+  }
+
+  constexpr xdg_activation_token_v1_listener kActivationTokenListener = {
+      .done = clientActivationTokenDone,
+  };
+
+  bool activateWithClientToken(State& state) {
+    if (state.activation == nullptr) {
+      std::println(stderr, "unmap-client: compositor is missing xdg_activation_v1");
+      return false;
+    }
+    xdg_activation_token_v1* token = xdg_activation_v1_get_activation_token(state.activation);
+    if (token == nullptr) {
+      std::println(stderr, "unmap-client: failed to create activation token");
+      return false;
+    }
+    xdg_activation_token_v1_add_listener(token, &kActivationTokenListener, &state);
+    xdg_activation_token_v1_set_surface(token, state.surface);
+    xdg_activation_token_v1_commit(token);
+    std::println("activation-requested");
+    std::fflush(stdout);
+    return true;
+  }
+
+  void inputActivationTokenDone(void* data, xdg_activation_token_v1* activationToken, const char* token) {
+    auto& state = *static_cast<State*>(data);
+    FILE* file = std::fopen(state.activationTokenFile, "w");
+    if (file == nullptr || std::fprintf(file, "%s\n", token) < 0) {
+      std::println(stderr, "unmap-client: cannot write input activation token");
+    } else {
+      std::println("input-activation-token-written");
+      std::fflush(stdout);
+    }
+    if (file != nullptr) {
+      std::fclose(file);
+    }
+    xdg_activation_token_v1_destroy(activationToken);
+  }
+
+  constexpr xdg_activation_token_v1_listener kInputActivationTokenListener = {
+      .done = inputActivationTokenDone,
+  };
+
+  bool issueInputActivationToken(State& state) {
+    if (state.activation == nullptr
+        || state.seat == nullptr
+        || state.activationTokenFile == nullptr
+        || !state.mapped
+        || !state.keyboardFocused
+        || state.inputSerial == 0) {
+      std::println(stderr, "unmap-client: input activation token needs a focused key press and output file");
+      return false;
+    }
+    xdg_activation_token_v1* token = xdg_activation_v1_get_activation_token(state.activation);
+    if (token == nullptr) {
+      std::println(stderr, "unmap-client: failed to create input activation token");
+      return false;
+    }
+    xdg_activation_token_v1_add_listener(token, &kInputActivationTokenListener, &state);
+    xdg_activation_token_v1_set_serial(token, state.inputSerial, state.seat);
+    xdg_activation_token_v1_set_surface(token, state.surface);
+    xdg_activation_token_v1_commit(token);
+    state.inputSerial = 0;
+    std::println("input-activation-token-requested");
+    std::fflush(stdout);
+    return true;
+  }
+
+  void destroyAuxiliaryToplevel(AuxiliaryToplevel& window) {
+    if (window.toplevel != nullptr) {
+      xdg_toplevel_destroy(window.toplevel);
+    }
+    if (window.xdgSurface != nullptr) {
+      xdg_surface_destroy(window.xdgSurface);
+    }
+    if (window.surface != nullptr) {
+      wl_surface_destroy(window.surface);
+    }
+    destroyBuffer(window.buffer);
+  }
+
+} // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--color-manager-version") == 0) {
+    std::println("{}", kColorManagerVersion);
+    return EXIT_SUCCESS;
+  }
+
+  State state;
+  state.title = argc > 1 ? argv[1] : "unmap-client";
+  state.appId = std::getenv("APP_ID");
+  state.remapAppId = std::getenv("APP_ID_AFTER_ACTIVATION");
+  if (state.remapAppId == nullptr) {
+    state.remapAppId = state.appId;
+  }
+  const bool remapOnStdin = std::getenv("REMAP_ON_STDIN") != nullptr;
+  const bool activateOnStart = std::getenv("ACTIVATE_ON_START") != nullptr;
+  const bool mapOnStdin = std::getenv("MAP_ON_STDIN") != nullptr;
+  state.activationTokenFile = std::getenv("ACTIVATION_TOKEN_FILE");
+  const char* initialContentType = std::getenv("CONTENT_TYPE");
+  const char* updatedContentType = std::getenv("CONTENT_TYPE_AFTER_MAP");
+  const char* initialXdgTag = std::getenv("XDG_TAG");
+  const char* updatedXdgTag = std::getenv("XDG_TAG_AFTER_MAP");
+  const char* updatedTitle = std::getenv("TITLE_AFTER_MAP");
+  // A toplevel that never sets a title, which is distinct from one that sets an empty title.
+  const bool skipTitle = std::getenv("NO_TITLE") != nullptr;
+  const bool maximizeOnStdin = std::getenv("MAXIMIZE_ON_STDIN") != nullptr;
+  const bool minimizeOnStdin = std::getenv("MINIMIZE_ON_STDIN") != nullptr;
+  const bool fullscreenOnStdin = std::getenv("FULLSCREEN_ON_STDIN") != nullptr;
+  const bool repaintOnStdin = std::getenv("REPAINT_ON_STDIN") != nullptr;
+  const bool updateOnStdin = repaintOnStdin
+      || updatedContentType != nullptr
+      || updatedXdgTag != nullptr
+      || updatedTitle != nullptr
+      || maximizeOnStdin
+      || minimizeOnStdin
+      || fullscreenOnStdin;
+  if (parseContentType(initialContentType) < 0 || parseContentType(updatedContentType) < 0) {
+    std::println(stderr, "unmap-client: CONTENT_TYPE values must be none, photo, video, or game");
+    return EXIT_FAILURE;
+  }
+  if (const char* redraw = std::getenv("REDRAW_ON_CLOSE")) {
+    state.redrawOnClose = true;
+    state.redrawOnceOnClose = std::string_view(redraw) == "once";
+  }
+  state.requestMaximized = std::getenv("REQUEST_MAXIMIZED") != nullptr;
+  state.requestMaximizedAfterConfigure = std::getenv("REQUEST_MAXIMIZED_AFTER_CONFIGURE") != nullptr;
+  state.requestMaximizedAfterMap = std::getenv("REQUEST_MAXIMIZED_AFTER_MAP") != nullptr;
+  state.requestMaximizedAfterFrame = std::getenv("REQUEST_MAXIMIZED_AFTER_FRAME") != nullptr;
+  state.logConfigures = std::getenv("LOG_CONFIGURES") != nullptr;
+  state.logSuspended = std::getenv("LOG_SUSPENDED") != nullptr;
+  state.logWmCapabilities = std::getenv("LOG_WM_CAPABILITIES") != nullptr;
+  state.followConfigures = std::getenv("FOLLOW_CONFIGURES") != nullptr;
+  state.requestFullscreen = std::getenv("REQUEST_FULLSCREEN") != nullptr;
+  state.requestHdr = std::getenv("COLOR_HDR") != nullptr;
+  state.requestWindowsScrgb = std::getenv("COLOR_WINDOWS_SCRGB") != nullptr;
+  state.requestWindowsBt2100 = std::getenv("COLOR_WINDOWS_BT2100") != nullptr;
+  state.colorOnSubsurface = std::getenv("COLOR_ON_SUBSURFACE") != nullptr;
+  state.contentTypeOnSubsurface = std::getenv("CONTENT_TYPE_ON_SUBSURFACE") != nullptr;
+  state.colorChildLifecycle = std::getenv("COLOR_CHILD_LIFECYCLE") != nullptr;
+  if (const char* hint = std::getenv("TEARING_HINT")) {
+    if (std::strcmp(hint, "async") == 0) {
+      state.tearingHint = WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
+    } else if (std::strcmp(hint, "vsync") == 0) {
+      state.tearingHint = WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC;
+    } else {
+      std::println(stderr, "unmap-client: TEARING_HINT must be async or vsync");
+      return EXIT_FAILURE;
+    }
+  }
+  if (const char* fill = std::getenv("FILL_COLOR")) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(fill, &end, 0);
+    if (*fill == '\0' || end == nullptr || *end != '\0' || errno != 0 || value > 0xFFFFFFFFUL) {
+      std::println(stderr, "unmap-client: FILL_COLOR must be a 32-bit ARGB value");
+      return EXIT_FAILURE;
+    }
+    state.fillColor = static_cast<uint32_t>(value);
+  }
+  if (const char* fill = std::getenv("RESIZE_FILL_COLOR")) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(fill, &end, 0);
+    if (*fill == '\0' || end == nullptr || *end != '\0' || errno != 0 || value > 0xFFFFFFFFUL) {
+      std::println(stderr, "unmap-client: RESIZE_FILL_COLOR must be a 32-bit ARGB value");
+      return EXIT_FAILURE;
+    }
+    state.resizeFillColor = static_cast<uint32_t>(value);
+  }
+  if (argc > 2) {
+    state.width = std::max(1, std::stoi(argv[2]));
+  }
+  if (argc > 3) {
+    state.height = std::max(1, std::stoi(argv[3]));
+  }
+  state.display = wl_display_connect(nullptr);
+  if (state.display == nullptr) {
+    std::println(stderr, "unmap-client: cannot connect to WAYLAND_DISPLAY");
+    return EXIT_FAILURE;
+  }
+
+  wl_registry* registry = wl_display_get_registry(state.display);
+  wl_registry_add_listener(registry, &kRegistryListener, &state);
+  wl_display_roundtrip(state.display);
+  wl_display_roundtrip(state.display);
+
+  if (state.compositor == nullptr || state.shm == nullptr || state.wmBase == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing a required Wayland global");
+    return EXIT_FAILURE;
+  }
+  if (state.activationTokenFile != nullptr && state.activation == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing xdg_activation_v1");
+    return EXIT_FAILURE;
+  }
+  if ((initialContentType != nullptr || updatedContentType != nullptr) && state.contentTypeManager == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing wp_content_type_manager_v1");
+    return EXIT_FAILURE;
+  }
+  if ((initialXdgTag != nullptr || updatedXdgTag != nullptr) && state.xdgTagManager == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing xdg_toplevel_tag_manager_v1");
+    return EXIT_FAILURE;
+  }
+
+  state.buffer = createBuffer(state, state.width, state.height);
+  if (state.buffer.resource == nullptr) {
+    std::println(stderr, "unmap-client: failed to allocate shared-memory buffer");
+    return EXIT_FAILURE;
+  }
+
+  const char* transientSuiteMode = std::getenv("TRANSIENT_SUITE");
+  const bool transientSuite = transientSuiteMode != nullptr;
+  const bool clearUnmappedTransientParent =
+      transientSuite && std::strcmp(transientSuiteMode, "unmapped-parent-cleared") == 0;
+  const bool unmappedTransientParent =
+      clearUnmappedTransientParent || (transientSuite && std::strcmp(transientSuiteMode, "unmapped-parent") == 0);
+  const bool mappedTogether = transientSuite && std::strcmp(transientSuiteMode, "mapped-together") == 0;
+  const bool parentInitialCommitOnly = unmappedTransientParent || mappedTogether;
+  const bool transientModal = std::getenv("TRANSIENT_MODAL") != nullptr;
+  const bool dialogOnStdin = transientSuite && std::getenv("TRANSIENT_DIALOG_ON_STDIN") != nullptr;
+  const bool nestedOnStdin = transientSuite && std::getenv("TRANSIENT_NESTED_ON_STDIN") != nullptr;
+  if ((transientModal || dialogOnStdin || nestedOnStdin) && state.dialogManager == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing xdg_wm_dialog_v1");
+    return EXIT_FAILURE;
+  }
+  const bool exportParent = transientSuite && std::getenv("EXPORT_PARENT") != nullptr;
+  if (exportParent && state.exporter == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing zxdg_exporter_v2");
+    return EXIT_FAILURE;
+  }
+  const char* foreignHandle = std::getenv("TRANSIENT_FOREIGN_HANDLE");
+  const bool foreignParentOnStdin = std::getenv("TRANSIENT_FOREIGN_PARENT_ON_STDIN") != nullptr;
+  if (foreignParentOnStdin && foreignHandle == nullptr) {
+    std::println(stderr, "unmap-client: TRANSIENT_FOREIGN_PARENT_ON_STDIN requires TRANSIENT_FOREIGN_HANDLE");
+    return EXIT_FAILURE;
+  }
+  if (foreignHandle != nullptr && state.importer == nullptr) {
+    std::println(stderr, "unmap-client: compositor is missing zxdg_importer_v2");
+    return EXIT_FAILURE;
+  }
+  int parentWidth = state.width;
+  int parentHeight = state.height;
+  if (const char* size = std::getenv("TRANSIENT_PARENT_SIZE"); size != nullptr) {
+    const auto parsed = harness::parseInts<int, 2>(size, 'x');
+    if (!parsed || (*parsed)[0] < 1 || (*parsed)[1] < 1) {
+      std::println(stderr, "unmap-client: TRANSIENT_PARENT_SIZE must be <width>x<height>");
+      return EXIT_FAILURE;
+    }
+    parentWidth = (*parsed)[0];
+    parentHeight = (*parsed)[1];
+  }
+  AuxiliaryToplevel transientParent;
+  AuxiliaryToplevel transientUnrelated;
+  AuxiliaryToplevel transientNested;
+  if (transientSuite) {
+    const bool supportReady = parentInitialCommitOnly
+        ? createAuxiliaryToplevel(state, transientParent, "transient-parent", parentWidth, parentHeight)
+        : mapAuxiliaryToplevel(state, transientParent, "transient-parent", parentWidth, parentHeight)
+            && mapAuxiliaryToplevel(state, transientUnrelated, "transient-unrelated", state.width, state.height);
+    if (!supportReady) {
+      std::println(stderr, "unmap-client: failed to create transient-suite support windows");
+      return EXIT_FAILURE;
+    }
+    if (parentInitialCommitOnly) {
+      // Queue the parent's initial commit without dispatching its configure. The child therefore sends set_parent
+      // while this toplevel is still unmapped, or, mapped together, its configure arrives in the same read as the
+      // child's and its map commit goes out in the same flush.
+      wl_surface_commit(transientParent.surface);
+    }
+  }
+  if (nestedOnStdin) {
+    if (!createAuxiliaryToplevel(state, transientNested, "transient-nested", state.width, state.height)) {
+      std::println(stderr, "unmap-client: failed to create the nested dialog");
+      return EXIT_FAILURE;
+    }
+    xdg_dialog_v1_set_modal(xdg_wm_dialog_v1_get_xdg_dialog(state.dialogManager, transientNested.toplevel));
+    wl_surface_commit(transientNested.surface);
+    if (!waitForAuxiliaryToplevel(state, transientNested)) {
+      return EXIT_FAILURE;
+    }
+  }
+  if (exportParent) {
+    zxdg_exported_v2_add_listener(
+        zxdg_exporter_v2_export_toplevel(state.exporter, transientParent.surface), &kExportedListener, nullptr
+    );
+  }
+
+  state.surface = wl_compositor_create_surface(state.compositor);
+  if (state.tearingHint >= 0) {
+    if (state.tearingManager == nullptr) {
+      std::println(stderr, "unmap-client: compositor is missing wp_tearing_control_manager_v1");
+      return EXIT_FAILURE;
+    }
+    state.tearingControl = wp_tearing_control_manager_v1_get_tearing_control(state.tearingManager, state.surface);
+    wp_tearing_control_v1_set_presentation_hint(state.tearingControl, static_cast<uint32_t>(state.tearingHint));
+  }
+  const bool deferContentTypeChild = state.contentTypeOnSubsurface
+      && !state.colorOnSubsurface
+      && initialContentType == nullptr
+      && updatedContentType != nullptr;
+  const auto createRenderingChildSurface = [&] {
+    if (state.colorChildSurface != nullptr) {
+      return true;
+    }
+    state.colorChildBuffer = createBuffer(state, state.width, state.height);
+    if (state.colorChildBuffer.resource == nullptr) {
+      return false;
+    }
+    state.colorChildSurface = wl_compositor_create_surface(state.compositor);
+    return state.colorChildSurface != nullptr;
+  };
+  const auto attachRenderingChild = [&] {
+    if (state.colorChildSubsurface != nullptr) {
+      return true;
+    }
+    if (state.colorChildSurface == nullptr) {
+      return false;
+    }
+    state.colorChildSubsurface =
+        wl_subcompositor_get_subsurface(state.subcompositor, state.colorChildSurface, state.surface);
+    if (state.colorChildSubsurface == nullptr) {
+      return false;
+    }
+    wl_subsurface_set_desync(state.colorChildSubsurface);
+    return true;
+  };
+  wl_surface* colorTargetSurface = state.surface;
+  if (state.colorOnSubsurface || (state.contentTypeOnSubsurface && !deferContentTypeChild)) {
+    if (state.subcompositor == nullptr) {
+      std::println(stderr, "unmap-client: compositor is missing wl_subcompositor");
+      return EXIT_FAILURE;
+    }
+    if (!createRenderingChildSurface() || !attachRenderingChild()) {
+      std::println(stderr, "unmap-client: failed to create rendering child");
+      return EXIT_FAILURE;
+    }
+    if (state.colorOnSubsurface) {
+      colorTargetSurface = state.colorChildSurface;
+    }
+  }
+  if ((initialContentType != nullptr || updatedContentType != nullptr) && !deferContentTypeChild) {
+    state.contentTypeSurface = state.contentTypeOnSubsurface ? state.colorChildSurface : state.surface;
+    state.contentType =
+        wp_content_type_manager_v1_get_surface_content_type(state.contentTypeManager, state.contentTypeSurface);
+    if (initialContentType != nullptr) {
+      wp_content_type_v1_set_content_type(
+          state.contentType, static_cast<uint32_t>(parseContentType(initialContentType))
+      );
+    }
+  }
+  if (state.requestHdr || state.requestWindowsScrgb || state.requestWindowsBt2100) {
+    if (state.colorManager == nullptr) {
+      std::println(stderr, "unmap-client: compositor is missing wp_color_manager_v1");
+      return EXIT_FAILURE;
+    }
+    if (state.requestWindowsScrgb
+        && (!state.colorManagerDone || !state.hasExtendedTargetVolume || !state.hasWindowsScrgb)) {
+      std::println(stderr, "unmap-client: compositor is missing Wine scRGB color-management features");
+      return EXIT_FAILURE;
+    }
+#ifdef WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION
+    if (state.requestWindowsBt2100 && (!state.colorManagerDone || !state.hasWindowsBt2100)) {
+      std::println(stderr, "unmap-client: compositor is missing Windows BT.2100 color-management support");
+      return EXIT_FAILURE;
+    }
+#else
+    if (state.requestWindowsBt2100) {
+      std::println(stderr, "unmap-client: Windows BT.2100 requires wayland-protocols 1.49");
+      return EXIT_FAILURE;
+    }
+#endif
+    state.colorSurface = wp_color_manager_v1_get_surface(state.colorManager, colorTargetSurface);
+    if (state.requestWindowsScrgb) {
+      state.imageDescription = wp_color_manager_v1_create_windows_scrgb(state.colorManager);
+#ifdef WP_COLOR_MANAGER_V1_CREATE_WINDOWS_BT2100_SINCE_VERSION
+    } else if (state.requestWindowsBt2100) {
+      state.imageDescription = wp_color_manager_v1_create_windows_bt2100(state.colorManager);
+#endif
+    } else {
+      wp_image_description_creator_params_v1* params =
+          wp_color_manager_v1_create_parametric_creator(state.colorManager);
+      wp_image_description_creator_params_v1_set_tf_named(params, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+      wp_image_description_creator_params_v1_set_primaries_named(params, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+      state.imageDescription = wp_image_description_creator_params_v1_create(params);
+    }
+    wp_image_description_v1_add_listener(state.imageDescription, &kImageDescriptionListener, &state);
+    while (!state.imageDescriptionReady && !state.imageDescriptionFailed && wl_display_roundtrip(state.display) >= 0) {
+    }
+    if (!state.imageDescriptionReady) {
+      return EXIT_FAILURE;
+    }
+    if (!state.colorChildLifecycle) {
+      wp_color_management_surface_v1_set_image_description(
+          state.colorSurface, state.imageDescription, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL
+      );
+    }
+  }
+  if (state.colorChildSurface != nullptr && !state.colorChildLifecycle) {
+    wl_surface_attach(state.colorChildSurface, state.colorChildBuffer.resource, 0, 0);
+    wl_surface_damage_buffer(state.colorChildSurface, 0, 0, state.width, state.height);
+    wl_surface_commit(state.colorChildSurface);
+  }
+  state.xdgSurface = xdg_wm_base_get_xdg_surface(state.wmBase, state.surface);
+  xdg_surface_add_listener(state.xdgSurface, &kXdgSurfaceListener, &state);
+  state.toplevel = xdg_surface_get_toplevel(state.xdgSurface);
+  xdg_toplevel_add_listener(state.toplevel, &kToplevelListener, &state);
+  if (!skipTitle) {
+    xdg_toplevel_set_title(state.toplevel, state.title);
+  }
+  if (state.appId != nullptr) {
+    xdg_toplevel_set_app_id(state.toplevel, state.appId);
+  }
+  if (initialXdgTag != nullptr) {
+    xdg_toplevel_tag_manager_v1_set_toplevel_tag(state.xdgTagManager, state.toplevel, initialXdgTag);
+  }
+  if (state.requestMaximized) {
+    // A restored client state is requested before the initial commit. This lets
+    // the compositor include it in the first configure instead of treating it
+    // as a post-map maximize request.
+    xdg_toplevel_set_maximized(state.toplevel);
+  }
+  if (mappedTogether) {
+    state.parentOnFirstConfigure = transientParent.toplevel;
+  } else if (transientSuite) {
+    xdg_toplevel_set_parent(state.toplevel, transientParent.toplevel);
+    if (clearUnmappedTransientParent) {
+      xdg_toplevel_set_parent(state.toplevel, nullptr);
+    }
+  }
+  xdg_dialog_v1* dialog = nullptr;
+  if (transientModal || dialogOnStdin) {
+    dialog = xdg_wm_dialog_v1_get_xdg_dialog(state.dialogManager, state.toplevel);
+    if (transientModal) {
+      xdg_dialog_v1_set_modal(dialog);
+    }
+  }
+  zxdg_imported_v2* imported = nullptr;
+  if (foreignHandle != nullptr) {
+    imported = zxdg_importer_v2_import_toplevel(state.importer, foreignHandle);
+    if (!foreignParentOnStdin) {
+      zxdg_imported_v2_set_parent_of(imported, state.surface);
+    }
+  }
+  if (activateOnStart && !activateWithToken(state, std::getenv("XDG_ACTIVATION_TOKEN"))) {
+    return EXIT_FAILURE;
+  }
+  if (mapOnStdin) {
+    if (wl_display_roundtrip(state.display) < 0) {
+      return EXIT_FAILURE;
+    }
+    std::println("map-pending");
+    std::fflush(stdout);
+    char command = 0;
+    if (read(STDIN_FILENO, &command, 1) <= 0) {
+      std::println(stderr, "unmap-client: MAP_ON_STDIN could not read its map command");
+      return EXIT_FAILURE;
+    }
+  }
+  wl_surface_commit(state.surface);
+
+  if (!remapOnStdin && !updateOnStdin && !dialogOnStdin && !nestedOnStdin && !foreignParentOnStdin) {
+    while (wl_display_dispatch(state.display) >= 0) {
+    }
+  } else {
+    bool foreignParentApplied = false;
+    pollfd sources[2] = {
+        {.fd = wl_display_get_fd(state.display), .events = POLLIN, .revents = 0},
+        {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
+    };
+    while (wl_display_dispatch_pending(state.display) >= 0) {
+      wl_display_flush(state.display);
+      int ready = 0;
+      do {
+        ready = poll(sources, 2, -1);
+      } while (ready < 0 && errno == EINTR);
+      if (ready < 0 || (sources[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        break;
+      }
+      if ((sources[1].revents & POLLIN) != 0) {
+        // A stdin handler's roundtrip can drain this POLLIN's events; dispatching stale readiness blocks forever.
+        sources[0].revents = 0;
+        char command = 0;
+        if (read(STDIN_FILENO, &command, 1) > 0) {
+          if (repaintOnStdin && state.mapped && (command == 'R' || command == 'G' || command == 'B')) {
+            state.repaintColor = command == 'R' ? 0xFFFF0000 : command == 'G' ? 0xFF00FF00 : 0xFF0000FF;
+            if (state.repaintFrame == nullptr) {
+              state.repaintFrame = wl_surface_frame(state.surface);
+              wl_callback_add_listener(state.repaintFrame, &kRepaintListener, &state);
+              wl_surface_commit(state.surface);
+            }
+          } else if (command == 'a') {
+            if (!activateFromFile(state, state.activationTokenFile)) {
+              return EXIT_FAILURE;
+            }
+            if (!state.mapped && remapOnStdin) {
+              queueRemap(state);
+            }
+          } else if (command == 'c') {
+            if (!activateWithClientToken(state)) {
+              return EXIT_FAILURE;
+            }
+          } else if (command == 'i') {
+            if (!issueInputActivationToken(state)) {
+              return EXIT_FAILURE;
+            }
+          } else if (dialogOnStdin && dialog != nullptr && (command == 'm' || command == 'n' || command == 'x')) {
+            if (command == 'm') {
+              xdg_dialog_v1_set_modal(dialog);
+            } else if (command == 'n') {
+              xdg_dialog_v1_unset_modal(dialog);
+            } else {
+              xdg_dialog_v1_destroy(dialog);
+              dialog = nullptr;
+            }
+          } else if (nestedOnStdin && command == 'p') {
+            xdg_toplevel_set_parent(transientNested.toplevel, state.toplevel);
+            wl_display_roundtrip(state.display);
+            std::println("nested-parent-set");
+            std::fflush(stdout);
+          } else if (
+              state.mapped && foreignParentOnStdin && !foreignParentApplied && imported != nullptr && command == 'p'
+          ) {
+            zxdg_imported_v2_set_parent_of(imported, state.surface);
+            wl_display_flush(state.display);
+            foreignParentApplied = true;
+            std::println("foreign-parent-set");
+            std::fflush(stdout);
+          } else if (state.mapped && maximizeOnStdin && command == 's') {
+            wl_surface_commit(state.surface);
+            if (wl_display_roundtrip(state.display) < 0) {
+              return EXIT_FAILURE;
+            }
+            std::println("surface-committed");
+            std::fflush(stdout);
+          } else if (state.mapped && maximizeOnStdin && command == 'm') {
+            xdg_toplevel_set_maximized(state.toplevel);
+            wl_surface_commit(state.surface);
+            wl_display_flush(state.display);
+            std::println("maximize-requested");
+            std::fflush(stdout);
+          } else if (state.mapped && maximizeOnStdin && command == 'M') {
+            xdg_toplevel_unset_maximized(state.toplevel);
+            wl_surface_commit(state.surface);
+            wl_display_flush(state.display);
+            std::println("unmaximize-requested");
+            std::fflush(stdout);
+          } else if (state.mapped && fullscreenOnStdin && command == 'f') {
+            xdg_toplevel_set_fullscreen(state.toplevel, nullptr);
+            wl_surface_commit(state.surface);
+            wl_display_flush(state.display);
+            std::println("fullscreen-requested");
+            std::fflush(stdout);
+          } else if (state.mapped && fullscreenOnStdin && command == 'u') {
+            xdg_toplevel_unset_fullscreen(state.toplevel);
+            wl_surface_commit(state.surface);
+            wl_display_flush(state.display);
+            std::println("unfullscreen-requested");
+            std::fflush(stdout);
+          } else if (state.mapped && minimizeOnStdin && command == 'z') {
+            xdg_toplevel_set_minimized(state.toplevel);
+            wl_display_flush(state.display);
+            std::println("minimize-requested");
+            std::fflush(stdout);
+          } else if (
+              state.mapped && updateOnStdin && command == 't' && updatedTitle != nullptr && !state.titleUpdated
+          ) {
+            xdg_toplevel_set_title(state.toplevel, updatedTitle);
+            wl_display_flush(state.display);
+            state.titleUpdated = true;
+            std::println("title-updated");
+            std::fflush(stdout);
+          } else if (state.mapped && updateOnStdin && command == 'u') {
+            if (updatedContentType != nullptr && !state.contentTypeUpdated) {
+              if (deferContentTypeChild) {
+                if (state.subcompositor == nullptr || !createRenderingChildSurface()) {
+                  std::println(stderr, "unmap-client: failed to create late content type child");
+                  return EXIT_FAILURE;
+                }
+                state.contentTypeSurface = state.colorChildSurface;
+                state.contentType = wp_content_type_manager_v1_get_surface_content_type(
+                    state.contentTypeManager, state.contentTypeSurface
+                );
+              }
+              wp_content_type_v1_set_content_type(
+                  state.contentType, static_cast<uint32_t>(parseContentType(updatedContentType))
+              );
+              if (deferContentTypeChild) {
+                if (!attachRenderingChild()) {
+                  std::println(stderr, "unmap-client: failed to attach late content type child");
+                  return EXIT_FAILURE;
+                }
+                // Apply the new subsurface relationship and positioning before the rendering child's first commit,
+                // matching Wine's already tagged client-surface attachment order.
+                wl_surface_commit(state.surface);
+                wl_surface_attach(state.colorChildSurface, state.colorChildBuffer.resource, 0, 0);
+                wl_surface_damage_buffer(state.colorChildSurface, 0, 0, state.width, state.height);
+              }
+              wl_surface_commit(state.contentTypeSurface);
+              state.contentTypeUpdated = true;
+            }
+            if (updatedXdgTag != nullptr && !state.xdgTagUpdated) {
+              xdg_toplevel_tag_manager_v1_set_toplevel_tag(state.xdgTagManager, state.toplevel, updatedXdgTag);
+              state.xdgTagUpdated = true;
+            }
+            if (updatedTitle != nullptr && !state.titleUpdated) {
+              xdg_toplevel_set_title(state.toplevel, updatedTitle);
+              state.titleUpdated = true;
+            }
+            wl_display_flush(state.display);
+            std::println("{}", updatedXdgTag != nullptr ? "xdg-tag-updated" : "content-type-updated");
+            std::fflush(stdout);
+          } else if (!state.mapped && remapOnStdin) {
+            queueRemap(state);
+          }
+        }
+      }
+      if ((sources[0].revents & POLLIN) != 0 && wl_display_dispatch(state.display) < 0) {
+        break;
+      }
+    }
+  }
+
+  if (state.toplevel != nullptr) {
+    xdg_toplevel_destroy(state.toplevel);
+  }
+  if (state.xdgSurface != nullptr) {
+    xdg_surface_destroy(state.xdgSurface);
+  }
+  if (state.tearingControl != nullptr) {
+    wp_tearing_control_v1_destroy(state.tearingControl);
+  }
+  if (state.colorSurface != nullptr) {
+    wp_color_management_surface_v1_destroy(state.colorSurface);
+  }
+  if (state.imageDescription != nullptr) {
+    wp_image_description_v1_destroy(state.imageDescription);
+  }
+  if (state.contentType != nullptr) {
+    wp_content_type_v1_destroy(state.contentType);
+  }
+  if (state.colorChildSubsurface != nullptr) {
+    wl_subsurface_destroy(state.colorChildSubsurface);
+  }
+  if (state.colorChildSurface != nullptr) {
+    wl_surface_destroy(state.colorChildSurface);
+  }
+  if (state.surface != nullptr) {
+    wl_surface_destroy(state.surface);
+  }
+  destroyAuxiliaryToplevel(transientNested);
+  destroyAuxiliaryToplevel(transientUnrelated);
+  destroyAuxiliaryToplevel(transientParent);
+  if (state.colorManager != nullptr) {
+    wp_color_manager_v1_destroy(state.colorManager);
+  }
+  if (state.tearingManager != nullptr) {
+    wp_tearing_control_manager_v1_destroy(state.tearingManager);
+  }
+  if (state.contentTypeManager != nullptr) {
+    wp_content_type_manager_v1_destroy(state.contentTypeManager);
+  }
+  if (state.xdgTagManager != nullptr) {
+    xdg_toplevel_tag_manager_v1_destroy(state.xdgTagManager);
+  }
+  if (state.dialogManager != nullptr) {
+    xdg_wm_dialog_v1_destroy(state.dialogManager);
+  }
+  if (imported != nullptr) {
+    zxdg_imported_v2_destroy(imported);
+  }
+  if (state.exporter != nullptr) {
+    zxdg_exporter_v2_destroy(state.exporter);
+  }
+  if (state.importer != nullptr) {
+    zxdg_importer_v2_destroy(state.importer);
+  }
+  if (state.activation != nullptr) {
+    xdg_activation_v1_destroy(state.activation);
+  }
+  if (state.keyboard != nullptr) {
+    wl_keyboard_destroy(state.keyboard);
+  }
+  if (state.seat != nullptr) {
+    wl_seat_destroy(state.seat);
+  }
+  destroyBuffer(state.buffer);
+  destroyBuffer(state.colorChildBuffer);
+  wl_display_disconnect(state.display);
+  return EXIT_SUCCESS;
+}

@@ -1,0 +1,1123 @@
+#include "layout/master.h"
+
+#include "config/config.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <ranges>
+#include <utility>
+
+extern "C" {
+#include <wlr/util/box.h>
+#include <wlr/util/edges.h>
+}
+
+namespace umbriel {
+
+  namespace {
+
+    constexpr double kFullWidth = 0.9;
+
+    struct MasterSnapshot final : LayoutSnapshot {
+      struct Row {
+        LayoutMemberId member = 0;
+        double weight = 1.0;
+      };
+
+      LayoutMode mode() const override { return LayoutMode::Master; }
+      size_t memberCount() const override { return members; }
+
+      std::vector<Row> master;
+      std::vector<Row> stack;
+      std::vector<Row> secondStack;
+      TabState masterTabs;
+      TabState stackTabs;
+      TabState secondStackTabs;
+      size_t members = 0;
+      double masterFraction = -1.0;
+      double savedFraction = 0.0;
+    };
+
+    std::pair<int, int> columnWidths(int contentWidth, int gap, double masterFraction) {
+      const int available = std::max(2, contentWidth - gap);
+      const int masterWidth = std::clamp(static_cast<int>(std::lround(masterFraction * available)), 1, available - 1);
+      return {masterWidth, available - masterWidth};
+    }
+
+    struct CenterWidths {
+      int side = 0;
+      int master = 0;
+      int secondSide = 0;
+    };
+
+    // Center mode keeps the master box centered: both sides share what the master fraction leaves, so an odd
+    // remainder goes to the second side.
+    CenterWidths centerWidths(int contentWidth, int gap, double masterFraction) {
+      const int available = std::max(3, contentWidth - 2 * gap);
+      const int master = std::clamp(static_cast<int>(std::lround(masterFraction * available)), 1, available - 2);
+      const int side = (available - master) / 2;
+      return {.side = side, .master = master, .secondSide = available - master - side};
+    }
+
+    // Height the next stack row gets once it joins `stack`, matching what arrange will assign.
+    int stackRowHeight(const MasterStackLayout::Area& stack, int contentHeight, int gap) {
+      const int count = static_cast<int>(stack.views.size());
+      const double weightSum = std::accumulate(stack.weights.begin(), stack.weights.end(), 0.0);
+      const int available = contentHeight - count * gap;
+      return std::max(1, static_cast<int>(std::lround(available / (weightSum + 1.0))));
+    }
+
+    class MasterResizeGrab final : public ResizeGrab {
+    public:
+      MasterResizeGrab(
+          Layout* layout, double* masterFraction, double fraction0, double horizontalSpan, double horizontalSign,
+          MasterStackLayout::Area* area, int upperRow, double weightSum, double upperHeight, double lowerHeight
+      )
+          : m_layout(layout), m_masterFraction(masterFraction), m_fraction0(fraction0),
+            m_horizontalSpan(horizontalSpan), m_horizontalSign(horizontalSign), m_area(area), m_upperRow(upperRow),
+            m_weightSum(weightSum), m_upperHeight(upperHeight), m_lowerHeight(lowerHeight) {}
+
+      void applyDelta(double dx, double dy, const wlr_box& /*usable*/) override {
+        if (m_masterFraction != nullptr && m_horizontalSpan > 0.0) {
+          *m_masterFraction = std::clamp(m_fraction0 + m_horizontalSign * dx / m_horizontalSpan, 0.1, 0.9);
+        }
+        const double pairHeight = m_upperHeight + m_lowerHeight;
+        if (m_area != nullptr
+            && m_upperRow >= 0
+            && static_cast<size_t>(m_upperRow + 1) < m_area->weights.size()
+            && pairHeight > 0.0) {
+          const double ratio = std::clamp((m_upperHeight + dy) / pairHeight, 0.05, 0.95);
+          m_area->weights[static_cast<size_t>(m_upperRow)] = m_weightSum * ratio;
+          m_area->weights[static_cast<size_t>(m_upperRow + 1)] = m_weightSum * (1.0 - ratio);
+        }
+      }
+
+      const Layout* ownerLayout() const override { return m_layout; }
+
+    private:
+      Layout* m_layout;
+      double* m_masterFraction;
+      double m_fraction0;
+      double m_horizontalSpan;
+      double m_horizontalSign;
+      MasterStackLayout::Area* m_area;
+      int m_upperRow;
+      double m_weightSum;
+      double m_upperHeight;
+      double m_lowerHeight;
+    };
+
+  } // namespace
+
+  double MasterStackLayout::masterFrac() const {
+    const double fraction =
+        m_masterFrac >= 0.0 ? m_masterFrac : (m_config != nullptr ? m_config->master.defaultWidthFraction : 0.55);
+    return std::clamp(fraction, 0.1, 0.9);
+  }
+
+  bool MasterStackLayout::masterIsLeft() const {
+    return m_config == nullptr || m_config->master.position == MasterPosition::Left;
+  }
+
+  bool MasterStackLayout::masterIsCenter() const {
+    return m_config != nullptr && m_config->master.position == MasterPosition::Center;
+  }
+
+  std::array<MasterStackLayout::Area*, 3> MasterStackLayout::orderedAreas() {
+    const std::array<const Area*, 3> ordered = std::as_const(*this).orderedAreas();
+    return {const_cast<Area*>(ordered[0]), const_cast<Area*>(ordered[1]), const_cast<Area*>(ordered[2])};
+  }
+
+  std::array<const MasterStackLayout::Area*, 3> MasterStackLayout::orderedAreas() const {
+    if (masterIsCenter()) {
+      return {&m_stack, &m_master, &m_secondStack};
+    }
+    if (masterIsLeft()) {
+      return {&m_master, &m_stack, nullptr};
+    }
+    return {&m_stack, &m_master, nullptr};
+  }
+
+  MasterStackLayout::Area& MasterStackLayout::insertionStack() {
+    return const_cast<Area&>(std::as_const(*this).insertionStack());
+  }
+
+  const MasterStackLayout::Area& MasterStackLayout::insertionStack() const {
+    return masterIsCenter() && m_secondStack.views.size() < m_stack.views.size() ? m_secondStack : m_stack;
+  }
+
+  MasterStackLayout::Area* MasterStackLayout::promotionStack() {
+    if (masterIsCenter() && m_secondStack.views.size() > m_stack.views.size()) {
+      return &m_secondStack;
+    }
+    return m_stack.views.empty() ? nullptr : &m_stack;
+  }
+
+  void MasterStackLayout::foldSecondStack() {
+    if (masterIsCenter() || m_secondStack.views.empty()) {
+      return;
+    }
+    for (size_t row = 0; row < m_secondStack.views.size(); ++row) {
+      insertRow(m_stack, m_stack.views.size(), m_secondStack.views[row], m_secondStack.weights[row]);
+    }
+    m_secondStack = {};
+  }
+
+  void MasterStackLayout::insertRow(Area& area, size_t row, View* view, double weight) const {
+    if (area.views.empty()) {
+      area.tabs = initialTabState();
+    }
+    row = std::min(row, area.views.size());
+    area.views.insert(area.views.begin() + static_cast<std::ptrdiff_t>(row), view);
+    area.weights.insert(area.weights.begin() + static_cast<std::ptrdiff_t>(row), weight);
+    area.tabs.rowInserted(row, area.views.size());
+  }
+
+  double MasterStackLayout::eraseRow(Area& area, size_t row) {
+    const double weight = area.weights[row];
+    area.views.erase(area.views.begin() + static_cast<std::ptrdiff_t>(row));
+    area.weights.erase(area.weights.begin() + static_cast<std::ptrdiff_t>(row));
+    area.tabs.rowErased(row, area.views.size());
+    return weight;
+  }
+
+  size_t MasterStackLayout::joinRow(const Area& area) const {
+    if (area.tabs.tabbed()
+        && !area.views.empty()
+        && m_config != nullptr
+        && m_config->tabs.newTabPosition == NewTabPosition::AfterActive) {
+      return area.tabs.active() + 1;
+    }
+    return area.views.size();
+  }
+
+  View* MasterStackLayout::areaEntry(const Area& area) const {
+    if (area.views.empty()) {
+      return nullptr;
+    }
+    if (area.tabs.tabbed() && area.tabs.active() < area.views.size()) {
+      return area.views[area.tabs.active()];
+    }
+    return area.views.front();
+  }
+
+  std::vector<LayoutTarget> MasterStackLayout::visibleTargets() const {
+    std::vector<LayoutTarget> visible;
+    visible.reserve(m_targets.size());
+    for (const LayoutTarget& target : m_targets) {
+      const Area* area = areaOf(target.view);
+      const View* shown = area != nullptr && area->tabs.tabbed() && area->tabs.active() < area->views.size()
+          ? area->views[area->tabs.active()]
+          : nullptr;
+      if (shown == nullptr || shown == target.view) {
+        visible.push_back(target);
+      }
+    }
+    return visible;
+  }
+
+  bool MasterStackLayout::setTabbed(const View* view, bool tabbed) {
+    Area* area = areaOf(view);
+    if (area == nullptr) {
+      return false;
+    }
+    // An area shows its rows as tabs as a whole, so the view it shows is the one tabbing it.
+    area->tabs.select(static_cast<size_t>(rowInArea(*area, view)), area->views.size());
+    if (!area->tabs.setTabbed(tabbed, area->views.size())) {
+      return false;
+    }
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::insertTab(View* view, int column, int row, const View* member) {
+    const Area* area = visualArea(column);
+    if (view == nullptr
+        || area == nullptr
+        || !area->tabs.tabbed()
+        || areaOf(member) != area
+        || row < 0
+        || static_cast<size_t>(row) > area->views.size()) {
+      return false;
+    }
+    insertViewIntoColumn(view, column, row);
+    return true;
+  }
+
+  bool MasterStackLayout::moveTab(const View* view, int direction) {
+    Area* area = areaOf(view);
+    if (area == nullptr || !area->tabs.tabbed() || (direction != -1 && direction != 1)) {
+      return false;
+    }
+    const int row = rowInArea(*area, view);
+    const int target = row + direction;
+    if (target < 0 || target >= static_cast<int>(area->views.size())) {
+      return false;
+    }
+    std::swap(area->views[static_cast<size_t>(row)], area->views[static_cast<size_t>(target)]);
+    std::swap(area->weights[static_cast<size_t>(row)], area->weights[static_cast<size_t>(target)]);
+    area->tabs.rowsSwapped(static_cast<size_t>(row), static_cast<size_t>(target));
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::setTabBar(const View* view, std::optional<bool> shown) {
+    Area* area = areaOf(view);
+    if (area == nullptr || !area->tabs.tabbed() || m_config == nullptr) {
+      return false;
+    }
+    const bool current = tabBarShown(*m_config, area->views.size(), area->tabs.bar());
+    const bool target = shown.value_or(!current);
+    area->tabs.setBar(target);
+    rebuildColumns();
+    return target != current;
+  }
+
+  bool MasterStackLayout::selectTab(const View* view) {
+    Area* area = areaOf(view);
+    if (area == nullptr || !area->tabs.select(static_cast<size_t>(rowInArea(*area, view)), area->views.size())) {
+      return false;
+    }
+    // Selecting a tab moves no box, so the arranged targets stay valid for directional focus.
+    const bool stale = m_geometryStale;
+    rebuildColumns();
+    m_geometryStale = stale;
+    return area->tabs.tabbed();
+  }
+
+  bool MasterStackLayout::widthAdjustable() const {
+    return masterIsCenter() ? !m_master.views.empty() : !m_master.views.empty() && !m_stack.views.empty();
+  }
+
+  MasterStackLayout::Area* MasterStackLayout::areaOf(const View* view) {
+    return const_cast<Area*>(std::as_const(*this).areaOf(view));
+  }
+
+  const MasterStackLayout::Area* MasterStackLayout::areaOf(const View* view) const {
+    if (std::ranges::find(m_master.views, view) != m_master.views.end()) {
+      return &m_master;
+    }
+    if (std::ranges::find(m_stack.views, view) != m_stack.views.end()) {
+      return &m_stack;
+    }
+    if (std::ranges::find(m_secondStack.views, view) != m_secondStack.views.end()) {
+      return &m_secondStack;
+    }
+    return nullptr;
+  }
+
+  MasterStackLayout::Area* MasterStackLayout::visualArea(int columnIndex) {
+    return const_cast<Area*>(std::as_const(*this).visualArea(columnIndex));
+  }
+
+  const MasterStackLayout::Area* MasterStackLayout::visualArea(int columnIndex) const {
+    if (columnIndex < 0) {
+      return nullptr;
+    }
+    int visibleIndex = 0;
+    for (const Area* area : orderedAreas()) {
+      if (area == nullptr || area->views.empty()) {
+        continue;
+      }
+      if (visibleIndex == columnIndex) {
+        return area;
+      }
+      ++visibleIndex;
+    }
+    return nullptr;
+  }
+
+  const MasterStackLayout::Area* MasterStackLayout::emptyStackAt(int gap) const {
+    if (m_master.views.empty()) {
+      return nullptr;
+    }
+    // Stacks sit outside the master area, so an empty one is always first or last in visual order.
+    const std::array<const Area*, 3> areas = orderedAreas();
+    const Area* edge = nullptr;
+    if (gap == 0) {
+      edge = areas[0];
+    } else if (gap == static_cast<int>(m_columns.size())) {
+      edge = areas[2] != nullptr ? areas[2] : areas[1];
+    }
+    return edge != nullptr && edge != &m_master && edge->views.empty() ? edge : nullptr;
+  }
+
+  int MasterStackLayout::rowInArea(const Area& area, const View* view) const {
+    const auto it = std::ranges::find(area.views, view);
+    return it == area.views.end() ? -1 : static_cast<int>(it - area.views.begin());
+  }
+
+  int MasterStackLayout::columnOf(const View* view) const {
+    for (size_t column = 0; column < m_columns.size(); ++column) {
+      if (std::ranges::find(m_columns[column].views, view) != m_columns[column].views.end()) {
+        return static_cast<int>(column);
+      }
+    }
+    return -1;
+  }
+
+  int MasterStackLayout::rowOf(const View* view) const {
+    const Area* area = areaOf(view);
+    return area != nullptr ? rowInArea(*area, view) : -1;
+  }
+
+  LayoutCapture MasterStackLayout::captureState() const {
+    auto snapshot = std::make_shared<MasterSnapshot>();
+    LayoutCapture capture{.snapshot = snapshot, .members = {}};
+    const auto saveArea = [&capture](const Area& area, std::vector<MasterSnapshot::Row>& rows) {
+      rows.reserve(area.views.size());
+      for (size_t row = 0; row < area.views.size(); ++row) {
+        const auto id = static_cast<LayoutMemberId>(capture.members.size());
+        capture.members.push_back({.id = id, .view = area.views[row]});
+        rows.push_back({.member = id, .weight = row < area.weights.size() ? area.weights[row] : 1.0});
+      }
+    };
+    saveArea(m_master, snapshot->master);
+    saveArea(m_stack, snapshot->stack);
+    saveArea(m_secondStack, snapshot->secondStack);
+    snapshot->masterTabs = m_master.tabs;
+    snapshot->stackTabs = m_stack.tabs;
+    snapshot->secondStackTabs = m_secondStack.tabs;
+    snapshot->members = capture.members.size();
+    snapshot->masterFraction = m_masterFrac;
+    snapshot->savedFraction = m_savedFrac;
+    return capture;
+  }
+
+  bool MasterStackLayout::restoreState(const LayoutSnapshot& base, std::span<const LayoutMember> members) {
+    const auto* snapshot = dynamic_cast<const MasterSnapshot*>(&base);
+    if (snapshot == nullptr || !m_master.views.empty() || !m_stack.views.empty() || !m_secondStack.views.empty()) {
+      return false;
+    }
+    const std::optional<std::vector<View*>> resolved = resolveLayoutMembers(snapshot->memberCount(), members);
+    if (!resolved) {
+      return false;
+    }
+
+    const auto restoreArea =
+        [&resolved](const std::vector<MasterSnapshot::Row>& rows, const TabState& tabs, Area& area) {
+          area.tabs = tabs;
+          for (size_t index = 0; index < rows.size(); ++index) {
+            View* view = (*resolved)[static_cast<size_t>(rows[index].member)];
+            if (view != nullptr) {
+              area.views.push_back(view);
+              area.weights.push_back(rows[index].weight);
+            } else {
+              // A member that did not come back leaves its row the way a close does.
+              area.tabs.rowErased(area.views.size(), area.views.size() + (rows.size() - index - 1));
+            }
+          }
+        };
+    restoreArea(snapshot->master, snapshot->masterTabs, m_master);
+    restoreArea(snapshot->stack, snapshot->stackTabs, m_stack);
+    restoreArea(snapshot->secondStack, snapshot->secondStackTabs, m_secondStack);
+    if (m_master.views.empty()) {
+      if (Area* stack = promotionStack(); stack != nullptr) {
+        View* promoted = stack->views.front();
+        insertRow(m_master, 0, promoted, eraseRow(*stack, 0));
+      }
+    }
+    m_masterFrac = snapshot->masterFraction;
+    m_savedFrac = snapshot->savedFraction;
+    m_targets.clear();
+    rebuildColumns();
+    return true;
+  }
+
+  void MasterStackLayout::eraseFromAreas(View* view) {
+    const auto erase = [this, view](Area& area) {
+      if (const int row = rowInArea(area, view); row >= 0) {
+        eraseRow(area, static_cast<size_t>(row));
+      }
+    };
+    erase(m_master);
+    erase(m_stack);
+    erase(m_secondStack);
+    std::erase_if(m_targets, [view](const LayoutTarget& target) { return target.view == view; });
+  }
+
+  void MasterStackLayout::rebuildColumns() {
+    foldSecondStack();
+    m_geometryStale = true;
+    m_columns.clear();
+    const double sideFrac = masterIsCenter() ? (1.0 - masterFrac()) / 2.0 : 1.0 - masterFrac();
+    for (const Area* area : orderedAreas()) {
+      if (area == nullptr || area->views.empty()) {
+        continue;
+      }
+      Column column;
+      column.views = area->views;
+      column.widthFrac = area == &m_master ? masterFrac() : sideFrac;
+      if (area->tabs.tabbed()) {
+        column.tabs.form(0, area->views.size(), area->tabs.active(), area->tabs.bar());
+        // Export the group's total extent without changing the rows restored by untabbing.
+        const double weight = std::accumulate(area->weights.begin(), area->weights.end(), 0.0);
+        column.heightWeights.assign(area->views.size(), weight);
+      } else {
+        column.heightWeights = area->weights;
+      }
+      m_columns.push_back(std::move(column));
+    }
+  }
+
+  void MasterStackLayout::insertView(View* view, int /*columnIndex*/) {
+    if (view == nullptr) {
+      return;
+    }
+    eraseFromAreas(view);
+    if (m_master.views.empty()) {
+      insertRow(m_master, 0, view, 1.0);
+    } else if (m_config != nullptr && m_config->master.newBecomesMaster) {
+      // The master count does not change, so the last master row drops to the stack top with its weight.
+      // The newcomer joins first, so a master area of one never empties and keeps its display.
+      Area& stack = insertionStack();
+      insertRow(m_master, 0, view, 1.0);
+      View* demoted = m_master.views.back();
+      insertRow(stack, 0, demoted, eraseRow(m_master, m_master.views.size() - 1));
+    } else {
+      const bool newOnTop = m_config == nullptr || m_config->master.newOnTop;
+      Area& stack = insertionStack();
+      insertRow(stack, newOnTop ? 0 : stack.views.size(), view, 1.0);
+    }
+    rebuildColumns();
+  }
+
+  void MasterStackLayout::insertViewIntoColumn(View* view, int columnIndex, int rowIndex) {
+    if (view == nullptr) {
+      return;
+    }
+    eraseFromAreas(view);
+
+    Area* destination = nullptr;
+    if (m_master.views.empty() && m_stack.views.empty() && m_secondStack.views.empty()) {
+      destination = &m_master;
+    } else {
+      destination = visualArea(columnIndex);
+    }
+    if (destination == nullptr) {
+      rebuildColumns();
+      return;
+    }
+
+    const int row = std::clamp(rowIndex, 0, static_cast<int>(destination->views.size()));
+    insertRow(*destination, static_cast<size_t>(row), view, 1.0);
+    rebuildColumns();
+  }
+
+  std::vector<MasterStackLayout::EmptyStack> MasterStackLayout::emptyStacks(const wlr_box& usable) const {
+    std::vector<EmptyStack> stacks;
+    const wlr_box content = contentArea(usable);
+    const int gap = m_config != nullptr ? m_config->totalGap : 0;
+    for (const int index : {0, static_cast<int>(m_columns.size())}) {
+      const Area* stack = emptyStackAt(index);
+      if (stack == nullptr) {
+        continue;
+      }
+      int width = 0;
+      if (masterIsCenter()) {
+        const CenterWidths widths = centerWidths(content.width, gap, masterFrac());
+        width = stack == &m_stack ? widths.side : widths.secondSide;
+      } else {
+        width = columnWidths(content.width, gap, masterFrac()).second;
+      }
+      const int x = index == 0 ? content.x : content.x + content.width - width;
+      stacks.push_back({.gap = index, .box = {.x = x, .y = content.y, .width = width, .height = content.height}});
+    }
+    return stacks;
+  }
+
+  wlr_box MasterStackLayout::emptyMasterBox(const wlr_box& usable) const {
+    const wlr_box content = contentArea(usable);
+    if (!masterIsCenter()) {
+      return content;
+    }
+    const int gap = m_config != nullptr ? m_config->totalGap : 0;
+    const CenterWidths widths = centerWidths(content.width, gap, masterFrac());
+    return {.x = content.x + widths.side + gap, .y = content.y, .width = widths.master, .height = content.height};
+  }
+
+  bool MasterStackLayout::openStack(View* view, int gap) {
+    const Area* stack = emptyStackAt(gap);
+    if (view == nullptr || stack == nullptr || areaOf(view) != nullptr) {
+      return false;
+    }
+    insertRow(const_cast<Area&>(*stack), 0, view, 1.0);
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::consume(View* view, int direction) {
+    if (direction != -1 && direction != 1) {
+      return false;
+    }
+    const std::array<Area*, 3> ordered = orderedAreas();
+    int index = -1;
+    for (int position = 0; position < static_cast<int>(ordered.size()); ++position) {
+      if (ordered[position] != nullptr && rowInArea(*ordered[position], view) >= 0) {
+        index = position;
+        break;
+      }
+    }
+    const int target = index + direction;
+    if (index < 0 || target < 0 || target >= static_cast<int>(ordered.size()) || ordered[target] == nullptr) {
+      return false;
+    }
+    Area* source = ordered[index];
+    Area* destination = ordered[target];
+    const double weight = eraseRow(*source, static_cast<size_t>(rowInArea(*source, view)));
+    insertRow(*destination, joinRow(*destination), view, weight);
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::expel(View* view, int direction) { return consume(view, direction); }
+
+  bool MasterStackLayout::consumeFrom(View* view, int direction) {
+    if (direction != -1 && direction != 1) {
+      return false;
+    }
+    const std::array<Area*, 3> ordered = orderedAreas();
+    int index = -1;
+    for (int position = 0; position < static_cast<int>(ordered.size()); ++position) {
+      if (ordered[position] != nullptr && rowInArea(*ordered[position], view) >= 0) {
+        index = position;
+        break;
+      }
+    }
+    const int sourceIndex = index + direction;
+    if (index < 0
+        || sourceIndex < 0
+        || sourceIndex >= static_cast<int>(ordered.size())
+        || ordered[sourceIndex] == nullptr) {
+      return false;
+    }
+    Area* source = ordered[sourceIndex];
+    Area* destination = ordered[index];
+    View* pulled = areaEntry(*source);
+    const int sourceRow = pulled != nullptr ? rowInArea(*source, pulled) : -1;
+    if (sourceRow < 0) {
+      return false;
+    }
+    const double weight = eraseRow(*source, static_cast<size_t>(sourceRow));
+    // The pulled window lands beside the focused row: among its area's tabs when the area is tabbed, otherwise
+    // directly below it. Focus stays where it was either way.
+    const size_t landing =
+        destination->tabs.tabbed() ? joinRow(*destination) : static_cast<size_t>(rowInArea(*destination, view) + 1);
+    insertRow(*destination, landing, pulled, weight);
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::moveViewVertical(View* view, int direction) {
+    // Tabs share one box, so the neighbour is the adjacent tab rather than whatever lies above or below.
+    if (Area* tabbed = areaOf(view); tabbed != nullptr && tabbed->tabs.tabbed()) {
+      const int row = rowInArea(*tabbed, view);
+      const int target = row + (direction < 0 ? -1 : 1);
+      if (target < 0 || target >= static_cast<int>(tabbed->views.size())) {
+        return false;
+      }
+      std::swap(tabbed->views[static_cast<size_t>(row)], tabbed->views[static_cast<size_t>(target)]);
+      std::swap(tabbed->weights[static_cast<size_t>(row)], tabbed->weights[static_cast<size_t>(target)]);
+      tabbed->tabs.rowsSwapped(static_cast<size_t>(row), static_cast<size_t>(target));
+      rebuildColumns();
+      return true;
+    }
+    View* neighbor = directionalNeighbor(m_targets, view, false, direction);
+    if (neighbor == nullptr) {
+      return false;
+    }
+    Area* area = areaOf(view);
+    if (area == nullptr || area != areaOf(neighbor)) {
+      return false;
+    }
+    const int first = rowInArea(*area, view);
+    const int second = rowInArea(*area, neighbor);
+    if (first < 0 || second < 0) {
+      return false;
+    }
+    std::swap(area->views[static_cast<size_t>(first)], area->views[static_cast<size_t>(second)]);
+    for (LayoutTarget& target : m_targets) {
+      if (target.view == view) {
+        target.view = neighbor;
+      } else if (target.view == neighbor) {
+        target.view = view;
+      }
+    }
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::swapViews(View* a, View* b) {
+    if (a == b) {
+      return false;
+    }
+    Area* firstArea = areaOf(a);
+    Area* secondArea = areaOf(b);
+    if (firstArea == nullptr || secondArea == nullptr) {
+      return false;
+    }
+    const int first = rowInArea(*firstArea, a);
+    const int second = rowInArea(*secondArea, b);
+    if (first < 0 || second < 0) {
+      return false;
+    }
+    if (firstArea == secondArea) {
+      firstArea->tabs.rowsSwapped(static_cast<size_t>(first), static_cast<size_t>(second));
+    }
+    std::swap(firstArea->views[static_cast<size_t>(first)], secondArea->views[static_cast<size_t>(second)]);
+    for (LayoutTarget& target : m_targets) {
+      if (target.view == a) {
+        target.view = b;
+      } else if (target.view == b) {
+        target.view = a;
+      }
+    }
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::promoteFromStack() {
+    Area* stack = promotionStack();
+    if (stack == nullptr) {
+      return false;
+    }
+    View* promoted = stack->views.front();
+    insertRow(m_master, m_master.views.size(), promoted, eraseRow(*stack, 0));
+    rebuildColumns();
+    return true;
+  }
+
+  bool MasterStackLayout::demoteToStack() {
+    if (m_master.views.size() < 2) {
+      return false;
+    }
+    Area& stack = insertionStack();
+    View* demoted = m_master.views.back();
+    insertRow(stack, 0, demoted, eraseRow(m_master, m_master.views.size() - 1));
+    rebuildColumns();
+    return true;
+  }
+
+  void MasterStackLayout::removeView(View* view) {
+    const bool wasMaster = rowInArea(m_master, view) >= 0;
+    if (!wasMaster && areaOf(view) == nullptr) {
+      return;
+    }
+    eraseFromAreas(view);
+    if (wasMaster && m_master.views.empty()) {
+      if (Area* stack = promotionStack(); stack != nullptr) {
+        View* promoted = stack->views.front();
+        insertRow(m_master, 0, promoted, eraseRow(*stack, 0));
+      }
+    }
+    rebuildColumns();
+  }
+
+  void MasterStackLayout::moveColumn(int from, int to) {
+    if (from == to) {
+      return;
+    }
+    Area* source = visualArea(from);
+    Area* destination = visualArea(to);
+    if (source == nullptr || destination == nullptr || source == destination) {
+      return;
+    }
+    std::swap(*source, *destination);
+    rebuildColumns();
+  }
+
+  void MasterStackLayout::arrange(const wlr_box& usable) {
+    foldSecondStack();
+    m_targets.clear();
+    const wlr_box content = contentArea(usable);
+    const int gap = m_config != nullptr ? m_config->totalGap : 0;
+
+    const auto arrangeArea = [&](const Area& area, const wlr_box& box) {
+      if (area.views.empty()) {
+        return;
+      }
+      if (area.tabs.tabbed()) {
+        // Every tab takes the whole area less its bar.
+        const wlr_box shared = tabbedBox(box, area.views.size(), area.tabs.bar());
+        for (View* view : area.views) {
+          m_targets.push_back(
+              {.view = view, .x = shared.x, .y = shared.y, .width = shared.width, .height = shared.height}
+          );
+        }
+        return;
+      }
+      const int rowCount = static_cast<int>(area.views.size());
+      const int available = box.height - std::max(0, rowCount - 1) * gap;
+      const double weightSum = std::accumulate(area.weights.begin(), area.weights.end(), 0.0);
+      int y = box.y;
+      int used = 0;
+      for (int row = 0; row < rowCount; ++row) {
+        int height = 1;
+        if (row == rowCount - 1) {
+          height = std::max(1, available - used);
+        } else {
+          height = std::max(
+              1, static_cast<int>(std::lround(available * area.weights[static_cast<size_t>(row)] / weightSum))
+          );
+          used += height;
+        }
+        m_targets.push_back({
+            .view = area.views[static_cast<size_t>(row)],
+            .x = box.x,
+            .y = y,
+            .width = box.width,
+            .height = height,
+        });
+        y += height + gap;
+      }
+    };
+
+    if (masterIsCenter()) {
+      if (!m_master.views.empty()) {
+        const CenterWidths widths = centerWidths(content.width, gap, masterFrac());
+        const wlr_box left{
+            .x = content.x,
+            .y = content.y,
+            .width = widths.side,
+            .height = content.height,
+        };
+        const wlr_box middle{
+            .x = left.x + widths.side + gap,
+            .y = content.y,
+            .width = widths.master,
+            .height = content.height,
+        };
+        const wlr_box right{
+            .x = middle.x + widths.master + gap,
+            .y = content.y,
+            .width = widths.secondSide,
+            .height = content.height,
+        };
+        arrangeArea(m_stack, left);
+        arrangeArea(m_master, middle);
+        arrangeArea(m_secondStack, right);
+      } else if (m_stack.views.empty() || m_secondStack.views.empty()) {
+        arrangeArea(m_stack, content);
+        arrangeArea(m_secondStack, content);
+      } else {
+        const int leftWidth = (content.width - gap) / 2;
+        const wlr_box left{.x = content.x, .y = content.y, .width = leftWidth, .height = content.height};
+        const wlr_box right{
+            .x = left.x + leftWidth + gap,
+            .y = content.y,
+            .width = content.width - gap - leftWidth,
+            .height = content.height,
+        };
+        arrangeArea(m_stack, left);
+        arrangeArea(m_secondStack, right);
+      }
+    } else if (m_master.views.empty()) {
+      arrangeArea(m_stack, content);
+    } else if (m_stack.views.empty()) {
+      arrangeArea(m_master, content);
+    } else {
+      const auto [masterWidth, stackWidth] = columnWidths(content.width, gap, masterFrac());
+      const wlr_box left{
+          .x = content.x,
+          .y = content.y,
+          .width = masterIsLeft() ? masterWidth : stackWidth,
+          .height = content.height,
+      };
+      const wlr_box right{
+          .x = left.x + left.width + gap,
+          .y = content.y,
+          .width = masterIsLeft() ? stackWidth : masterWidth,
+          .height = content.height,
+      };
+      arrangeArea(masterIsLeft() ? m_master : m_stack, left);
+      arrangeArea(masterIsLeft() ? m_stack : m_master, right);
+    }
+    rebuildColumns();
+    m_geometryStale = false;
+  }
+
+  wlr_box MasterStackLayout::targetBox(const View* view) const {
+    const auto it = std::ranges::find_if(m_targets, [view](const LayoutTarget& target) { return target.view == view; });
+    if (it == m_targets.end()) {
+      return {};
+    }
+    return {.x = it->x, .y = it->y, .width = it->width, .height = it->height};
+  }
+
+  Layout::InitialSize MasterStackLayout::initialSize(
+      const wlr_box& usable, bool /*wantMaximize*/, std::optional<double> /*ruleExtent*/,
+      std::optional<int> /*ruleExtentPx*/, const View* /*splitAnchor*/
+  ) const {
+    const wlr_box content = contentArea(usable);
+    const int gap = m_config != nullptr ? m_config->totalGap : 0;
+    const bool becomesMaster = m_master.views.empty() || (m_config != nullptr && m_config->master.newBecomesMaster);
+
+    if (masterIsCenter()) {
+      const CenterWidths widths = centerWidths(content.width, gap, masterFrac());
+      if (becomesMaster) {
+        return joiningSize(m_master, widths.master, content.height, gap);
+      }
+      const Area& stack = insertionStack();
+      return joiningSize(stack, &stack == &m_secondStack ? widths.secondSide : widths.side, content.height, gap);
+    }
+
+    if (m_master.views.empty() && m_stack.views.empty()) {
+      return joiningSize(m_master, content.width, content.height, gap);
+    }
+    const auto [masterWidth, stackWidth] = columnWidths(content.width, gap, masterFrac());
+    if (becomesMaster) {
+      return joiningSize(m_master, masterWidth, content.height, gap);
+    }
+    return joiningSize(m_stack, stackWidth, content.height, gap);
+  }
+
+  Layout::InitialSize MasterStackLayout::joiningSize(const Area& area, int width, int contentHeight, int gap) const {
+    // A newcomer to an empty area starts it with the display new areas take; one joining a tabbed area takes the
+    // shared box beside its bar, on whichever edge the bar is.
+    const TabState tabs = area.views.empty() ? initialTabState() : area.tabs;
+    if (tabs.tabbed()) {
+      const wlr_box shared =
+          tabbedBox({.x = 0, .y = 0, .width = width, .height = contentHeight}, area.views.size() + 1, tabs.bar());
+      return {.width = shared.width, .height = shared.height};
+    }
+    if (&area == &m_master) {
+      return {.width = width, .height = contentHeight};
+    }
+    return {.width = width, .height = stackRowHeight(area, contentHeight, gap)};
+  }
+
+  std::optional<View*> MasterStackLayout::focusHorizontalLeaf(const View* view, int direction) const {
+    // A structural change invalidates the boxes until the next arrange. Answering from them would send focus by the
+    // old geometry, so the caller falls back to column and row order instead.
+    if (m_geometryStale) {
+      return std::nullopt;
+    }
+    return directionalNeighbor(visibleTargets(), view, true, direction);
+  }
+
+  std::optional<View*> MasterStackLayout::focusVerticalLeaf(const View* view, int direction) const {
+    // Up and down walk a tabbed area's tabs in order and stop at either end, as they stop at a stack's ends.
+    if (const Area* area = areaOf(view); area != nullptr && area->tabs.tabbed()) {
+      const int target = rowInArea(*area, view) + (direction < 0 ? -1 : 1);
+      if (target < 0 || target >= static_cast<int>(area->views.size())) {
+        return nullptr;
+      }
+      return area->views[static_cast<size_t>(target)];
+    }
+    if (m_geometryStale) {
+      return std::nullopt;
+    }
+    return directionalNeighbor(visibleTargets(), view, false, direction);
+  }
+
+  bool MasterStackLayout::cycleWidth(int columnIndex, int direction) {
+    if (!widthAdjustable() || visualArea(columnIndex) == nullptr) {
+      return false;
+    }
+    return cycleFractionPreset(
+        m_config->extentPresets, widthFraction(columnIndex), direction,
+        [&](double fraction) { return setWidthFraction(columnIndex, fraction); },
+        [&] { return widthFraction(columnIndex); }
+    );
+  }
+
+  bool MasterStackLayout::toggleFullWidth(int columnIndex) {
+    if (!widthAdjustable() || visualArea(columnIndex) == nullptr) {
+      return false;
+    }
+    const Area* area = visualArea(columnIndex);
+    const double current = widthFraction(columnIndex);
+    if (current >= kFullWidth - kFractionEpsilon) {
+      double restore = m_savedFrac;
+      if (restore <= 0.0) {
+        const double defaultFraction = m_config->master.defaultWidthFraction;
+        if (area == &m_master) {
+          restore = defaultFraction;
+        } else {
+          restore = masterIsCenter() ? (1.0 - defaultFraction) / 2.0 : 1.0 - defaultFraction;
+        }
+      }
+      m_savedFrac = 0.0;
+      setWidthFraction(columnIndex, restore);
+      return false;
+    }
+    m_savedFrac = current;
+    setWidthFraction(columnIndex, kFullWidth);
+    m_savedFrac = current;
+    return true;
+  }
+
+  bool MasterStackLayout::isFullWidth(int columnIndex) const {
+    return widthAdjustable()
+        && visualArea(columnIndex) != nullptr
+        && widthFraction(columnIndex) >= kFullWidth - kFractionEpsilon;
+  }
+
+  bool MasterStackLayout::setWidthFraction(int columnIndex, double fraction) {
+    if (!widthAdjustable()) {
+      return false;
+    }
+    const Area* area = visualArea(columnIndex);
+    if (area == nullptr) {
+      return false;
+    }
+    const double used = std::clamp(fraction, 0.1, 0.9);
+    if (area == &m_master) {
+      m_masterFrac = used;
+    } else {
+      // A side column owns half of what the master leaves, so its fraction sets the master's complement.
+      m_masterFrac = masterIsCenter() ? 1.0 - 2.0 * used : 1.0 - used;
+    }
+    m_masterFrac = std::clamp(m_masterFrac, 0.1, 0.9);
+    m_savedFrac = 0.0;
+    rebuildColumns();
+    return true;
+  }
+
+  void MasterStackLayout::clearFullWidthState(int columnIndex) {
+    if (widthAdjustable() && visualArea(columnIndex) != nullptr) {
+      m_savedFrac = 0.0;
+    }
+  }
+
+  double MasterStackLayout::widthFraction(int columnIndex) const {
+    const Area* area = visualArea(columnIndex);
+    if (area == nullptr) {
+      return 1.0;
+    }
+    if (masterIsCenter()) {
+      if (m_master.views.empty()) {
+        return m_stack.views.empty() || m_secondStack.views.empty() ? 1.0 : 0.5;
+      }
+      return area == &m_master ? masterFrac() : (1.0 - masterFrac()) / 2.0;
+    }
+    if (!widthAdjustable()) {
+      return 1.0;
+    }
+    return area == &m_master ? masterFrac() : 1.0 - masterFrac();
+  }
+
+  double MasterStackLayout::heightFraction(const View* view) const {
+    const Area* area = areaOf(view);
+    if (area == nullptr || area->views.size() <= 1 || area->tabs.tabbed()) {
+      return 1.0;
+    }
+    const int row = rowInArea(*area, view);
+    const double total = std::accumulate(area->weights.begin(), area->weights.end(), 0.0);
+    return area->weights[static_cast<size_t>(row)] / total;
+  }
+
+  bool MasterStackLayout::setHeightFraction(View* view, double fraction) {
+    Area* area = areaOf(view);
+    if (area == nullptr || area->views.size() <= 1 || area->tabs.tabbed()) {
+      return false;
+    }
+    const int row = rowInArea(*area, view);
+    const auto index = static_cast<size_t>(row);
+    const double total = std::accumulate(area->weights.begin(), area->weights.end(), 0.0);
+    const double others = total - area->weights[index];
+    const double target = std::clamp(fraction, 0.1, 0.95);
+    area->weights[index] = target * others / (1.0 - target);
+    rebuildColumns();
+    return true;
+  }
+
+  uint32_t MasterStackLayout::resizableEdges(const View* view) const {
+    const Area* area = areaOf(view);
+    if (area == nullptr) {
+      return 0;
+    }
+    uint32_t edges = 0;
+    if (masterIsCenter()) {
+      if (!m_master.views.empty()) {
+        // The master box is centered, so both of its margins move; a side column only borders the master.
+        if (area == &m_master) {
+          edges |= WLR_EDGE_LEFT | WLR_EDGE_RIGHT;
+        } else {
+          edges |= area == &m_stack ? WLR_EDGE_RIGHT : WLR_EDGE_LEFT;
+        }
+      }
+    } else if (!m_master.views.empty() && !m_stack.views.empty()) {
+      const bool areaIsLeft = (area == &m_master) == masterIsLeft();
+      edges |= areaIsLeft ? WLR_EDGE_RIGHT : WLR_EDGE_LEFT;
+    }
+    if (area->tabs.tabbed()) {
+      // Tabs share one box: there is no row boundary to drag.
+      return edges;
+    }
+    const int row = rowInArea(*area, view);
+    if (row > 0) {
+      edges |= WLR_EDGE_TOP;
+    }
+    if (row >= 0 && row + 1 < static_cast<int>(area->views.size())) {
+      edges |= WLR_EDGE_BOTTOM;
+    }
+    return edges;
+  }
+
+  uint32_t MasterStackLayout::resizeEdgesAt(const View* view, double cx, double cy) const {
+    const wlr_box box = targetBox(view);
+    if (box.width <= 0 || box.height <= 0) {
+      return 0;
+    }
+    return sanitizeResizeEdges(view, resizeEdgesForPoint(box, cx, cy));
+  }
+
+  uint32_t MasterStackLayout::sanitizeResizeEdges(const View* view, uint32_t edges) const {
+    return edges & resizableEdges(view);
+  }
+
+  std::unique_ptr<ResizeGrab> MasterStackLayout::beginResize(View* view, uint32_t edges, const wlr_box& usable) {
+    Area* area = areaOf(view);
+    if (area == nullptr) {
+      return nullptr;
+    }
+    const uint32_t allowed = edges & resizableEdges(view);
+
+    double* horizontalFraction = nullptr;
+    double horizontalSpan = 0.0;
+    double horizontalSign = 0.0;
+    if ((allowed & (WLR_EDGE_LEFT | WLR_EDGE_RIGHT)) != 0) {
+      horizontalFraction = &m_masterFrac;
+      if (masterIsCenter()) {
+        // Both margins move together, so the master grows by twice the edge travel.
+        horizontalSpan = (contentArea(usable).width - 2 * m_config->totalGap) / 2.0;
+        if (area == &m_master) {
+          horizontalSign = (allowed & WLR_EDGE_RIGHT) != 0 ? 1.0 : -1.0;
+        } else {
+          horizontalSign = area == &m_stack ? -1.0 : 1.0;
+        }
+      } else {
+        horizontalSpan = static_cast<double>(contentArea(usable).width - m_config->totalGap);
+        horizontalSign = masterIsLeft() ? 1.0 : -1.0;
+      }
+    }
+
+    double weightSum = 0.0;
+    double upperHeight = 0.0;
+    double lowerHeight = 0.0;
+    int upperRow = -1;
+    const int row = rowInArea(*area, view);
+    if ((allowed & WLR_EDGE_TOP) != 0 && row > 0) {
+      upperRow = row - 1;
+    } else if ((allowed & WLR_EDGE_BOTTOM) != 0 && row + 1 < static_cast<int>(area->views.size())) {
+      upperRow = row;
+    }
+    if (upperRow >= 0) {
+      weightSum = area->weights[static_cast<size_t>(upperRow)] + area->weights[static_cast<size_t>(upperRow + 1)];
+      upperHeight = targetBox(area->views[static_cast<size_t>(upperRow)]).height;
+      lowerHeight = targetBox(area->views[static_cast<size_t>(upperRow + 1)]).height;
+    }
+
+    if (horizontalFraction == nullptr && upperRow < 0) {
+      return nullptr;
+    }
+    m_savedFrac = 0.0;
+    return std::make_unique<MasterResizeGrab>(
+        this, horizontalFraction, masterFrac(), horizontalSpan, horizontalSign, area, upperRow, weightSum, upperHeight,
+        lowerHeight
+    );
+  }
+
+} // namespace umbriel

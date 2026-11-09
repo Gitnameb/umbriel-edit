@@ -1,0 +1,130 @@
+name: CI (glibc)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      # Arch's rolling `clang` package is the pinned major; the guard fails loudly when Arch moves on.
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm --needed git clang
+          clang-format --version | grep -q 'version 23\.' || { clang-format --version; echo "error: expected clang-format 23" >&2; exit 1; }
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          mapfile -d '' files < <(find src tests umbrielfx examples/effects \( -name '*.cpp' -o -name '*.c' -o -name '*.h' -o -name '*.frag' -o -name '*.vert' -o -name '*.glsl' \) -print0)
+          clang-format --dry-run -Werror "${files[@]}"
+          if grep -InE '[[:blank:]]+$' "${files[@]}"; then
+            printf 'Source files contain trailing whitespace.\n' >&2
+            exit 1
+          fi
+
+  format-docs:
+    name: Docs format
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git just nodejs npm
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: just format-docs-check
+
+  build-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          # libxcb supplies the RandR client library and xcb-randr.pc.
+          pacman -Syu --noconfirm --needed \
+            base-devel clang dbus git jemalloc just meson ninja pkgconf \
+            cairo lcms2 libdisplay-info libdrm libei libinput libxcb 'libxkbcommon>=1.10.0' mesa pango pixman \
+            nlohmann-json tomlplusplus wayland wayland-protocols wlroots0.20
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare unprivileged build user
+        run: |
+          useradd --create-home ci
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+
+      - name: Build
+        run: runuser --user ci -- env HOME=/home/ci just build
+
+      - name: Run unit tests
+        run: runuser --user ci -- env HOME=/home/ci just test
+
+  lint:
+    name: Lint
+    needs: build-test
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          # libxcb supplies the RandR client library and xcb-randr.pc.
+          pacman -Syu --noconfirm --needed \
+            base-devel clang dbus git jemalloc just meson ninja pkgconf \
+            cairo lcms2 libdisplay-info libdrm libei libinput libxcb 'libxkbcommon>=1.10.0' mesa pango pixman \
+            nlohmann-json tomlplusplus wayland wayland-protocols wlroots0.20
+
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check clang-tidy version
+        run: |
+          clang-tidy --version | grep -q 'version 23\.' || { clang-tidy --version; echo "error: expected clang-tidy 23" >&2; exit 1; }
+
+      - name: Prepare unprivileged build user
+        run: |
+          useradd --create-home ci
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+
+      - name: Prepare compile database and generated sources
+        run: |
+          runuser --user ci -- env HOME=/home/ci just configure
+          runuser --user ci -- env HOME=/home/ci meson compile -C build-debug umbriel unit-tests harness-clients
+
+      - name: Run clang-tidy
+        run: runuser --user ci -- env HOME=/home/ci just lint

@@ -1,0 +1,26 @@
+option(
+  'tests',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build unit tests, harness clients, and umbrielfx checks (auto: on for unsanitized debug builds)',
+)
+option(
+  'harness',
+  type: 'feature',
+  value: 'auto',
+  description: 'Harness-only behavior: IPC commands such as settle and the animation clock, renderer recovery, and'
+    + ' test switches (auto: on for debug builds)',
+)
+option('jemalloc', type: 'feature', value: 'auto', description: 'Use jemalloc on glibc builds')
+option(
+  'localed',
+  type: 'feature',
+  value: 'auto',
+  description: 'Read the systemd-localed keymap through libsystemd\'s sd-bus for keyboards with no XKB configuration',
+)
+option(
+  'tracy',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Compile umbrielfx\'s Tracy CPU and GPU render zones (needs a client built with TRACY_ENABLE and TRACY_ON_DEMAND)',
+)

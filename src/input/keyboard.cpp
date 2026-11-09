@@ -1,0 +1,650 @@
+#include "input/keyboard.h"
+
+#include "config/config.h"
+#include "core/log.h"
+#include "input/cursor.h"
+#include "input/eis.h"
+#include "input/input_capture.h"
+#include "input/keyboard_layout.h"
+#include "input/keyboard_state.h"
+#include "input/seat.h"
+#include "input/shortcut_keysym.h"
+#include "input/text_input.h"
+#include "overview/overview.h"
+#include "scene/cheatsheet.h"
+#include "scene/move_menu.h"
+#include "scene/quit_confirm.h"
+#include "server/ipc.h"
+#include "server/server.h"
+#include "wlr.h"
+
+#include <algorithm>
+#include <optional>
+
+namespace umbriel {
+
+  namespace {
+    constexpr Logger kLog("keyboard");
+
+    uint32_t modifierForKeysym(uint32_t keysym) {
+      switch (keysym) {
+      case XKB_KEY_Shift_L:
+      case XKB_KEY_Shift_R:
+        return WLR_MODIFIER_SHIFT;
+      case XKB_KEY_Control_L:
+      case XKB_KEY_Control_R:
+        return WLR_MODIFIER_CTRL;
+      case XKB_KEY_Alt_L:
+      case XKB_KEY_Alt_R:
+        return WLR_MODIFIER_ALT;
+      case XKB_KEY_Super_L:
+      case XKB_KEY_Super_R:
+        return WLR_MODIFIER_LOGO;
+      default:
+        return 0;
+      }
+    }
+  } // namespace
+
+  Keyboard::Keyboard(Server& server, wlr_input_device* device)
+      : m_server(&server), m_keyboard(wlr_keyboard_from_input_device(device)),
+        m_virtual(
+            wlr_input_device_get_virtual_keyboard(device) != nullptr
+            || (server.eisInput() != nullptr && server.eisInput()->ownsDevice(device))
+        ),
+        m_deviceName(device->name != nullptr ? device->name : "") {
+    if (m_virtual) {
+      m_server->inputMethodRelay()->canonicalizeOwnedKeyboardKeymap(m_keyboard);
+    }
+    applyConfig();
+    m_modifiers.notify = onModifiers;
+    wl_signal_add(&m_keyboard->events.modifiers, &m_modifiers);
+    m_key.notify = onKey;
+    wl_signal_add(&m_keyboard->events.key, &m_key);
+    m_destroy.notify = onDestroy;
+    wl_signal_add(&device->events.destroy, &m_destroy);
+  }
+  void Keyboard::applyConfig() {
+    cancelRepeat();
+    if (m_virtual) {
+      return;
+    }
+    const Config::Input& input = config().input;
+    const Config::Input::Device* device = input.findDevice(m_deviceName);
+
+    const bool enabled = device != nullptr ? device->enabled.value_or(true) : true;
+    libinput_device* libinputDevice =
+        wlr_input_device_is_libinput(&m_keyboard->base) ? wlr_libinput_get_device_handle(&m_keyboard->base) : nullptr;
+    // A device that is also a pointer, touch, or tablet device has one send-events mode, owned by that device's path.
+    const bool sharedDevice = libinputDevice != nullptr
+        && (libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_POINTER) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TOUCH) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0);
+    if (libinputDevice != nullptr && !sharedDevice) {
+      if ((libinput_device_config_send_events_get_modes(libinputDevice) & LIBINPUT_CONFIG_SEND_EVENTS_DISABLED) != 0) {
+        libinput_device_config_send_events_set_mode(
+            libinputDevice, enabled ? LIBINPUT_CONFIG_SEND_EVENTS_ENABLED : LIBINPUT_CONFIG_SEND_EVENTS_DISABLED
+        );
+      } else if (!enabled) {
+        kLog.warn("input: '{}' cannot be disabled", m_deviceName);
+      }
+    }
+
+    const XkbNames names = resolveXkbNames(input.keyboard, device, m_server->systemKeymap());
+    const int repeatRate = device != nullptr && device->repeatRate ? *device->repeatRate : input.keyboard.repeatRate;
+    const int repeatDelay =
+        device != nullptr && device->repeatDelay ? *device->repeatDelay : input.keyboard.repeatDelay;
+    xkb_context* context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    const xkb_rule_names rules{
+        .rules = nullptr,
+        .model = names.model.empty() ? nullptr : names.model.c_str(),
+        .layout = names.layout.empty() ? nullptr : names.layout.c_str(),
+        .variant = names.variant.empty() ? nullptr : names.variant.c_str(),
+        .options = names.options.empty() ? nullptr : names.options.c_str(),
+    };
+    xkb_keymap* keymap =
+        context == nullptr ? nullptr : xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (keymap != nullptr) {
+      // Restoring lock state emits a synthetic modifiers event. It must not
+      // select an inactive keyboard as the user's current input source.
+      m_syncingLayout = true;
+      const bool applied = setKeyboardKeymapPreservingState(m_keyboard, keymap);
+      m_syncingLayout = false;
+      if (!applied) {
+        wlr_log(WLR_ERROR, "failed to apply keyboard keymap");
+      }
+      xkb_keymap_unref(keymap);
+    } else {
+      wlr_log(WLR_ERROR, "failed to create keyboard keymap");
+    }
+    if (context != nullptr) {
+      xkb_context_unref(context);
+    }
+    wlr_keyboard_set_repeat_info(m_keyboard, repeatRate, repeatDelay);
+    // A changed keymap starts in group zero; an identical map keeps its state.
+    // Record either without treating config reload as a user layout transition.
+    m_lastNotifiedLayout = m_keyboard->xkb_state == nullptr
+        ? XKB_LAYOUT_INVALID
+        : xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+  }
+
+  bool Keyboard::cycleLayout() {
+    // A virtual keyboard's keymap belongs to its client, so its groups are not
+    // ours to rotate. Same reason applyConfig leaves them alone.
+    if (m_virtual || m_keyboard->keymap == nullptr || m_keyboard->xkb_state == nullptr) {
+      return false;
+    }
+    const xkb_layout_index_t count = xkb_keymap_num_layouts(m_keyboard->keymap);
+    if (count < 2) {
+      return false;
+    }
+    const xkb_layout_index_t current = xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+    const xkb_layout_index_t next = (current + 1) % count;
+    // Locking the group through wlroots rather than xkbcommon directly is what gets the new group out to clients: it
+    // refreshes wlr_keyboard::modifiers and emits the modifiers event the seat forwards.
+    wlr_keyboard_notify_modifiers(
+        m_keyboard, m_keyboard->modifiers.depressed, m_keyboard->modifiers.latched, m_keyboard->modifiers.locked, next
+    );
+    const xkb_layout_index_t effective = xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+    const char* name = xkb_keymap_layout_get_name(m_keyboard->keymap, effective);
+    kLog.info(
+        "'{}' switched to layout {}/{} ({})", m_deviceName, effective + 1, count, name != nullptr ? name : "unnamed"
+    );
+    return effective == next;
+  }
+
+  void Keyboard::syncLayoutFrom(const Keyboard& source) {
+    if (m_virtual
+        || m_keyboard->keymap == nullptr
+        || m_keyboard->xkb_state == nullptr
+        || source.m_virtual
+        || source.m_keyboard->keymap == nullptr
+        || source.m_keyboard->xkb_state == nullptr) {
+      return;
+    }
+    const xkb_layout_index_t sourceGroup =
+        xkb_state_serialize_layout(source.m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+    const std::optional<xkb_layout_index_t> targetGroup =
+        matchingLayoutGroup(m_keyboard->keymap, source.m_keyboard->keymap, sourceGroup);
+    if (targetGroup.has_value()) {
+      setLayout(*targetGroup);
+    }
+  }
+
+  bool Keyboard::setLayoutByName(std::string_view name) {
+    if (m_virtual || m_keyboard->keymap == nullptr || m_keyboard->xkb_state == nullptr) {
+      return false;
+    }
+    const std::optional<xkb_layout_index_t> group = layoutGroupNamed(m_keyboard->keymap, name);
+    if (!group.has_value()) {
+      return false;
+    }
+    setLayout(*group);
+    return true;
+  }
+
+  void Keyboard::setLayout(xkb_layout_index_t group) {
+    if (m_virtual
+        || m_keyboard->keymap == nullptr
+        || m_keyboard->xkb_state == nullptr
+        || group >= xkb_keymap_num_layouts(m_keyboard->keymap)
+        || xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE) == group) {
+      return;
+    }
+    // wlroots emits the modifiers signal synchronously. Keep this synthetic
+    // update away from the seat and input-method paths, which must continue to
+    // describe the keyboard that produced the real input event.
+    m_syncingLayout = true;
+    wlr_keyboard_notify_modifiers(
+        m_keyboard, m_keyboard->modifiers.depressed, m_keyboard->modifiers.latched, m_keyboard->modifiers.locked, group
+    );
+    m_syncingLayout = false;
+    m_lastNotifiedLayout = xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+  }
+
+  void Keyboard::notifyLayoutIfChanged() {
+    if (m_virtual || m_keyboard->keymap == nullptr || m_keyboard->xkb_state == nullptr) {
+      return;
+    }
+    const xkb_layout_index_t effective = xkb_state_serialize_layout(m_keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+    if (effective == m_lastNotifiedLayout) {
+      return;
+    }
+    m_lastNotifiedLayout = effective;
+    m_server->keyboardLayoutChanged(this);
+  }
+
+  wlr_input_method_keyboard_grab_v2* Keyboard::activeInputMethodGrab() const {
+    if (m_server->sessionLocked()) {
+      return nullptr;
+    }
+    return m_server->inputMethodRelay()->grabForKeyboard(m_keyboard);
+  }
+
+  Keyboard::~Keyboard() {
+    if (m_repeatTimer != nullptr) {
+      wl_event_source_remove(m_repeatTimer);
+      m_repeatTimer = nullptr;
+    }
+    if (m_modifiers.link.next != nullptr) {
+      wl_list_remove(&m_modifiers.link);
+      wl_list_remove(&m_key.link);
+      wl_list_remove(&m_destroy.link);
+    }
+  }
+
+  void Keyboard::onModifiers(wl_listener* listener, void* /*data*/) {
+    Keyboard* self;
+    self = wl_container_of(listener, self, m_modifiers);
+    self->handleModifiers();
+  }
+
+  void Keyboard::onKey(wl_listener* listener, void* data) {
+    Keyboard* self;
+    self = wl_container_of(listener, self, m_key);
+    self->handleKey(data);
+  }
+
+  void Keyboard::onDestroy(wl_listener* listener, void* /*data*/) {
+    Keyboard* self;
+    self = wl_container_of(listener, self, m_destroy);
+    self->handleDestroy();
+  }
+
+  void Keyboard::prepareInputCapture(bool ending) {
+    cancelRepeat();
+    if (ending) {
+      for (size_t index = 0; index < m_keyboard->num_keycodes; ++index) {
+        m_consumedKeycodes.insert(m_keyboard->keycodes[index]);
+      }
+      return;
+    }
+    if (wlr_input_method_keyboard_grab_v2* grab = activeInputMethodGrab(); grab != nullptr) {
+      for (size_t index = 0; index < m_keyboard->num_keycodes; ++index) {
+        const uint32_t keycode = m_keyboard->keycodes[index];
+        if (!m_consumedKeycodes.contains(keycode)) {
+          wlr_input_method_keyboard_grab_v2_send_key(grab, 0, keycode, WL_KEYBOARD_KEY_STATE_RELEASED);
+        }
+      }
+      wlr_keyboard_modifiers neutral{};
+      wlr_input_method_keyboard_grab_v2_send_modifiers(grab, &neutral);
+    }
+  }
+
+  void Keyboard::handleModifiers() {
+    if (InputCapture* capture = m_server->inputCapture(); capture != nullptr && (capture->capabilities() & 1U) != 0) {
+      if (!m_syncingLayout && !m_server->syncingKeyboardLocks() && !m_virtual) {
+        m_server->rememberKeyboardInputSource(*this);
+      }
+      if (!m_virtual) {
+        capture->captureModifiers(m_keyboard);
+      }
+      return;
+    }
+    wlr_seat* seat = m_server->seat()->wlr();
+    if (m_syncingLayout || m_server->syncingKeyboardLocks()) {
+      m_server->refreshKeyboardLeds();
+      // A config reload can remap the seat's current keyboard to a differently
+      // ordered matching group. Forward that current state, but never select or
+      // forward a sibling keyboard merely because it was synchronized.
+      if (wlr_seat_get_keyboard(seat) == m_keyboard) {
+        wlr_input_method_keyboard_grab_v2* grab = activeInputMethodGrab();
+        if (grab != nullptr) {
+          wlr_input_method_keyboard_grab_v2_set_keyboard(grab, m_keyboard);
+          wlr_input_method_keyboard_grab_v2_send_modifiers(grab, &m_keyboard->modifiers);
+        } else {
+          wlr_seat_keyboard_notify_modifiers(seat, &m_keyboard->modifiers);
+        }
+        m_server->seat()->notifyPointerModifiers();
+        m_server->refreshModTapState();
+        if (Ipc* ipc = m_server->ipc(); ipc != nullptr) {
+          ipc->notifyModifiersChanged();
+        }
+      }
+      return;
+    }
+    if (!m_virtual && m_server->eisInput() != nullptr) {
+      m_server->eisInput()->updateModifiers(m_keyboard->modifiers);
+    }
+    m_server->rememberKeyboardInputSource(*this);
+    cancelRepeat();
+    m_server->notifyIdleActivity();
+    wlr_input_method_keyboard_grab_v2* grab = activeInputMethodGrab();
+    if (grab != nullptr) {
+      wlr_input_method_keyboard_grab_v2_set_keyboard(grab, m_keyboard);
+      wlr_input_method_keyboard_grab_v2_send_modifiers(grab, &m_keyboard->modifiers);
+    } else {
+      wlr_seat_set_keyboard(seat, m_keyboard);
+      wlr_seat_keyboard_notify_modifiers(seat, &m_keyboard->modifiers);
+    }
+    // A grabbed keyboard may differ from the seat keyboard. Only forward
+    // masks belonging to the keymap already sent to pointer clients.
+    if (wlr_seat_get_keyboard(seat) == m_keyboard) {
+      m_server->seat()->notifyPointerModifiers();
+    }
+    m_server->cursor()->refreshInteractiveCursor();
+    m_server->refreshModTapState();
+    if (Ipc* ipc = m_server->ipc(); ipc != nullptr) {
+      ipc->notifyModifiersChanged();
+    }
+    notifyLayoutIfChanged();
+  }
+
+  void Keyboard::handleKey(void* data) {
+    auto* event = static_cast<wlr_keyboard_key_event*>(data);
+    if (InputCapture* capture = m_server->inputCapture();
+        capture != nullptr && (capture->capabilities() & 1U) != 0 && m_virtual) {
+      if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        m_consumedKeycodes.insert(event->keycode);
+      } else {
+        m_consumedKeycodes.erase(event->keycode);
+      }
+      return;
+    }
+    m_server->rememberKeyboardInputSource(*this);
+    if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+      m_server->notifyInputActivity();
+    } else {
+      m_server->notifyIdleActivity();
+    }
+    wlr_seat* seat = m_server->seat()->wlr();
+
+    uint32_t keycode = event->keycode + 8;
+    const xkb_keysym_t* syms = nullptr;
+    int nsyms = xkb_state_key_get_syms(m_keyboard->xkb_state, keycode, &syms);
+    xkb_keymap* keymap = xkb_state_get_keymap(m_keyboard->xkb_state);
+    const xkb_layout_index_t layout = xkb_state_key_get_layout(m_keyboard->xkb_state, keycode);
+    const uint32_t rawSym = rawShortcutKeysym(keymap, keycode, layout);
+    const bool modifierOnly = nsyms > 0 && syms[0] >= XKB_KEY_Shift_L && syms[0] <= XKB_KEY_Hyper_R;
+
+    bool handled = false;
+    std::optional<Keybind> modifierTap;
+    // An XF86 key can arrive from a dedicated hotkey device while its modifiers are held on the main keyboard. Match
+    // against the combined seat-wide state so those chords behave like keys on one device.
+    uint32_t modifiers = m_server->keyboardModifiers(true);
+    // Track a pristine mod press: only a mod press with no other modifiers
+    // starts one, and any other press ends it. The release event carries this
+    // flag so a shell can tell a plain tap from a shortcut chord.
+    if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+      uint32_t pressedModifier = 0;
+      for (int index = 0; index < nsyms; ++index) {
+        pressedModifier |= modifierForKeysym(static_cast<uint32_t>(syms[index]));
+      }
+      const uint32_t plain = modifiers & ~(WLR_MODIFIER_CAPS | WLR_MODIFIER_MOD2);
+      if (pressedModifier != 0 && pressedModifier == m_server->modKey() && plain == 0) {
+        m_server->setModTapPristine(true);
+      } else if (pressedModifier != 0 || !modifierOnly) {
+        m_server->setModTapPristine(false);
+      }
+    }
+    if (QuitConfirm* confirm = m_server->quitConfirm();
+        confirm != nullptr && confirm->visible() && confirm->kind() == QuitConfirm::Kind::InputCapture && m_virtual) {
+      if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        m_consumedKeycodes.insert(event->keycode);
+      } else {
+        m_consumedKeycodes.erase(event->keycode);
+      }
+      return;
+    }
+    if (InputCapture* capture = m_server->inputCapture(); capture != nullptr && capture->active()) {
+      cancelRepeat();
+      const bool pressed = event->state == WL_KEYBOARD_KEY_STATE_PRESSED;
+      if (!m_virtual && pressed) {
+        const bool escape =
+            (modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)) == (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)
+            && std::ranges::any_of(std::span(syms, nsyms > 0 ? static_cast<size_t>(nsyms) : 0), [](xkb_keysym_t sym) {
+                 return sym == XKB_KEY_Escape;
+               });
+        bool vt = false;
+        for (int index = 0; index < nsyms && !escape; ++index) {
+          vt = m_server->handleVtSwitch(syms[index], modifiers) || vt;
+        }
+        if (escape || vt) {
+          capture->suspend();
+          m_consumedKeycodes.insert(event->keycode);
+          return;
+        }
+      }
+      if ((capture->capabilities() & 1U) != 0) {
+        if (pressed) {
+          m_consumedKeycodes.insert(event->keycode);
+        } else {
+          m_consumedKeycodes.erase(event->keycode);
+        }
+        if (!m_virtual) {
+          capture->captureKey(event->time_msec, m_keyboard, event->keycode, pressed);
+        }
+        return;
+      }
+    }
+    if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+      if (!modifierOnly && nsyms > 0) {
+        m_server->cursor()->noteTyping();
+      }
+      // IME echoes must not cancel the original key's pending tap.
+      if (!m_server->inputMethodRelay()->ownsKeyboard(m_keyboard)) {
+        m_server->armModifierTap(
+            this, event->keycode, std::span<const uint32_t>(syms, nsyms > 0 ? static_cast<size_t>(nsyms) : 0), modifiers
+        );
+      }
+      cancelRepeat();
+      bool vtSwitched = false;
+      for (int i = 0; i < nsyms; ++i) {
+        if (m_server->handleVtSwitch(syms[i], modifiers)) {
+          vtSwitched = true;
+          handled = true;
+        }
+      }
+      // El selector nativo de escritorio es modal mientras está abierto:
+      // Escape lo cierra, 1–9 eligen y el resto no escribe en la ventana.
+      if (MoveMenu* menu = m_server->moveMenu(); menu != nullptr && menu->visible() && !modifierOnly) {
+        bool chosen = false;
+        for (int i = 0; i < nsyms && !chosen; ++i) {
+          chosen = menu->handleKey(syms[i]);
+        }
+        (void)chosen;
+        handled = true;
+      }
+      // Modal confirmation consumes non-modifier presses before binds or clients.
+      // Enter or a matching action confirms; input capture can also offer R to
+      // remember approval. Modifier-only presses keep held chords intact.
+      bool confirmationConsumed = handled;
+      if (QuitConfirm* confirm = m_server->quitConfirm();
+          !handled && confirm != nullptr && confirm->visible() && !modifierOnly) {
+        bool confirmed = false;
+        bool rememberCapture = false;
+        for (int i = 0; i < nsyms; ++i) {
+          confirmed = confirmed || syms[i] == XKB_KEY_Return || syms[i] == XKB_KEY_KP_Enter;
+          if (!m_virtual && confirm->canRememberInputCapture() && (syms[i] == XKB_KEY_r || syms[i] == XKB_KEY_R)) {
+            confirmed = true;
+            rememberCapture = true;
+          }
+        }
+        // Repeating the quit action or any target-changing screencast action confirms its corresponding panel.
+        // matchKeybind mirrors handleKeybind without running the action, so the pending screencast command remains
+        // the one whose warning is visible.
+        for (int i = 0; i < nsyms && !confirmed; ++i) {
+          const Keybind* matched = m_server->matchKeybind(syms[i], rawSym, modifiers);
+          if (matched == nullptr) {
+            continue;
+          }
+          if (confirm->kind() == QuitConfirm::Kind::SessionQuit) {
+            confirmed = matched->action == KeybindAction::SessionQuit;
+          } else if (confirm->kind() == QuitConfirm::Kind::ScreenCastDynamic) {
+            confirmed = matched->action == KeybindAction::ScreenCastSetOutput
+                || matched->action == KeybindAction::ScreenCastSetWindow
+                || matched->action == KeybindAction::ScreenCastFollowWindow
+                || matched->action == KeybindAction::ScreenCastFollowOutput;
+          }
+        }
+        if (confirmed) {
+          if (confirm->kind() == QuitConfirm::Kind::SessionQuit) {
+            m_server->requestSessionExit();
+          } else if (confirm->kind() == QuitConfirm::Kind::InputEmulation) {
+            m_server->confirmInputEmulation();
+          } else if (confirm->kind() == QuitConfirm::Kind::InputCapture) {
+            m_server->confirmInputCapture(rememberCapture);
+          } else {
+            m_server->confirmScreenCastDynamic();
+          }
+        } else {
+          m_server->dismissConfirmation();
+        }
+        handled = true;
+        confirmationConsumed = true;
+      }
+      std::optional<Keybind> matched;
+      if (!confirmationConsumed) {
+        for (int i = 0; i < nsyms; ++i) {
+          // The action can move focus, and the enter it sends must already know
+          // this press is consumed, or the incoming surface is handed a held key
+          // whose release never comes.
+          m_consumedKeycodes.insert(event->keycode);
+          std::optional<Keybind> result = m_server->handleKeybind(syms[i], rawSym, modifiers);
+          if (result.has_value()) {
+            matched = std::move(result);
+            handled = true;
+            break;
+          }
+          m_consumedKeycodes.erase(event->keycode);
+        }
+      }
+      if (matched.has_value()) {
+        armRepeat(*matched, event->keycode);
+      }
+      // Unbound plain keys drive overview navigation instead of reaching clients, unless a layer surface (launcher,
+      // panel) holds the keyboard: its Escape/arrows belong to it, not to the filmstrip.
+      if (!handled && seat->keyboard_state.focused_surface == nullptr) {
+        Overview* overview = m_server->overview();
+        const uint32_t plain = modifiers & ~(WLR_MODIFIER_CAPS | WLR_MODIFIER_MOD2);
+        if (overview != nullptr && overview->interactive() && plain == 0) {
+          for (int i = 0; i < nsyms && !handled; ++i) {
+            handled = overview->handleFallbackKey(syms[i]);
+          }
+        }
+      }
+      // Any non-modifier key press dismisses the cheatsheet, except the key
+      // that just toggled it.
+      if (Cheatsheet* sheet = m_server->cheatsheet(); sheet != nullptr && sheet->visible()) {
+        const bool cheatsheetBind = matched.has_value() && isCheatsheetAction(matched->action);
+        if (!cheatsheetBind && !modifierOnly) {
+          sheet->hide();
+        }
+      }
+      if (handled) {
+        m_consumedKeycodes.insert(event->keycode);
+      }
+      if (vtSwitched) {
+        // Every release lands on the other VT, so keeping the pressed-key
+        // bookkeeping would swallow a later, unrelated release on this one.
+        m_server->forgetConsumedKeycodes();
+      }
+    } else if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+      if (m_repeatArmed && event->keycode == m_repeatKeycode) {
+        cancelRepeat();
+      }
+      modifierTap = m_server->releaseModifierTap(this, event->keycode);
+      handled = m_consumedKeycodes.erase(event->keycode) > 0;
+    }
+
+    if (!handled) {
+      wlr_input_method_keyboard_grab_v2* grab = activeInputMethodGrab();
+      if (grab != nullptr) {
+        wlr_input_method_keyboard_grab_v2_set_keyboard(grab, m_keyboard);
+        wlr_input_method_keyboard_grab_v2_send_key(grab, event->time_msec, event->keycode, event->state);
+      } else {
+        // Overview holds the seat, so windows see no keys until it closes. It never hands keyboard focus to a view
+        // while open (focusView skips the seat enter), so a non-null focus here is a layer surface that took it
+        // deliberately, e.g. a launcher panel; those keep typing.
+        const Overview* overview = m_server->overview();
+        const bool overviewOwnsKeyboard =
+            overview != nullptr && overview->active() && seat->keyboard_state.focused_surface == nullptr;
+        if (!overviewOwnsKeyboard) {
+          wlr_seat_set_keyboard(seat, m_keyboard);
+          wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
+        }
+      }
+    }
+    // A modifier-only action runs after its release reaches the focused
+    // client, so opening a surface cannot strand the old focus with Mod held.
+    if (modifierTap.has_value()) {
+      m_server->executeAction(*modifierTap);
+    }
+  }
+
+  void Keyboard::handleDestroy() {
+    if (m_repeatTimer != nullptr) {
+      wl_event_source_remove(m_repeatTimer);
+      m_repeatTimer = nullptr;
+    }
+    wl_list_remove(&m_modifiers.link);
+    wl_list_remove(&m_key.link);
+    wl_list_remove(&m_destroy.link);
+    m_modifiers.link.next = nullptr;
+    m_key.link.next = nullptr;
+    m_destroy.link.next = nullptr;
+    // removeKeyboard() deletes this object, so keep the server pointer first.
+    // Dropping the last keyboard changes the aggregate modifier mask without
+    // a modifiers event; publish it so a shell cannot keep a held-Mod overlay.
+    Server* server = m_server;
+    server->cancelModifierTap();
+    server->removeKeyboard(this);
+    server->refreshModTapState();
+    if (Ipc* ipc = server->ipc(); ipc != nullptr) {
+      ipc->notifyModifiersChanged();
+    }
+  }
+
+  void Keyboard::armRepeat(const Keybind& bind, uint32_t keycode) {
+    const int32_t rate = m_keyboard->repeat_info.rate;
+    const int32_t delay = m_keyboard->repeat_info.delay;
+    const bool repeatable = bind.action != KeybindAction::ScratchpadToggle
+        && bind.action != KeybindAction::ScratchpadFocusNext
+        && bind.action != KeybindAction::ScratchpadWindowShowNext
+        && bind.action != KeybindAction::ScratchpadWindowShowPrevious;
+    if (!bind.repeat || !repeatable || rate <= 0 || delay <= 0) {
+      cancelRepeat();
+      return;
+    }
+    m_repeatBind = bind;
+    m_repeatKeycode = keycode;
+    m_repeatIntervalMs = std::max(1, 1000 / rate);
+    if (m_repeatTimer == nullptr) {
+      wl_event_loop* loop = wl_display_get_event_loop(m_server->display());
+      m_repeatTimer = wl_event_loop_add_timer(loop, onRepeatTimer, this);
+      if (m_repeatTimer == nullptr) {
+        return;
+      }
+    }
+    wl_event_source_timer_update(m_repeatTimer, delay);
+    m_repeatArmed = true;
+  }
+
+  void Keyboard::cancelRepeat() {
+    if (m_repeatArmed) {
+      wl_event_source_timer_update(m_repeatTimer, 0);
+      m_repeatArmed = false;
+    }
+  }
+
+  int Keyboard::onRepeatTimer(void* data) {
+    auto* self = static_cast<Keyboard*>(data);
+    if (!self->m_repeatArmed) {
+      return 0;
+    }
+    if (self->m_server->sessionLocked() && !self->m_repeatBind.allowWhenLocked) {
+      self->cancelRepeat();
+      return 0;
+    }
+    if (self->m_server->keyboardShortcutsInhibited() && !self->m_repeatBind.allowWhenInhibited) {
+      self->cancelRepeat();
+      return 0;
+    }
+    self->m_server->notifyIdleActivity();
+    self->m_server->executeAction(self->m_repeatBind);
+    wl_event_source_timer_update(self->m_repeatTimer, self->m_repeatIntervalMs);
+    return 0;
+  }
+
+} // namespace umbriel

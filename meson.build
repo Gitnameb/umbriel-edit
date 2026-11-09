@@ -1,0 +1,1001 @@
+project(
+  'umbriel',
+  ['c', 'cpp'],
+  version: files('VERSION'),
+  meson_version: '>=1.3',
+  default_options: [
+    'cpp_std=c++23',
+    'warning_level=2',
+    'werror=false',
+    'b_ndebug=if-release',
+  ],
+)
+
+# wl_container_of recovers listener owners with offsetof on non-standard-layout classes, which
+# GCC and clang support; silence the conditionally-supported warning at every expansion site.
+add_project_arguments(
+  '-DWLR_USE_UNSTABLE',
+  '-Wno-invalid-offsetof',
+  language: 'cpp',
+)
+git_program = find_program('git', required: false)
+if git_program.found()
+  umbriel_git_revision_h = vcs_tag(
+    input: 'src/core/git_revision.h.in',
+    output: 'umbriel_git_revision.h',
+    command: [git_program, 'describe', '--tags', '--always', '--dirty=-dirty', '--abbrev=12'],
+    fallback: 'unknown',
+  )
+else
+  umbriel_git_revision_config = configuration_data()
+  umbriel_git_revision_config.set('VCS_TAG', 'unknown')
+  umbriel_git_revision_h = configure_file(
+    input: 'src/core/git_revision.h.in',
+    output: 'umbriel_git_revision.h',
+    configuration: umbriel_git_revision_config,
+  )
+endif
+
+umbriel_data_dir = get_option('prefix') / get_option('datadir')
+umbriel_data_dir_config = configuration_data()
+umbriel_data_dir_config.set_quoted('UMBRIEL_DATA_DIR', umbriel_data_dir)
+configure_file(
+  input: 'src/config/data_dir.h.in',
+  output: 'umbriel_data_dir.h',
+  configuration: umbriel_data_dir_config,
+)
+add_project_arguments(
+  '-DWLR_USE_UNSTABLE',
+  language: 'c',
+)
+
+# Version floors here are the union of the compositor's needs and umbrielfx's.
+wayland_server_dep = dependency('wayland-server', version: '>=1.24')
+wayland_client_dep = dependency('wayland-client')
+wayland_protocols_dep = dependency('wayland-protocols', version: '>=1.47')
+# umbrielfx compiles against wlroots' private struct layouts, so it is pinned to
+# one minor series rather than tracking whatever is installed. The floor is
+# 0.20.1: its scene surface code reads `wlr_surface_output.suspended`.
+wlroots_dep = dependency('wlroots-0.20', version: ['>=0.20.1', '<0.21.0'])
+cpp = meson.get_compiler('cpp')
+fs = import('fs')
+
+# Unit tests, harness clients, and umbrielfx's checks are defined only when
+# `tests` resolves to enabled. Auto mode covers unsanitized debug builds, so a
+# distribution release build defines no test targets and `meson install` never
+# builds one.
+tests_opt = get_option('tests')
+build_tests = tests_opt.enabled() or (
+  tests_opt.auto()
+  and get_option('buildtype') == 'debug'
+  and get_option('b_sanitize') == 'none'
+)
+
+# Harness-only behavior is compiled out of anything but a debug build unless requested, so a release cannot expose it.
+harness_opt = get_option('harness')
+if harness_opt.enabled() or (harness_opt.auto() and get_option('buildtype') == 'debug')
+  add_project_arguments('-DUMBRIEL_HARNESS', language: 'cpp')
+endif
+
+if cpp.get_define('WLR_HAS_SESSION', prefix: '#include <wlr/config.h>', dependencies: wlroots_dep) != '1'
+  error('Umbriel requires wlroots built with session support')
+endif
+wlr_has_drm_backend = cpp.get_define(
+  'WLR_HAS_DRM_BACKEND',
+  prefix: '#include <wlr/config.h>',
+  dependencies: wlroots_dep,
+) == '1'
+add_project_arguments(
+  '-DUMBRIEL_HAS_DRM_BACKEND=' + wlr_has_drm_backend.to_int().to_string(),
+  language: 'cpp',
+)
+if cpp.get_define('WLR_HAS_LIBINPUT_BACKEND', prefix: '#include <wlr/config.h>', dependencies: wlroots_dep) != '1'
+  error('Umbriel requires wlroots built with the libinput backend')
+endif
+if cpp.get_define('WLR_HAS_XWAYLAND', prefix: '#include <wlr/config.h>', dependencies: wlroots_dep) != '1'
+  error('Umbriel requires wlroots built with Xwayland support')
+endif
+
+# jemalloc keeps a long-running compositor's heap compact: fewer arenas and fast page decay bound RSS. It interposes malloc only on glibc, so other libc builds
+# skip it (auto) or fail (enabled).
+jemalloc_option = get_option('jemalloc')
+is_glibc = cpp.get_define('__GLIBC__', prefix: '#include <features.h>') != ''
+jemalloc_deps = []
+jemalloc_cpp_args = []
+
+if jemalloc_option.enabled() and not is_glibc
+  error('jemalloc support requires glibc')
+endif
+
+if is_glibc
+  jemalloc_dep = dependency('jemalloc', required: jemalloc_option)
+  if jemalloc_dep.found()
+    jemalloc_deps += [jemalloc_dep]
+    jemalloc_cpp_args += ['-DUMBRIEL_USE_JEMALLOC=1']
+  endif
+endif
+
+xkbcommon_dep = dependency('xkbcommon', version: '>=1.10.0')
+libinput_dep = dependency('libinput', version: '>=1.29')
+libeis_dep = dependency('libeis-1.0', version: '>=1.3')
+pixman_dep = dependency('pixman-1', version: '>=0.43.0')
+tomlplusplus_dep = dependency('tomlplusplus')
+nlohmann_json_dep = dependency('nlohmann_json')
+cairo_dep = dependency('cairo')
+pangocairo_dep = dependency('pangocairo')
+gdk_pixbuf_dep = dependency('gdk-pixbuf-2.0')
+libdrm_dep = dependency('libdrm', version: '>=2.4.129')
+libdisplay_info_dep = dependency('libdisplay-info', version: '>=0.3.0')
+libudev_dep = dependency('libudev', required: false)
+# sd-bus reads the systemd-localed keymap a keyboard without XKB config uses.
+libsystemd_dep = dependency('libsystemd', version: '>=243', required: get_option('localed'))
+xcb_dep = dependency('xcb')
+xcb_icccm_dep = dependency('xcb-icccm')
+xcb_ewmh_dep = dependency('xcb-ewmh')
+xcb_shape_dep = dependency('xcb-shape')
+xcb_randr_dep = dependency('xcb-randr')
+native_drm_policy_supported = wlr_has_drm_backend and libudev_dep.found()
+native_drm_policy_deps = []
+if native_drm_policy_supported
+  native_drm_policy_deps += libudev_dep
+endif
+add_project_arguments(
+  '-DUMBRIEL_HAS_NATIVE_DRM_POLICY=' + native_drm_policy_supported.to_int().to_string(),
+  '-DUMBRIEL_HAS_SD_BUS=' + libsystemd_dep.found().to_int().to_string(),
+  language: 'cpp',
+)
+
+wayland_scanner = find_program('wayland-scanner')
+
+input_capture_server_h = custom_target(
+  'umbriel-input-capture-v1-server-protocol.h',
+  input: 'protocols/umbriel-input-capture-v1.xml',
+  output: 'umbriel-input-capture-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+input_capture_client_h = custom_target(
+  'umbriel-input-capture-v1-client-protocol.h',
+  input: 'protocols/umbriel-input-capture-v1.xml',
+  output: 'umbriel-input-capture-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+input_capture_protocol_c = custom_target(
+  'umbriel-input-capture-v1-protocol.c',
+  input: 'protocols/umbriel-input-capture-v1.xml',
+  output: 'umbriel-input-capture-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+# umbrielfx's vendored layer-shell scene helper needs this server header, so it
+# is generated before the subdir that consumes it.
+layer_shell_protocol_h = custom_target(
+  'wlr-layer-shell-unstable-v1-protocol.h',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+
+# wlroots' layer-shell header includes the generated header by name, so any
+# target reaching src/wlr.h needs it generated and on its include path. It lands
+# in the build root, which only root-scope targets get for free.
+layer_shell_protocol_dep = declare_dependency(
+  sources: layer_shell_protocol_h,
+  include_directories: include_directories('.'),
+)
+
+# Off by default: an enabled client opens a listening socket. The probe is
+# `___tracy_connected` because the no-op stub still links and records nothing.
+tracy_dep = dependency('tracy', required: get_option('tracy'))
+if tracy_dep.found()
+  if not cpp.has_function(
+    '___tracy_connected',
+    args: ['-DTRACY_ENABLE', '-DTRACY_ON_DEMAND'],
+    prefix: '#include <tracy/TracyC.h>',
+    dependencies: tracy_dep,
+  )
+    error('the Tracy client must be built with TRACY_ENABLE=ON and TRACY_ON_DEMAND=ON')
+  endif
+  # C++ needs the same definitions so both sets of zones share one timeline.
+  add_project_arguments('-DTRACY_ENABLE', '-DTRACY_ON_DEMAND', language: 'cpp')
+endif
+
+# Umbriel's fork of the wlroots scene graph and renderer. No installed package
+# can supply it, so it is never probed for.
+subdir('umbrielfx')
+
+# wlroots cursor-shape header pulls enum defs from wayland-protocols.
+wayland_protocols_enums = declare_dependency(
+  include_directories: include_directories(
+    wayland_protocols_dep.get_variable(pkgconfig: 'includedir'),
+    is_system: true,
+  ),
+)
+
+layer_shell_client_h = custom_target(
+  'wlr-layer-shell-unstable-v1-client-protocol.h',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+layer_shell_client_c = custom_target(
+  'wlr-layer-shell-unstable-v1-client-protocol.c',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+wlr_data_control_client_h = custom_target(
+  'wlr-data-control-unstable-v1-client-protocol.h',
+  input: 'protocols/wlr-data-control-unstable-v1.xml',
+  output: 'wlr-data-control-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+wlr_data_control_client_c = custom_target(
+  'wlr-data-control-unstable-v1-client-protocol.c',
+  input: 'protocols/wlr-data-control-unstable-v1.xml',
+  output: 'wlr-data-control-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_data_control_client_h = custom_target(
+  'ext-data-control-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-data-control/ext-data-control-v1.xml',
+  output: 'ext-data-control-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_data_control_client_c = custom_target(
+  'ext-data-control-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-data-control/ext-data-control-v1.xml',
+  output: 'ext-data-control-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+foreign_toplevel_client_h = custom_target(
+  'wlr-foreign-toplevel-management-unstable-v1-client-protocol.h',
+  input: 'protocols/wlr-foreign-toplevel-management-unstable-v1.xml',
+  output: 'wlr-foreign-toplevel-management-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+foreign_toplevel_client_c = custom_target(
+  'wlr-foreign-toplevel-management-unstable-v1-client-protocol.c',
+  input: 'protocols/wlr-foreign-toplevel-management-unstable-v1.xml',
+  output: 'wlr-foreign-toplevel-management-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_shell_client_h = custom_target(
+  'xdg-shell-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/xdg-shell/xdg-shell.xml',
+  output: 'xdg-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_shell_client_c = custom_target(
+  'xdg-shell-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/xdg-shell/xdg-shell.xml',
+  output: 'xdg-shell-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+toplevel_drag_xml = wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml'
+toplevel_drag_server_h = custom_target(
+  'xdg-toplevel-drag-v1-server-protocol.h',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+toplevel_drag_client_h = custom_target(
+  'xdg-toplevel-drag-v1-client-protocol.h',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+toplevel_drag_c = custom_target(
+  'xdg-toplevel-drag-v1-protocol.c',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+text_input_client_h = custom_target(
+  'text-input-unstable-v3-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/text-input/text-input-unstable-v3.xml',
+  output: 'text-input-unstable-v3-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+text_input_client_c = custom_target(
+  'text-input-unstable-v3-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/text-input/text-input-unstable-v3.xml',
+  output: 'text-input-unstable-v3-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+legacy_decoration_client_h = custom_target(
+  'server-decoration-client-protocol.h',
+  input: 'protocols/server-decoration.xml',
+  output: 'server-decoration-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+legacy_decoration_client_c = custom_target(
+  'server-decoration-client-protocol.c',
+  input: 'protocols/server-decoration.xml',
+  output: 'server-decoration-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_decoration_client_h = custom_target(
+  'xdg-decoration-unstable-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml',
+  output: 'xdg-decoration-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_decoration_client_c = custom_target(
+  'xdg-decoration-unstable-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml',
+  output: 'xdg-decoration-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_activation_client_h = custom_target(
+  'xdg-activation-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-activation/xdg-activation-v1.xml',
+  output: 'xdg-activation-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_activation_client_c = custom_target(
+  'xdg-activation-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-activation/xdg-activation-v1.xml',
+  output: 'xdg-activation-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_toplevel_tag_client_h = custom_target(
+  'xdg-toplevel-tag-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml',
+  output: 'xdg-toplevel-tag-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_toplevel_tag_client_c = custom_target(
+  'xdg-toplevel-tag-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml',
+  output: 'xdg-toplevel-tag-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_dialog_client_h = custom_target(
+  'xdg-dialog-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-dialog/xdg-dialog-v1.xml',
+  output: 'xdg-dialog-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_dialog_client_c = custom_target(
+  'xdg-dialog-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-dialog/xdg-dialog-v1.xml',
+  output: 'xdg-dialog-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+xdg_foreign_client_h = custom_target(
+  'xdg-foreign-unstable-v2-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
+  output: 'xdg-foreign-unstable-v2-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_foreign_client_c = custom_target(
+  'xdg-foreign-unstable-v2-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
+  output: 'xdg-foreign-unstable-v2-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+content_type_client_h = custom_target(
+  'content-type-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/content-type/content-type-v1.xml',
+  output: 'content-type-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+content_type_client_c = custom_target(
+  'content-type-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/content-type/content-type-v1.xml',
+  output: 'content-type-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+color_management_client_h = custom_target(
+  'color-management-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/color-management/color-management-v1.xml',
+  output: 'color-management-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+color_management_client_c = custom_target(
+  'color-management-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/color-management/color-management-v1.xml',
+  output: 'color-management-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+tearing_control_client_h = custom_target(
+  'tearing-control-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/tearing-control/tearing-control-v1.xml',
+  output: 'tearing-control-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+tearing_control_client_c = custom_target(
+  'tearing-control-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/tearing-control/tearing-control-v1.xml',
+  output: 'tearing-control-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+color_management_server_h = custom_target(
+  'color-management-v1-server-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/color-management/color-management-v1.xml',
+  output: 'color-management-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+color_management_server_c = custom_target(
+  'color-management-v1-server-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/color-management/color-management-v1.xml',
+  output: 'color-management-v1-server-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+xdg_output_server_h = custom_target(
+  'xdg-output-unstable-v1-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-output/xdg-output-unstable-v1.xml',
+  output: 'xdg-output-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_output_server_c = custom_target(
+  'xdg-output-unstable-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/xdg-output/xdg-output-unstable-v1.xml',
+  output: 'xdg-output-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+viewporter_client_h = custom_target(
+  'viewporter-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/viewporter/viewporter.xml',
+  output: 'viewporter-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+viewporter_client_c = custom_target(
+  'viewporter-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/viewporter/viewporter.xml',
+  output: 'viewporter-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+fractional_scale_client_h = custom_target(
+  'fractional-scale-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/fractional-scale/fractional-scale-v1.xml',
+  output: 'fractional-scale-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+fractional_scale_client_c = custom_target(
+  'fractional-scale-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/fractional-scale/fractional-scale-v1.xml',
+  output: 'fractional-scale-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+linux_dmabuf_client_h = custom_target(
+  'linux-dmabuf-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/linux-dmabuf/linux-dmabuf-v1.xml',
+  output: 'linux-dmabuf-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+linux_dmabuf_client_c = custom_target(
+  'linux-dmabuf-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/linux-dmabuf/linux-dmabuf-v1.xml',
+  output: 'linux-dmabuf-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+linux_drm_syncobj_client_h = custom_target(
+  'linux-drm-syncobj-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
+  output: 'linux-drm-syncobj-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+linux_drm_syncobj_client_c = custom_target(
+  'linux-drm-syncobj-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
+  output: 'linux-drm-syncobj-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_image_capture_source_client_h = custom_target(
+  'ext-image-capture-source-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-image-capture-source/ext-image-capture-source-v1.xml',
+  output: 'ext-image-capture-source-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_image_capture_source_client_c = custom_target(
+  'ext-image-capture-source-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-image-capture-source/ext-image-capture-source-v1.xml',
+  output: 'ext-image-capture-source-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_image_copy_capture_client_h = custom_target(
+  'ext-image-copy-capture-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',
+  output: 'ext-image-copy-capture-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_image_copy_capture_client_c = custom_target(
+  'ext-image-copy-capture-v1-client-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml',
+  output: 'ext-image-copy-capture-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_foreign_toplevel_list_client_h = custom_target(
+  'ext-foreign-toplevel-list-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
+  output: 'ext-foreign-toplevel-list-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_foreign_toplevel_list_client_c = custom_target(
+  'ext-foreign-toplevel-list-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
+  output: 'ext-foreign-toplevel-list-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+idle_inhibit_client_h = custom_target(
+  'idle-inhibit-unstable-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/idle-inhibit/idle-inhibit-unstable-v1.xml',
+  output: 'idle-inhibit-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+idle_inhibit_client_c = custom_target(
+  'idle-inhibit-unstable-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/idle-inhibit/idle-inhibit-unstable-v1.xml',
+  output: 'idle-inhibit-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+constraint_client_protocols = []
+foreach protocol : ['pointer-constraints', 'relative-pointer']
+  protocol_xml = wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable' / protocol / (protocol + '-unstable-v1.xml')
+  constraint_client_protocols += custom_target(
+    protocol + '-unstable-v1-client-protocol.h',
+    input: protocol_xml,
+    output: protocol + '-unstable-v1-client-protocol.h',
+    command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+  )
+  constraint_client_protocols += custom_target(
+    protocol + '-unstable-v1-protocol.c',
+    input: protocol_xml,
+    output: protocol + '-unstable-v1-protocol.c',
+    command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+  )
+endforeach
+
+keyboard_shortcuts_inhibit_client_h = custom_target(
+  'keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml',
+  output: 'keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+keyboard_shortcuts_inhibit_client_c = custom_target(
+  'keyboard-shortcuts-inhibit-unstable-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml',
+  output: 'keyboard-shortcuts-inhibit-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+ext_idle_notify_client_h = custom_target(
+  'ext-idle-notify-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-idle-notify/ext-idle-notify-v1.xml',
+  output: 'ext-idle-notify-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_idle_notify_client_c = custom_target(
+  'ext-idle-notify-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-idle-notify/ext-idle-notify-v1.xml',
+  output: 'ext-idle-notify-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_session_lock_client_h = custom_target(
+  'ext-session-lock-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-session-lock/ext-session-lock-v1.xml',
+  output: 'ext-session-lock-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_session_lock_client_c = custom_target(
+  'ext-session-lock-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-session-lock/ext-session-lock-v1.xml',
+  output: 'ext-session-lock-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+security_context_client_h = custom_target(
+  'security-context-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/security-context/security-context-v1.xml',
+  output: 'security-context-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+security_context_client_c = custom_target(
+  'security-context-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/security-context/security-context-v1.xml',
+  output: 'security-context-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+output_mgmt_client_h = custom_target(
+  'wlr-output-management-unstable-v1-client-protocol.h',
+  input: 'protocols/wlr-output-management-unstable-v1.xml',
+  output: 'wlr-output-management-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+output_mgmt_client_c = custom_target(
+  'wlr-output-management-unstable-v1-protocol.c',
+  input: 'protocols/wlr-output-management-unstable-v1.xml',
+  output: 'wlr-output-management-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+virtual_pointer_client_h = custom_target(
+  'wlr-virtual-pointer-unstable-v1-client-protocol.h',
+  input: 'protocols/wlr-virtual-pointer-unstable-v1.xml',
+  output: 'wlr-virtual-pointer-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+virtual_pointer_client_c = custom_target(
+  'wlr-virtual-pointer-unstable-v1-protocol.c',
+  input: 'protocols/wlr-virtual-pointer-unstable-v1.xml',
+  output: 'wlr-virtual-pointer-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+virtual_keyboard_client_h = custom_target(
+  'virtual-keyboard-unstable-v1-client-protocol.h',
+  input: 'protocols/virtual-keyboard-unstable-v1.xml',
+  output: 'virtual-keyboard-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+virtual_keyboard_client_c = custom_target(
+  'virtual-keyboard-unstable-v1-protocol.c',
+  input: 'protocols/virtual-keyboard-unstable-v1.xml',
+  output: 'virtual-keyboard-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+input_method_client_h = custom_target(
+  'input-method-unstable-v2-client-protocol.h',
+  input: 'protocols/input-method-unstable-v2.xml',
+  output: 'input-method-unstable-v2-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+input_method_client_c = custom_target(
+  'input-method-unstable-v2-protocol.c',
+  input: 'protocols/input-method-unstable-v2.xml',
+  output: 'input-method-unstable-v2-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+ext_workspace_client_h = custom_target(
+  'ext-workspace-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-workspace/ext-workspace-v1.xml',
+  output: 'ext-workspace-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_workspace_client_c = custom_target(
+  'ext-workspace-v1-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-workspace/ext-workspace-v1.xml',
+  output: 'ext-workspace-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+# Logic with no dependency on the compositor: string parsing and layout geometry. Built once and linked by both the
+# compositor and the tests, so a test never recompiles a translation unit. Keep this list free of anything needing
+# umbrielfx, pango, or a running server.
+pure_sources = files(
+  'src/config/change.cpp',
+  'src/config/resolve.cpp',
+  'src/config/keybind_parse.cpp',
+  'src/config/value_parse.cpp',
+  'src/config/section.cpp',
+  'src/config/effects.cpp',
+  'src/input/lid_state.cpp',
+  'src/input/modifier_tap.cpp',
+  'src/input/swipe_tracker.cpp',
+  'src/input/keyboard_layout.cpp',
+  'src/input/keyboard_leds.cpp',
+  'src/input/keyboard_state.cpp',
+  'src/input/input_capture_geometry.cpp',
+  'src/input/surface_layouts.cpp',
+  'src/input/shortcuts_inhibit.cpp',
+  'src/input/shortcut_keysym.cpp',
+  'src/input/xcursor_matcher.cpp',
+  'src/layout/layout.cpp',
+  'src/scene/ssd_frame_geometry.cpp',
+  'src/layout/layout_motion.cpp',
+  'src/layout/scrolling.cpp',
+  'src/layout/dwindle.cpp',
+  'src/layout/master.cpp',
+  'src/layout/stacking.cpp',
+  'src/output/direction.cpp',
+  'src/output/identity.cpp',
+  'src/output/enable_overrides.cpp',
+  'src/output/format_sequence.cpp',
+  'src/output/gamma_transition.cpp',
+  'src/output/mode_selection.cpp',
+  'src/output/cursor_plane_pace.cpp',
+  'src/server/allocator_policy.cpp',
+  'src/server/drm_policy.cpp',
+  'src/scene/cheatsheet_rows.cpp',
+  'src/scene/effect_selection.cpp',
+  'src/overview/shortcut_labels.cpp',
+  'src/view/border_ring.cpp',
+  'src/view/effects_rules.cpp',
+  'src/view/floating.cpp',
+  'src/view/window_region.cpp',
+  'src/view/drag_physics.cpp',
+  'src/xwayland/xsettings.cpp',
+)
+
+umbriel_pure_deps = [
+  wlroots_dep,
+  xkbcommon_dep,
+  umbrielfx_dep,
+  tomlplusplus_dep,
+  layer_shell_protocol_dep,
+]
+
+umbriel_pure = static_library(
+  'umbriel-pure',
+  pure_sources,
+  include_directories: include_directories('src'),
+  dependencies: umbriel_pure_deps,
+)
+
+# What a test needs to use the pure layer: the library, the include root, and
+# the dependencies its headers pull in (umbrielfx for the border ring's corner radii).
+umbriel_pure_dep = declare_dependency(
+  link_with: umbriel_pure,
+  include_directories: include_directories('src'),
+  dependencies: umbriel_pure_deps,
+)
+
+# The compositor itself. main.cpp is deliberately not here: everything lives in a library so a test can link any of it without re-listing or recompiling sources,
+# and the executable is just an entry point.
+core_sources = files(
+  'src/core/animation.cpp',
+  'src/core/application_scope.cpp',
+  'src/scene/effect_registry.cpp',
+  'src/core/fdlimit.cpp',
+  'src/core/log.cpp',
+  'src/config/config.cpp',
+  'src/config/fields.cpp',
+  'src/config/fields_animation.cpp',
+  'src/config/fields_drm.cpp',
+  'src/config/fields_effects.cpp',
+  'src/config/fields_general.cpp',
+  'src/config/fields_input.cpp',
+  'src/config/fields_keybinds.cpp',
+  'src/config/fields_layout.cpp',
+  'src/config/fields_output.cpp',
+  'src/config/fields_rules.cpp',
+  'src/config/store.cpp',
+  'src/config/config_merge.cpp',
+  'src/config/config_watcher.cpp',
+  'src/config/schema.cpp',
+  'src/layout/drop_target.cpp',
+  'src/server/color_manager.cpp',
+  'src/server/color_description.cpp',
+  'src/server/backend_manager.cpp',
+  'src/server/drm_lease.cpp',
+  'src/server/allocator.cpp',
+  'src/server/server.cpp',
+  'src/server/server_events.cpp',
+  'src/server/server_keybinds.cpp',
+  'src/server/server_outputs.cpp',
+  'src/server/syncobj_acquire_barrier.cpp',
+  'src/server/syncobj_superseded_release.cpp',
+  'src/server/syncobj_unmap_release.cpp',
+  'src/server/actions.cpp',
+  'src/server/effects.cpp',
+  'src/output/output.cpp',
+  'src/output/hdr_metadata.cpp',
+  'src/input/seat.cpp',
+  'src/input/toplevel_drag.cpp',
+  'src/input/keyboard.cpp',
+  'src/input/system_keymap.cpp',
+  'src/input/text_input.cpp',
+  'src/input/cursor.cpp',
+  'src/input/gestures.cpp',
+  'src/input/cursor_constraint.cpp',
+  'src/view/view.cpp',
+  'src/view/decoration.cpp',
+  'src/view/effects.cpp',
+  'src/view/presentation.cpp',
+  'src/view/registry.cpp',
+  'src/server/focus.cpp',
+  'src/xwayland/xwayland.cpp',
+  'src/xwayland/shape.cpp',
+  'src/input/eis.cpp',
+  'src/input/input_capture.cpp',
+  'src/input/input_capture_permissions.cpp',
+  'src/input/eis_socket.cpp',
+  'src/xwayland/window.cpp',
+  'src/xwayland/unmanaged.cpp',
+  'src/xwayland/outputs.cpp',
+  'src/xwayland/primary.cpp',
+  'src/core/process.cpp',
+  'src/core/process_syscall.cpp',
+  'src/view/view_foreign.cpp',
+  'src/view/view_role.cpp',
+  'src/view/view_animation.cpp',
+  'src/view/view_attachment.cpp',
+  'src/view/view_chrome.cpp',
+  'src/view/view_floating.cpp',
+  'src/view/view_region.cpp',
+  'src/view/view_lifecycle.cpp',
+  'src/view/view_rules.cpp',
+  'src/view/view_state.cpp',
+  'src/view/popup.cpp',
+  'src/layer/layer_surface.cpp',
+  'src/scene/surface_blur.cpp',
+  'src/scene/surface_shape.cpp',
+  'src/scene/hint_rect.cpp',
+  'src/scene/move_menu.cpp',
+  'src/scene/native_handles.cpp',
+  'src/scene/border_rect.cpp',
+  'src/scene/surface_shadow.cpp',
+  'src/scene/config_banner.cpp',
+  'src/scene/quit_confirm.cpp',
+  'src/scene/cheatsheet.cpp',
+  'src/scene/text_buffer.cpp',
+  'src/scene/cairo_buffer.cpp',
+  'src/scene/title_bar_icon.cpp',
+  'src/scene/app_icon.cpp',
+  'src/scene/tab_bar.cpp',
+  'src/scene/ssd_frame.cpp',
+  'src/scene/tab_bar_style.cpp',
+  'src/scene/tab_label_cache.cpp',
+  'src/lock/session_lock.cpp',
+  'src/overview/overview.cpp',
+  'src/workspace/workspace.cpp',
+  'src/workspace/tab_presenter.cpp',
+  'src/workspace/scratchpad.cpp',
+  'src/cli/ipc_client.cpp',
+  'src/server/action_request.cpp',
+  'src/server/ipc.cpp',
+  'src/server/ipc_commands.cpp',
+)
+
+umbriel_core_deps = [
+  libeis_dep,
+  umbrielfx_dep,
+  wlroots_dep,
+  wayland_server_dep,
+  wayland_client_dep,
+  wayland_protocols_enums,
+  xkbcommon_dep,
+  libinput_dep,
+  pixman_dep,
+  tomlplusplus_dep,
+  cairo_dep,
+  pangocairo_dep,
+  gdk_pixbuf_dep,
+  libdrm_dep,
+  libdisplay_info_dep,
+  native_drm_policy_deps,
+  libsystemd_dep,
+  nlohmann_json_dep,
+  layer_shell_protocol_dep,
+  xcb_dep,
+  xcb_icccm_dep,
+  xcb_ewmh_dep,
+  xcb_shape_dep,
+  xcb_randr_dep,
+]
+
+umbriel_core = static_library(
+  'umbriel-core',
+  core_sources + [
+    input_capture_server_h,
+    input_capture_protocol_c,
+    toplevel_drag_server_h,
+    toplevel_drag_c,
+    xdg_shell_client_c,
+    color_management_server_h,
+    color_management_server_c,
+    xdg_output_server_h,
+    xdg_output_server_c,
+  ],
+  include_directories: include_directories('src'),
+  link_with: umbriel_pure,
+  dependencies: umbriel_core_deps,
+)
+
+# A test over compositor code links this and nothing else. It is far heavier than umbriel_pure_dep (umbrielfx, pango, cairo), so prefer the pure layer wherever the
+# code under test allows it.
+umbriel_core_dep = declare_dependency(
+  link_with: umbriel_core,
+  include_directories: include_directories('src'),
+  dependencies: umbriel_core_deps,
+)
+
+# build_info.cpp is the only unit compiled against the generated revision header
+# and the version define, and it stays out of umbriel_core so a new commit
+# rebuilds one small object and relinks the compositor instead of the library
+# every test links.
+umbriel = executable(
+  'umbriel',
+  ['src/main.cpp', 'src/core/build_info.cpp', umbriel_git_revision_h],
+  cpp_args: jemalloc_cpp_args + ['-DUMBRIEL_VERSION="' + meson.project_version() + '"'],
+  dependencies: [umbriel_core_dep] + jemalloc_deps,
+  install: true,
+)
+
+# Unit tests and the harness clients check.sh drives.
+if build_tests
+  xcb_render_dep = dependency('xcb-render')
+  subdir('tests')
+  alias_target('unit-tests', unit_test_targets)
+  alias_target('harness-clients', harness_client_targets)
+endif
+
+install_data(
+  'data/umbriel.desktop',
+  install_dir: get_option('datadir') / 'wayland-sessions',
+)
+
+umbriel_session_config = configuration_data()
+umbriel_session_config.set(
+  'UMBRIEL_EXECUTABLE',
+  get_option('prefix') / get_option('bindir') / 'umbriel',
+)
+start_umbriel = configure_file(
+  input: 'data/start-umbriel.in',
+  output: 'start-umbriel',
+  configuration: umbriel_session_config,
+  install: true,
+  install_dir: get_option('bindir'),
+  install_mode: 'rwxr-xr-x',
+)
+if build_tests
+  test_session_config = configuration_data()
+  test_session_config.set('UMBRIEL_EXECUTABLE', '/bin/sh')
+  test_start_umbriel = configure_file(
+    input: 'data/start-umbriel.in',
+    output: 'test-start-umbriel',
+    configuration: test_session_config,
+  )
+  test(
+    'session-launcher',
+    find_program('bash'),
+    args: [files('tests/session_launcher.sh'), start_umbriel, test_start_umbriel],
+  )
+endif
+configure_file(
+  input: 'data/umbriel.service.in',
+  output: 'umbriel.service',
+  configuration: umbriel_session_config,
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'user',
+)
+
+install_data(
+  'data/umbriel-session.target',
+  'data/umbriel-shutdown.target',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'user',
+)
+
+install_data(
+  'examples/config.toml',
+  install_dir: get_option('datadir') / 'umbriel',
+)
+# Bundled effect presets: each directory holds the preset's shader and an
+# effect.toml that defines it without selecting it. Users include the TOML and
+# select the name.
+foreach effect : ['animation/reveal', 'animation/squash', 'animation/workspace_wipe', 'border/pulse', 'border/audio', 'window/scanlines', 'screen/vignette', 'cursor/glow', 'cursor/trail', 'cursor/trail-path']
+  install_data(
+    'examples/effects' / effect / 'shader.glsl',
+    'examples/effects' / effect / 'effect.toml',
+    install_dir: get_option('datadir') / 'umbriel' / 'effects' / effect,
+  )
+endforeach

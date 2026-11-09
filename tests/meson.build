@@ -1,0 +1,574 @@
+# Unit tests. Each entry is [name, test sources, extra dependencies]. Every test gets umbriel_pure_dep; add umbriel_core_dep to the third field for a test that
+# needs compositor code. Either way a test never lists or recompiles a source.
+unit_tests = [
+  ['overview-navigation', ['unit/overview_navigation.cpp'], []],
+  ['gesture-physics', ['unit/gesture_physics.cpp'], []],
+  ['overview-preview-geometry', ['unit/overview_preview_geometry.cpp'], [umbriel_core_dep]],
+  ['presented-crop', ['unit/presented_crop.cpp'], []],
+  ['scene-node', ['unit/scene_node.cpp'], []],
+  ['scene-clip', ['unit/scene_clip.cpp'], [wayland_server_dep]],
+  ['xwayland-outputs', ['unit/xwayland_outputs.cpp'], [umbriel_core_dep]],
+  ['xwayland-xsettings', ['unit/xwayland_xsettings.cpp'], []],
+  ['presentation', ['unit/presentation.cpp'], [umbriel_core_dep]],
+  ['animation', ['unit/animation.cpp'], [umbriel_core_dep]],
+  ['application-scope', ['unit/application_scope.cpp'], [umbriel_core_dep], [], ['-Wl,--wrap=umbrielCloseRange']],
+  ['shader-source', ['unit/shader_source.cpp'], []],
+  ['effects', ['unit/effects.cpp'], []],
+  ['effect-selection', ['unit/effect_selection.cpp'], []],
+  ['window-opacity-blur', ['unit/window_opacity_blur.cpp'], [umbriel_core_dep]],
+  ['value-parse', ['unit/value_parse.cpp'], []],
+  ['keybind-parse', ['unit/keybind_parse.cpp'], []],
+  ['lid-state', ['unit/lid_state.cpp'], []],
+  ['output-enable-overrides', ['unit/output_enable_overrides.cpp'], []],
+  ['modifier-tap', ['unit/modifier_tap.cpp'], []],
+  ['keyboard-layout', ['unit/keyboard_layout.cpp'], []],
+  ['keyboard-leds', ['unit/keyboard_leds.cpp'], [wayland_server_dep]],
+  ['keyboard-state', ['unit/keyboard_state.cpp'], [wayland_server_dep]],
+  ['input-capture-geometry', ['unit/input_capture_geometry.cpp'], []],
+  ['input-capture-permissions', ['unit/input_capture_permissions.cpp'], [umbriel_core_dep]],
+  ['eis-socket', ['unit/eis_socket.cpp'], [umbriel_core_dep, wayland_server_dep]],
+  ['surface-layouts', ['unit/surface_layouts.cpp'], []],
+  ['shortcuts-inhibit', ['unit/shortcuts_inhibit.cpp'], []],
+  ['shortcut-keysym', ['unit/shortcut_keysym.cpp'], []],
+  ['xcursor-matcher', ['unit/xcursor_matcher.cpp'], []],
+  ['output-direction', ['unit/output_direction.cpp'], []],
+  ['output-identity', ['unit/output_identity.cpp'], []],
+  ['output-mode-selection', ['unit/output_mode_selection.cpp'], []],
+  ['cursor-plane-pace', ['unit/cursor_plane_pace.cpp'], []],
+  ['output-frame-schedule', ['unit/output_frame_schedule.cpp'], []],
+  ['output-direct-scanout', ['unit/output_direct_scanout.cpp'], []],
+  ['output-hdr-transition', ['unit/output_hdr_transition.cpp'], []],
+  ['output-format-sequence', ['unit/output_format_sequence.cpp'], []],
+  ['output-gamma-transition', ['unit/output_gamma_transition.cpp'], []],
+  ['hdr-metadata', ['unit/hdr_metadata.cpp'], [umbriel_core_dep]],
+  ['color-description', ['unit/color_description.cpp'], [umbriel_core_dep]],
+  ['hdr-format', ['unit/hdr_format.cpp'], []],
+  ['sdr-format', ['unit/sdr_format.cpp'], []],
+  ['layout-struts', ['unit/layout_struts.cpp'], []],
+  ['layout-motion', ['unit/layout_motion.cpp'], []],
+  ['scrolling-layout', ['unit/scrolling_layout.cpp'], []],
+  ['dwindle-layout', ['unit/dwindle_layout.cpp'], []],
+  ['master-layout', ['unit/master_layout.cpp'], []],
+  ['stacking-layout', ['unit/stacking_layout.cpp'], []],
+  ['tabbed-layout', ['unit/tabbed_layout.cpp'], []],
+  ['cheatsheet-rows', ['unit/cheatsheet_rows.cpp'], []],
+  ['shortcut-labels', ['unit/shortcut_labels.cpp'], []],
+  ['border-ring', ['unit/border_ring.cpp'], []],
+  ['ssd-frame-geometry', ['unit/ssd_frame_geometry.cpp'], []],
+  ['title-bar-icon', ['unit/title_bar_icon.cpp'], [umbriel_core_dep]],
+  ['floating', ['unit/floating.cpp'], []],
+  ['window-region', ['unit/window_region.cpp'], []],
+  ['drag-physics', ['unit/drag_physics.cpp'], []],
+  ['preset-cycle', ['unit/preset_cycle.cpp'], []],
+  ['maximize', ['unit/maximize.cpp'], []],
+  ['deferred-unfullscreen', ['unit/deferred_unfullscreen.cpp'], []],
+  ['config-section', ['unit/config_section.cpp'], []],
+  ['config-change', ['unit/config_change.cpp'], []],
+  ['config-schema', ['unit/config_schema.cpp'], [umbriel_core_dep]],
+  [
+    'config-load',
+    ['unit/config_load.cpp'],
+    [umbriel_core_dep],
+    [
+      '-DUMBRIEL_EXAMPLE_CONFIG="' + meson.project_source_root() / 'examples/config.toml' + '"',
+      '-DUMBRIEL_SOURCE_ROOT="' + meson.project_source_root() + '"',
+    ],
+  ],
+  ['allocator-policy', ['unit/allocator_policy.cpp'], []],
+  ['drm-policy', ['unit/drm_policy.cpp'], []],
+  ['config-watcher', ['unit/config_watcher.cpp'], [umbriel_core_dep]],
+  ['action-registry', ['unit/action_registry.cpp'], [umbriel_core_dep]],
+  ['ipc-commands', ['unit/ipc_commands.cpp'], [umbriel_core_dep]],
+  ['config-resolve', ['unit/config_resolve.cpp'], []],
+  # Reads docs/user/actions.md from the source tree: the doc's tables are generated from the same spec strings the CLI
+  # prints, so the compiled table and the page cannot drift apart unnoticed.
+  [
+    'docs-actions',
+    ['unit/docs_actions.cpp'],
+    [],
+    ['-DUMBRIEL_DOCS_ACTIONS_MD="' + meson.project_source_root() / 'docs/user/actions.md' + '"'],
+  ],
+]
+
+if native_drm_policy_supported
+  # Meson enables 64-bit file offsets; glibc redirects stat to stat64.
+  stat_symbol = is_glibc ? 'stat64' : 'stat'
+  unit_tests += [
+    ['backend-manager', ['unit/backend_manager.cpp'], [umbriel_core_dep], [], ['-Wl,--wrap=' + stat_symbol]],
+  ]
+endif
+
+if wlr_has_drm_backend
+  unit_tests += [
+    ['drm-lease', ['unit/drm_lease.cpp'], [umbriel_core_dep]],
+  ]
+endif
+
+unit_test_targets = []
+foreach unit_test : unit_tests
+  # Optional compile and link args for tests needing paths, flags, or device I/O wrappers.
+  unit_test_args = unit_test.length() > 3 ? unit_test[3] : []
+  unit_test_link_args = unit_test.length() > 4 ? unit_test[4] : []
+  test_exe = executable(
+    unit_test[0] + '-test',
+    unit_test[1],
+    include_directories: include_directories('unit'),
+    dependencies: [umbriel_pure_dep] + unit_test[2],
+    cpp_args: unit_test_args,
+    link_args: unit_test_link_args,
+  )
+  unit_test_targets += test_exe
+  # Config-load also validates the packaged example, including out-of-tree builds.
+  test(unit_test[0], test_exe, workdir: meson.project_source_root())
+endforeach
+
+test(
+  'validate-config',
+  find_program('validate_config.sh'),
+  args: [umbriel],
+)
+
+# Harness helper, not a unit test: drives virtual pointer and modifier input against a running compositor. The headless backend has no input devices, so protocol
+# input is the only way to exercise pointer hit-testing and grabs.
+pointer_client = executable(
+  'pointer-client',
+  [
+    'harness/clients/pointer_client.cpp',
+    virtual_pointer_client_h,
+    virtual_pointer_client_c,
+    virtual_keyboard_client_h,
+    virtual_keyboard_client_c,
+  ],
+  dependencies: [wayland_client_dep, xkbcommon_dep],
+)
+
+pointer_modifiers_client = executable(
+  'pointer-modifiers-client',
+  [
+    'harness/clients/pointer_modifiers_client.cpp',
+    input_method_client_h, input_method_client_c,
+    ext_session_lock_client_h, ext_session_lock_client_c,
+    virtual_pointer_client_h, virtual_pointer_client_c,
+    virtual_keyboard_client_h, virtual_keyboard_client_c,
+    layer_shell_client_h, layer_shell_client_c, xdg_shell_client_c,
+  ],
+  dependencies: [wayland_client_dep, xkbcommon_dep],
+)
+
+# Harness helper that checks deferred virtual-keyboard keymaps as seen by regular wl_keyboard clients.
+keyboard_keymap_client = executable(
+  'keyboard-keymap-client',
+  [
+    'harness/clients/keyboard_keymap_client.cpp',
+    virtual_keyboard_client_h,
+    virtual_keyboard_client_c,
+  ],
+  dependencies: [wayland_client_dep, xkbcommon_dep],
+)
+
+# Harness helper that reproduces the keyboard ownership of a real input method.
+input_method_client = executable(
+  'input-method-client',
+  [
+    'harness/clients/input_method_client.cpp',
+    input_method_client_h,
+    input_method_client_c,
+    virtual_keyboard_client_h,
+    virtual_keyboard_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that owns a mapped surface and initiates a data-device drag.
+drag_client = executable(
+  'drag-client',
+  [
+    'harness/clients/drag_client.cpp',
+    toplevel_drag_client_h, toplevel_drag_c,
+    layer_shell_client_h, layer_shell_client_c,
+    xdg_shell_client_h, xdg_shell_client_c,
+    xdg_activation_client_h, xdg_activation_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that reserves an exclusive zone on a named output. Output
+# restoration checks use it to reproduce a panel returning after windows do.
+layer_client = executable(
+  'layer-client',
+  [
+    'harness/clients/layer_client.cpp',
+    layer_shell_client_h,
+    layer_shell_client_c,
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that checks whether a Wayland global is visible to a newly
+# connected client.
+global_client = executable(
+  'global-client',
+  [
+    'harness/clients/global_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    xdg_decoration_client_h,
+    xdg_decoration_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that sets the regular clipboard through the legacy data-control
+# protocol and receives it through the standardized replacement.
+data_control_client = executable(
+  'data-control-client',
+  [
+    'harness/clients/data_control_client.cpp',
+    wlr_data_control_client_h,
+    wlr_data_control_client_c,
+    ext_data_control_client_h,
+    ext_data_control_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that reports the active workspace through ext-workspace-v1.
+workspace_client = executable(
+  'workspace-client',
+  ['harness/clients/workspace_client.cpp', ext_workspace_client_h, ext_workspace_client_c],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that checks the output membership advertised for a foreign
+# toplevel, including while its workspace is inactive.
+foreign_toplevel_client = executable(
+  'foreign-toplevel-client',
+  [
+    'harness/clients/foreign_toplevel_client.cpp',
+    foreign_toplevel_client_h,
+    foreign_toplevel_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that unmaps its toplevel on a close request without destroying
+# it, so the compositor keeps the View registered but unmapped.
+unmap_client = executable(
+  'unmap-client',
+  [
+    'harness/clients/unmap_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    xdg_activation_client_h,
+    xdg_activation_client_c,
+    xdg_toplevel_tag_client_h,
+    xdg_toplevel_tag_client_c,
+    xdg_dialog_client_h,
+    xdg_dialog_client_c,
+    xdg_foreign_client_h,
+    xdg_foreign_client_c,
+    content_type_client_h,
+    content_type_client_c,
+    color_management_client_h,
+    color_management_client_c,
+    tearing_control_client_h,
+    tearing_control_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that creates a grabbed XDG popup and reports its dismissal.
+popup_client = executable(
+  'popup-client',
+  ['harness/clients/popup_client.cpp', xdg_shell_client_h, xdg_shell_client_c],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper whose whole content is drawn by a full-window desynchronized
+# wl_subsurface, the way Firefox presents its chrome and web content.
+subsurface_client = executable(
+  'subsurface-client',
+  ['harness/clients/subsurface_client.cpp', xdg_shell_client_h, xdg_shell_client_c],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that renders one buffer at the preferred fractional scale and
+# publishes its logical size through wp_viewporter, the way a fractional-scale
+# aware toolkit does.
+fractional_client = executable(
+  'fractional-client',
+  [
+    'harness/clients/fractional_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    viewporter_client_h,
+    viewporter_client_c,
+    fractional_scale_client_h,
+    fractional_scale_client_c,
+    legacy_decoration_client_h,
+    legacy_decoration_client_c,
+    xdg_decoration_client_h,
+    xdg_decoration_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that maps one explicitly synchronized dmabuf, unmaps it, and
+# waits for the compositor to signal the buffer's release point.
+syncobj_client = executable(
+  'syncobj-client',
+  [
+    'harness/clients/syncobj_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    linux_dmabuf_client_h,
+    linux_dmabuf_client_c,
+    linux_drm_syncobj_client_h,
+    linux_drm_syncobj_client_c,
+  ],
+  dependencies: [wayland_client_dep, libdrm_dep, dependency('gbm')],
+)
+
+# Harness helper that keeps an idle inhibitor attached to a mapped toplevel and
+# reports when the compositor starts honoring its idle notification.
+idle_inhibit_client = executable(
+  'idle-inhibit-client',
+  [
+    'harness/clients/idle_inhibit_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    idle_inhibit_client_h,
+    idle_inhibit_client_c,
+    ext_idle_notify_client_h,
+    ext_idle_notify_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that locks the session through ext-session-lock and unlocks it
+# on demand, so checks can compare compositor state across a real lock cycle.
+lock_client = executable(
+  'lock-client',
+  [
+    'harness/clients/lock_client.cpp',
+    ext_session_lock_client_h,
+    ext_session_lock_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness wrapper that runs another Wayland client through a committed
+# security-context listener.
+security_context_client = executable(
+  'security-context-client',
+  [
+    'harness/clients/security_context_client.cpp',
+    security_context_client_h,
+    security_context_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+color_feedback_client = executable(
+  'color-feedback-client',
+  [
+    'harness/clients/color_feedback_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    color_management_client_h,
+    color_management_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that logs the seat input events a window receives, for input state checks.
+seat_log_client = executable(
+  'seat-log-client',
+  [
+    'harness/clients/seat_log_client.cpp',
+    constraint_client_protocols,
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    xdg_foreign_client_h,
+    xdg_foreign_client_c,
+    keyboard_shortcuts_inhibit_client_h,
+    keyboard_shortcuts_inhibit_client_c,
+    text_input_client_h,
+    text_input_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that maps an X11 window, logs its keyboard events, and
+# reports the X input focus together with the root active-window property.
+xwayland_focus_client = executable(
+  'xwayland-focus-client',
+  ['harness/clients/xwayland_focus_client.cpp'],
+  dependencies: [xcb_dep],
+)
+
+xwayland_output_client = executable(
+  'xwayland-output-client',
+  ['harness/clients/xwayland_output_client.cpp'],
+  dependencies: [xcb_dep, xcb_randr_dep, nlohmann_json_dep],
+)
+
+# An idle X11 client for controlled first-buffer and association ordering.
+xwayland_association_client = executable(
+  'xwayland-association-client',
+  ['harness/clients/xwayland_association_client.cpp'],
+  dependencies: [xcb_dep],
+)
+
+xwayland_dialog_client = executable(
+  'xwayland-dialog-client',
+  ['harness/clients/xwayland_dialog_client.cpp'],
+  dependencies: [xcb_dep],
+)
+
+xwayland_popup_client = executable(
+  'xwayland-popup-client',
+  ['harness/clients/xwayland_popup_client.cpp'],
+  dependencies: [xcb_dep],
+)
+
+xwayland_input_client = executable(
+  'xwayland-input-client',
+  ['harness/clients/xwayland_input_client.cpp'],
+  dependencies: [xcb_dep, dependency('xcb-xtest')],
+)
+
+ei_peer_client = executable(
+  'ei-peer-client',
+  ['harness/clients/ei_peer_client.cpp'],
+  dependencies: [dependency('libei-1.0', version: '>=1.3')],
+)
+
+# Eager X11 selection reader and owner for clipboard focus transitions.
+xwayland_selection_client = executable(
+  'xwayland-selection-client',
+  ['harness/clients/xwayland_selection_client.cpp'],
+  dependencies: [xcb_dep, dependency('xcb-xfixes')],
+)
+
+# ARGB windows whose bounding and input shapes change independently.
+xwayland_shape_client = executable(
+  'xwayland-shape-client',
+  ['harness/clients/xwayland_shape_client.cpp'],
+  dependencies: [xcb_dep, xcb_shape_dep],
+)
+
+# Harness pair that proves only Xwayland-owned theme cursor surfaces are
+# promoted to compositor Xcursors. The X11 fixture also supplies an unmatched
+# custom cursor, while the native fixture supplies matching theme pixels as an
+# ownership control.
+xwayland_cursor_client = executable(
+  'xwayland-cursor-client',
+  ['harness/clients/xwayland_cursor_client.cpp'],
+  dependencies: [xcb_dep, xcb_render_dep, wlroots_dep],
+)
+
+# Reads the XSETTINGS manager's selection and settings property on DISPLAY.
+xsettings_client = executable(
+  'xsettings-client',
+  ['harness/clients/xsettings_client.cpp'],
+  dependencies: [xcb_dep],
+)
+
+wayland_cursor_client = executable(
+  'wayland-cursor-client',
+  ['harness/clients/wayland_cursor_client.cpp', xdg_shell_client_h, xdg_shell_client_c],
+  dependencies: [wayland_client_dep, wlroots_dep],
+)
+
+# Harness helper that sends complete test or apply transactions through
+# wlr-output-management, including logical output disable and re-enable.
+output_management_client = executable(
+  'output-management-client',
+  [
+    'harness/clients/output_management_client.cpp',
+    output_mgmt_client_h,
+    output_mgmt_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Harness helper that counts, bounds, and samples screenshot pixels for checks.
+pixel_probe = executable(
+  'pixel-probe',
+  ['harness/clients/pixel_probe.cpp'],
+  dependencies: [cairo_dep],
+  # Checks call it for every captured frame; a debug build of the per-pixel loop would cost more than the capture.
+  override_options: ['optimization=2'],
+)
+
+# Harness helper that captures one output through ext-image-copy-capture and reports every delivered frame;
+# --cursor also asks for cursor metadata, which is what the compositor gates capture pacing on. --window ID captures
+# a window instead, the way a portal window cast does.
+capture_client = executable(
+  'capture-client',
+  [
+    'harness/clients/capture_client.cpp',
+    ext_image_capture_source_client_h,
+    ext_image_capture_source_client_c,
+    ext_image_copy_capture_client_h,
+    ext_image_copy_capture_client_c,
+    ext_foreign_toplevel_list_client_h,
+    ext_foreign_toplevel_list_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
+# Uses real backend devices in an isolated compositor to verify physical consent.
+input_capture_compositor = executable(
+  'input-capture-compositor',
+  ['harness/clients/input_capture_compositor.cpp'],
+  dependencies: [umbriel_core_dep],
+)
+input_capture_client = executable(
+  'input-capture-client',
+  ['harness/clients/input_capture_client.cpp', input_capture_client_h, input_capture_protocol_c],
+  dependencies: [wayland_client_dep, dependency('libei-1.0', version: '>=1.3')],
+)
+
+harness_client_targets = [
+  input_capture_compositor,
+  input_capture_client,
+  color_feedback_client,
+  pixel_probe,
+  capture_client,
+  pointer_client,
+  pointer_modifiers_client,
+  keyboard_keymap_client,
+  input_method_client,
+  drag_client,
+  layer_client,
+  global_client,
+  data_control_client,
+  workspace_client,
+  foreign_toplevel_client,
+  unmap_client,
+  popup_client,
+  subsurface_client,
+  fractional_client,
+  syncobj_client,
+  idle_inhibit_client,
+  lock_client,
+  security_context_client,
+  seat_log_client,
+  xwayland_focus_client,
+  xwayland_output_client,
+  xwayland_association_client,
+  xwayland_dialog_client,
+  xwayland_popup_client,
+  xwayland_input_client,
+  ei_peer_client,
+  xwayland_selection_client,
+  xwayland_shape_client,
+  xwayland_cursor_client,
+  xsettings_client,
+  wayland_cursor_client,
+  output_management_client,
+]
