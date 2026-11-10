@@ -69,16 +69,23 @@ namespace umbriel {
     if (m_titleBarOverlayVisible == visible)
       return;
     m_titleBarOverlayVisible = visible;
-    if (m_ssdFrame == nullptr) {
-      // En pantalla completa el frame no existe: se crea al mantener Mod para
-      // poder dibujar los controles sobre el contenido.
-      if (visible && fullscreenOverlayChrome()) {
-        syncSsdFrame();
+    if (visible && fullscreenOverlayChrome()) {
+      // Al entrar en pantalla completa la geometría del chrome quedó
+      // suprimida. Si Mod se mantiene después, hay que recalcularla antes de
+      // mostrarlo; si no, el frame sigue con altura 0 y no se dibuja.
+      syncSsdFrame();
+      if (m_ssdFrame != nullptr) {
+        m_ssdFrame->setOverlayVisible(true);
+        m_ssdFrame->raise();
+        wlr_scene_node_raise_to_top(&m_attachmentTree->node);
       }
       return;
     }
+    if (m_ssdFrame == nullptr) {
+      return;
+    }
     m_ssdFrame->setOverlayVisible(visible);
-    if (visible && (titleBarOverlay() || fullscreenOverlayChrome())) {
+    if (visible && titleBarOverlay()) {
       m_ssdFrame->raise();
       wlr_scene_node_raise_to_top(&m_attachmentTree->node);
     }
