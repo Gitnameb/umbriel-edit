@@ -222,7 +222,12 @@ namespace umbriel {
     int titleBarHeight() const;
     // Height of the title bar chrome itself, even when it does not reserve space.
     int titleBarChromeHeight() const;
+    // Igual que titleBarChromeHeight(), pero sin descartar la pantalla
+    // completa: sirve para dibujar los controles superpuestos con Mod.
+    int titleBarOverlayChromeHeight() const;
     bool titleBarOverlay() const;
+    // Controles superpuestos visibles sobre una ventana a pantalla completa.
+    bool fullscreenOverlayChrome() const;
     // Blurs the client content of the window under the pointer while Mod is
     // held, matching the shell mockup. Native chrome stays sharp and undimmed.
     void setModHover(bool visible);

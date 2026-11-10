@@ -26,9 +26,8 @@ extern "C" {
 #include "xwayland/xwayland.h"
 
 namespace umbriel {
-  int View::titleBarChromeHeight() const {
+  int View::titleBarOverlayChromeHeight() const {
     if (!wantsTitleBar(m_titleBarMode.value_or(config().appearance.titleBar.mode))
-        || scheduledFullscreen()
         || (m_tiled && m_workspace != nullptr && m_workspace->inTabGroup(this))) {
       return 0;
     }
@@ -39,8 +38,27 @@ namespace umbriel {
     return style.height + (style.overlay ? 2 * kOverlayPillMargin : 0);
   }
 
+  int View::titleBarChromeHeight() const {
+    // A pantalla completa no se reserva ni se dibuja chrome normal. El
+    // superpuesto, que solo aparece con Mod mantenido, se calcula aparte.
+    if (scheduledFullscreen()) {
+      return 0;
+    }
+    return titleBarOverlayChromeHeight();
+  }
+
   bool View::titleBarOverlay() const {
     return titleBarChromeHeight() > 0 && config().appearance.titleBar.overlay;
+  }
+
+  // Controles superpuestos sobre una ventana a pantalla completa. Solo se
+  // dibujan mientras se mantiene Mod o el overlay está fijado, y no reservan
+  // espacio ni tocan la geometría del juego.
+  bool View::fullscreenOverlayChrome() const {
+    return (scheduledFullscreen() || currentFullscreen())
+        && m_titleBarOverlayVisible
+        && config().appearance.titleBar.overlay
+        && titleBarOverlayChromeHeight() > 0;
   }
 
   int View::titleBarHeight() const {
@@ -51,12 +69,18 @@ namespace umbriel {
     if (m_titleBarOverlayVisible == visible)
       return;
     m_titleBarOverlayVisible = visible;
-    if (m_ssdFrame != nullptr) {
-      m_ssdFrame->setOverlayVisible(visible);
-      if (visible && titleBarOverlay()) {
-        m_ssdFrame->raise();
-        wlr_scene_node_raise_to_top(&m_attachmentTree->node);
+    if (m_ssdFrame == nullptr) {
+      // En pantalla completa el frame no existe: se crea al mantener Mod para
+      // poder dibujar los controles sobre el contenido.
+      if (visible && fullscreenOverlayChrome()) {
+        syncSsdFrame();
       }
+      return;
+    }
+    m_ssdFrame->setOverlayVisible(visible);
+    if (visible && (titleBarOverlay() || fullscreenOverlayChrome())) {
+      m_ssdFrame->raise();
+      wlr_scene_node_raise_to_top(&m_attachmentTree->node);
     }
   }
 
@@ -147,13 +171,18 @@ namespace umbriel {
     if (!m_mapped)
       return;
     const int chromeHeight = titleBarChromeHeight();
-    const int previousHeight = m_ssdFrame != nullptr ? m_ssdFrame->titleBarHeight() : 0;
-    if (previousHeight != chromeHeight) {
+    const bool fullscreenChrome = fullscreenOverlayChrome();
+    // markArrange solo mira el espacio reservado; en overlay (y en pantalla
+    // completa) es cero, así que los controles flotantes no reordenan nada.
+    const int previousHeight = m_ssdFrame != nullptr
+        ? (m_ssdFrame->titleBarOverlayMode() ? 0 : m_ssdFrame->titleBarHeight())
+        : 0;
+    if (previousHeight != titleBarHeight()) {
       if (m_workspace != nullptr)
         m_workspace->markArrange();
       m_server->scheduleIpcWindowsEvent();
     }
-    if ((chromeHeight > 0 || !m_tiled) && m_ssdFrame == nullptr) {
+    if ((chromeHeight > 0 || !m_tiled || fullscreenChrome) && m_ssdFrame == nullptr) {
       // Chrome lives in the content tree so its coordinates are the same in
       // both modes: above the content when integrated, over it when floating.
       // Overlay mode raises it above the client surface after each layout.
@@ -187,7 +216,8 @@ namespace umbriel {
     layoutChromeAttachment(content.width, content.height);
     // Overlay chrome is raised above client surfaces; attachment dialogs keep
     // the top layer because they are created later in the same tree.
-    if (m_ssdFrame != nullptr && m_titleBarOverlayVisible && titleBarOverlay())
+    if (m_ssdFrame != nullptr && m_titleBarOverlayVisible
+        && (titleBarOverlay() || fullscreenChrome))
       m_ssdFrame->raise();
     wlr_scene_node_raise_to_top(&m_attachmentTree->node);
   }
@@ -501,6 +531,8 @@ namespace umbriel {
       return;
     }
     const Output* output = currentOutput();
+    const bool fullscreen = scheduledFullscreen() || currentFullscreen();
+    const bool fullscreenChrome = fullscreenOverlayChrome();
     ViewChromeGeometry geometry{
         .contentX = 0,
         .contentY = 0,
@@ -508,10 +540,11 @@ namespace umbriel {
         .contentHeight = contentHeight,
         .borderInset = borderInset(),
         .cornerRadius = m_maximizedToEdges ? 0 : decorationCornerRadius(),
-        .titleBarHeight = titleBarChromeHeight(),
-        .titleBarOverlay = titleBarOverlay(),
+        .titleBarHeight = fullscreenChrome
+            ? titleBarOverlayChromeHeight() : titleBarChromeHeight(),
+        .titleBarOverlay = fullscreenChrome || titleBarOverlay(),
         .scale = output != nullptr ? output->wlr()->scale : 1.0F,
-        .suppressed = !m_mapped || scheduledFullscreen() || currentFullscreen(),
+        .suppressed = !m_mapped || (fullscreen && !fullscreenChrome),
     };
     if (m_ssdFrame != nullptr)
       m_ssdFrame->layout(geometry);
