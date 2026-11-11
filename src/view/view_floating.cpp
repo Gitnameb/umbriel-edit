@@ -566,11 +566,14 @@ namespace umbriel {
       wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
     }
     if (m_fixedRender) {
-      // El centrado del fullscreen anterior pudo mover este nodo; el piloto
-      // siempre lo quiere en el origen de m_contentTree y compensa con
-      // m_fixedOffsetX/Y.
+      // El centrado de la imagen va en el nodo de superficie, no en el árbol
+      // de contenido: así el borde y el fondo se quedan en la caja y la imagen
+      // se reparte con las barras negras dentro.
       if (wlr_scene_node* surfaceNode = view_detail::toplevelSurfaceTreeNode(m_contentTree, rootSurface())) {
-        wlr_scene_node_set_position(surfaceNode, 0, 0);
+        wlr_scene_node_set_position(surfaceNode, m_fixedOffsetX, m_fixedOffsetY);
+        kLog.debug("fixed-render surface node at {},{}", surfaceNode->x, surfaceNode->y);
+      } else {
+        kLog.debug("fixed-render surface node NULL");
       }
       struct Ctx {
         double applied;

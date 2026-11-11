@@ -1267,13 +1267,14 @@ namespace umbriel {
           "fixed-render presentacion {}x{} cliente {}x{} escala {:.4} offset {},{}", target.width, target.height,
           m_fixedRenderWidth, m_fixedRenderHeight, m_fixedScale, m_fixedOffsetX, m_fixedOffsetY
       );
+      // El árbol de contenido se queda en el origen de la caja para que el
+      // borde, la barra de título y el fondo coincidan con la ventana. El
+      // centrado de la imagen se hace moviendo solo el nodo de la superficie.
       if (m_contentTree != nullptr) {
-        wlr_scene_node_set_position(&m_contentTree->node, m_fixedOffsetX, m_fixedOffsetY);
+        wlr_scene_node_set_position(&m_contentTree->node, 0, 0);
       }
-      // Fondo negro de la ventana: cubre las barras que deja el fit. El
-      // rectángulo vive dentro del árbol desplazado, así que se compensa el
-      // offset para que en coordenadas de la ventana empiece en 0,0.
-      m_presentation.setBackdropBox(-m_fixedOffsetX, -m_fixedOffsetY, target.width, target.height);
+      // Fondo negro de la ventana: cubre las barras que deja el fit.
+      m_presentation.setBackdropBox(0, 0, target.width, target.height);
       m_presentation.setBackdropEnabled(true);
       applyContentScale();
       // La superficie se dibuja escalada dentro de la caja; el recorte y el

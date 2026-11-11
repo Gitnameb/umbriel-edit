@@ -1130,6 +1130,10 @@ namespace umbriel {
               static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth,
               static_cast<double>(m_fixedBoxHeight) / m_fixedRenderHeight
           );
+          const int contentWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));
+          const int contentHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
+          m_fixedOffsetX = std::max(0, (m_fixedBoxWidth - contentWidth) / 2);
+          m_fixedOffsetY = std::max(0, (m_fixedBoxHeight - contentHeight) / 2);
           m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
           beginResizeAnimation(m_fixedBoxWidth, m_fixedBoxHeight, true);
           animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
@@ -1138,6 +1142,9 @@ namespace umbriel {
           // centrada, sin esperar a que el cliente vuelva a dibujar.
           m_presentation.resetCrop(m_contentTree, rootSurface());
           applyContentScale();
+          // Sin frames de animación, nada más aplicaría la presentación: se
+          // hace ahora para que la primera imagen ya salga centrada.
+          syncOwnedPresentation();
         } else {
           requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
           beginResizeAnimation(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height, true);
