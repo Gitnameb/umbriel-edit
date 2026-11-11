@@ -263,9 +263,12 @@ namespace umbriel {
 
   void View::updateFullscreenPresentation(int width, int height) {
     if (m_fixedRender) {
-      // La escala la aplica el árbol de superficie. Resetear el centrado deja
-      // los offsets en cero; el fondo lo pone la salida.
-      m_presentation.updateFullscreen(false, 0, 0, nullptr, {});
+      // La escala la aplica el árbol de superficie. Se pasa el nodo para que
+      // se deshaga cualquier centrado viejo del fullscreen: si no, el
+      // contenido queda desplazado media caja y se sale de la ventana.
+      m_presentation.updateFullscreen(
+          false, 0, 0, toplevelSurfaceTreeNode(m_contentTree, rootSurface()), geometryBox()
+      );
       return;
     }
     m_presentation.updateFullscreen(

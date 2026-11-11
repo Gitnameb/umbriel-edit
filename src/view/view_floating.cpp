@@ -564,6 +564,39 @@ namespace umbriel {
     if (m_captureScene != nullptr) {
       wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
     }
+    if (m_fixedRender) {
+      // El centrado del fullscreen anterior pudo mover este nodo; el piloto
+      // siempre lo quiere en el origen de m_contentTree y compensa con
+      // m_fixedOffsetX/Y.
+      if (wlr_scene_node* surfaceNode = view_detail::toplevelSurfaceTreeNode(m_contentTree, rootSurface())) {
+        wlr_scene_node_set_position(surfaceNode, 0, 0);
+      }
+      struct Ctx {
+        double applied;
+      } ctx{scale};
+      wlr_scene_node_for_each_buffer(
+          &m_contentTree->node,
+          [](wlr_scene_buffer* buffer, int sx, int sy, void* data) {
+            auto* ctx = static_cast<Ctx*>(data);
+            wlr_scene_surface* sceneSurface = wlr_scene_surface_try_from_buffer(buffer);
+            if (sceneSurface == nullptr) {
+              return;
+            }
+            int width = 0;
+            int height = 0;
+            wlr_scene_surface_get_size(sceneSurface, &width, &height);
+            kLog.debug(
+                "fixed-render buffer '{}x{}' at {},{}, dest {}x{}, divisor {:.4}", sceneSurface->surface->current.width,
+                sceneSurface->surface->current.height, sx, sy, width, height, ctx->applied
+            );
+          },
+          &ctx
+      );
+      int lx = 0;
+      int ly = 0;
+      wlr_scene_node_coords(&m_contentTree->node, &lx, &ly);
+      kLog.debug("fixed-render contenido en {},{} divisor {:.4}", lx, ly, scale);
+    }
     syncXwaylandShape();
   }
 
