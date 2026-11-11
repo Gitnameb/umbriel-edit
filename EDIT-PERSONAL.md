@@ -25,6 +25,12 @@ mis necesidades y mi forma de usar el escritorio.
   ratón.
 - Ajustes de integración con el shell: foco con Super, notificaciones, volumen
   por ventana y detalles de la barra.
+- Piloto de **resolución de render fija** para juegos Xwayland
+  (`steam_app_*`, apps que abren en pantalla completa o con tamaño fijo): al
+  redimensionar la ventana flotante no se reconfigura el cliente; el contenido
+  se escala a la caja y se respeta la relación de aspecto. Así el juego
+  conserva su resolución interna aunque la ventana sea más pequeña. Solo con
+  escala de salida 1 y, por ahora, en ventanas flotantes.
 
 ## Licencia
 

@@ -172,6 +172,9 @@ namespace umbriel {
     bool restoresTiledOnUnpin() const { return m_restoreTiledAfterUnpin; }
     bool maximizedToEdges() const { return m_maximizedToEdges; }
     bool floatingMaximized() const { return m_floatingMaximized; }
+    // Piloto de resolución de render fija: el cliente conserva su tamaño y la
+    // ventana flotante se escala a la caja. Solo Xwayland y escala 1.
+    bool fixedRender() const { return m_fixedRender; }
     // Fullscreen for layout purposes follows the state already scheduled for the next configure.
     bool layoutFullscreen() const;
     bool urgent() const { return m_urgent; }
@@ -804,6 +807,11 @@ namespace umbriel {
     void syncFloatingSurfaceClip();
     void beginFloatingResize(uint32_t edges);
     void resizeFloating(int width, int height);
+    // Piloto: separa el tamaño del cliente (resolución de render) de la caja
+    // flotante. La caja se redimensiona y el contenido se escala.
+    void beginFixedRenderPilot();
+    void resizeFixedRenderBox(int width, int height);
+    void applyContentScale();
     void finishFloatingResize();
     void syncFloatingResizePosition();
     void adoptFloatingClientSize();
@@ -1144,6 +1152,16 @@ namespace umbriel {
     // The box a maximized float was last placed in, so a refit acts only when its settings moved it.
     wlr_box m_floatingMaximizedBox{};
     FloatingGeometry m_floating;
+    // Piloto de render fijo: tamaño del cliente y caja presentada. Con
+    // m_fixedScale = caja / cliente, el árbol de superficie se escala.
+    bool m_fixedRender = false;
+    int m_fixedRenderWidth = 0;
+    int m_fixedRenderHeight = 0;
+    int m_fixedBoxWidth = 0;
+    int m_fixedBoxHeight = 0;
+    int m_fixedOffsetX = 0;
+    int m_fixedOffsetY = 0;
+    double m_fixedScale = 1.0;
     // Unapplied floating defaults stay in their configured units until the first float transition.
     std::optional<int> m_pendingFloatingWidthPx;
     std::optional<int> m_pendingFloatingHeightPx;

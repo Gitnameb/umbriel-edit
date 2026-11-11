@@ -104,6 +104,10 @@ namespace umbriel {
   }
 
   void View::setMaximized(bool maximized, bool animate) {
+    if (m_fixedRender) {
+      // El piloto de render fijo no reconfigura al cliente para maximizar.
+      return;
+    }
     if (m_tiled && m_workspace != nullptr) {
       m_floatingMaximized = false;
       if (m_maximizedToEdges) {
@@ -356,6 +360,10 @@ namespace umbriel {
   }
 
   void View::setMaximizedToEdges(bool maximized, bool animate) {
+    if (m_fixedRender) {
+      // Ver setMaximized: el tamaño del cliente no cambia.
+      return;
+    }
     if (!maximized) {
       m_restoreMaximizedToEdges = false;
     }
@@ -767,6 +775,11 @@ namespace umbriel {
     if (m_tiled == wantTiled) {
       return;
     }
+    if (m_fixedRender && wantTiled) {
+      // La ventana de render fijo vive fuera del mosaico: volver a mosaicarla
+      // reconfiguraría al cliente y rompería el piloto.
+      return;
+    }
     // A window shows before it joins the layout, which cannot hold a hidden tile.
     if (!floating && m_minimized) {
       setMinimized(false);
@@ -1094,9 +1107,20 @@ namespace umbriel {
         raiseToTop();
       }
       if (restoreFloating) {
-        requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
-        beginResizeAnimation(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height, true);
-        animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+        if (m_fixedRender) {
+          // La caja vuelve a su tamaño anterior; el cliente no se reconfigura.
+          m_fixedBoxWidth = m_fullscreenRestoreBox.width;
+          m_fixedBoxHeight = m_fullscreenRestoreBox.height;
+          m_fixedScale = static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth;
+          m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
+          beginResizeAnimation(m_fixedBoxWidth, m_fixedBoxHeight, true);
+          animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+          applyContentScale();
+        } else {
+          requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
+          beginResizeAnimation(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height, true);
+          animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+        }
       } else if (m_tiled) {
         m_hasFullscreenRestoreBox = false;
       }

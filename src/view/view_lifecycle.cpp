@@ -251,6 +251,7 @@ namespace umbriel {
     const wlr_box& mapGeo = geometryBox();
     m_presentation.setSize(mapGeo.width, mapGeo.height);
     resetSurfaceClip();
+    beginFixedRenderPilot();
 
     // Resolve opening rules before startup focus and placement can change
     // state-based matches. Dynamic rules use the live state later.
@@ -1145,6 +1146,9 @@ namespace umbriel {
     // A later maximize request is client intent and must not be consumed.
     if (m_mapped && m_acceptClientMaximizeRequests) {
       m_consumeRestoredMaximizeRequest = false;
+    }
+    if (m_mapped) {
+      beginFixedRenderPilot();
     }
     // Parent trees can move the window without a setScenePosition; keep the X server's idea of it current.
     if (m_mapped && m_xsurface != nullptr) {

@@ -147,6 +147,7 @@ namespace umbriel {
     if (m_mapped) {
       reconcileAttachment();
       reconcileDialogAttachments();
+      beginFixedRenderPilot();
       if (Output* output = currentOutput()) {
         output->updateHdr();
       }

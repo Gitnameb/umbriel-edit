@@ -390,11 +390,9 @@ namespace umbriel {
       return;
     }
     m_xScale = scale;
-    wlr_scene_subsurface_tree_set_scale(&m_contentTree->node, scale);
-    if (m_captureScene != nullptr) {
-      wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
-    }
-    syncXwaylandShape();
+    // La escala de salida se combina con la de presentación del piloto de
+    // render fijo (m_fixedScale) en un solo sitio.
+    applyContentScale();
   }
 
   void View::syncXwaylandShape() {
@@ -453,6 +451,14 @@ namespace umbriel {
     if (!m_mapped) {
       // Before map the client owns its geometry; the opening configure at map replaces it.
       grantConfigureRequest(m_xsurface, event);
+      return;
+    }
+    if (m_fixedRender) {
+      // El cliente conserva su resolución; los cambios de tamaño solo mueven
+      // la caja de presentación. Reafirmar el tamaño de render evita que un
+      // juego que se redimensiona solo vuelva a entrar en el bucle de resize.
+      m_xConfigured.x = INT_MIN;
+      syncXwaylandConfigure();
       return;
     }
     // A request may name one axis only; the other keeps the configured size.
