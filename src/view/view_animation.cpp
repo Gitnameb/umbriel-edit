@@ -1273,8 +1273,20 @@ namespace umbriel {
       m_presentation.setBackdropBox(-m_fixedOffsetX, -m_fixedOffsetY, target.width, target.height);
       m_presentation.setBackdropEnabled(true);
       applyContentScale();
-      // La superficie completa se dibuja escalada en la caja; sin recorte.
+      // La superficie se dibuja escalada dentro de la caja; el recorte y el
+      // crop de abajo trabajan en coordenadas de superficie 1:1 y dejarían
+      // solo una esquina, así que se saltan.
+      m_presentedBox = {.x = target.x, .y = target.y, .width = target.width, .height = target.height};
+      trackPresentedSize(target.width, target.height);
       setSurfaceTreeClip(nullptr);
+      applyCornerRadius();
+      updateBorderGeometry(target.width, target.height);
+      syncWindowHandles(target.width, target.height);
+      updateShadow();
+      updateBlur(target.width, target.height);
+      syncModalShade();
+      layoutAttachments();
+      return;
     }
     // Stay inside the tile while geometry lags configure (Electron often stays wide).
     const wlr_box content{

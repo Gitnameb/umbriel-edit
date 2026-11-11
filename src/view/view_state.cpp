@@ -1056,20 +1056,14 @@ namespace umbriel {
       };
       m_hasFullscreenRestoreBox = width > 0 && height > 0;
     }
-    if (fullscreen && m_fixedRender) {
-      // Al entrar en fullscreen el render pasa a la resolución de la salida.
-      // Al salir se conserva esa resolución y la caja vuelve a su tamaño;
-      // el contenido se escala hacia abajo sin reconfigurar al cliente.
+    if (fullscreen && m_fixedRender && (m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0)) {
+      // El piloto nunca reconfigura al cliente de tamaño: la resolución del
+      // juego se queda como está y el compositor la escala en pantalla
+      // completa. Así el juego puede seguir creyendo que está en fullscreen y
+      // no cambia de resolución al entrar o salir de la ventana.
       const wlr_box fullArea = fullscreenArea();
-      if (fullArea.width > 0
-          && fullArea.height > 0
-          && (m_fixedRenderWidth != fullArea.width || m_fixedRenderHeight != fullArea.height)) {
-        m_fixedRenderWidth = fullArea.width;
-        m_fixedRenderHeight = fullArea.height;
-        m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
-        configureSize(m_fixedRenderWidth, m_fixedRenderHeight);
-        applyContentScale();
-      }
+      m_fixedRenderWidth = fullArea.width;
+      m_fixedRenderHeight = fullArea.height;
     }
     const bool restoreFloating = !fullscreen && !m_tiled && m_hasFullscreenRestoreBox;
     // Any leave-fullscreen invalidates a pending float-toggle restore: the
@@ -1132,7 +1126,10 @@ namespace umbriel {
           // La caja vuelve a su tamaño anterior; el cliente no se reconfigura.
           m_fixedBoxWidth = m_fullscreenRestoreBox.width;
           m_fixedBoxHeight = m_fullscreenRestoreBox.height;
-          m_fixedScale = static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth;
+          m_fixedScale = std::min(
+              static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth,
+              static_cast<double>(m_fixedBoxHeight) / m_fixedRenderHeight
+          );
           m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
           beginResizeAnimation(m_fixedBoxWidth, m_fixedBoxHeight, true);
           animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);

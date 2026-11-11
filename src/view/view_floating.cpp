@@ -529,25 +529,37 @@ namespace umbriel {
         static_cast<double>(boxWidth) / m_fixedRenderWidth,
         static_cast<double>(boxHeight) / m_fixedRenderHeight
     );
-    kLog.info(
+    kLog.debug(
         "fixed-render '{}': caja {}x{}, escala {:.4}", appId(), boxWidth, boxHeight, m_fixedScale
     );
     m_presentation.setSize(boxWidth, boxHeight);
     beginResizeAnimation(boxWidth, boxHeight);
     applyContentScale();
     // La ventana X cambia de posición con la caja, pero no de tamaño.
-    syncXwaylandConfigure();
+    if (const auto& anchor = m_floating.anchor(); anchor && !currentFullscreen()) {
+      // Al arrastrar un borde, el opuesto se queda quieto y la caja crece
+      // hacia el lado que se mueve.
+      const auto origin = anchoredContentOrigin(
+          *anchor, m_floating.edges(), {.x = 0, .y = 0, .width = boxWidth, .height = boxHeight}
+      );
+      setPosition(origin.x, origin.y);
+    }
+    // Igual que la ruta normal: si la caja nueva no cabe, se recoloca. Durante
+    // un arrastre con el ratón esto no hace nada y el cursor manda.
     clampFloatingPositionForSize(boxWidth, boxHeight);
+    syncXwaylandConfigure();
     syncOwnedPresentation();
   }
 
-  // El árbol de superficie se dibuja a m_xScale (escala de salida de Xwayland)
-  // multiplicada por la escala de presentación de la caja.
+  // El árbol de superficie se dibuja con una escala divisoria: el tamaño en
+  // escena es el del búfer dividido por la escala. La escala de salida de
+  // Xwayland (m_xScale) ya divide el búfer a tamaño lógico, así que para
+  // agrandar el contenido k veces hay que dividir por k: m_xScale / k.
   void View::applyContentScale() {
     if (m_contentTree == nullptr) {
       return;
     }
-    const double scale = m_xScale * (m_fixedRender ? m_fixedScale : 1.0);
+    const double scale = m_fixedRender && m_fixedScale > 0.0 ? m_xScale / m_fixedScale : m_xScale;
     wlr_scene_subsurface_tree_set_scale(&m_contentTree->node, scale);
     if (m_captureScene != nullptr) {
       wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
@@ -600,16 +612,25 @@ namespace umbriel {
     }
     const SizeHints hints = sizeHints();
     const auto [basisWidth, basisHeight] = floatingSize();
-    const int width =
-        widthFraction ? clampWidth(floatingFractionSize(*widthFraction, usable.width), hints) : basisWidth;
-    const int height =
-        heightFraction ? clampHeight(floatingFractionSize(*heightFraction, usable.height), hints) : basisHeight;
+    // El piloto de render fijo desacopla la caja del cliente: sus límites de
+    // tamaño son la resolución del juego, no los de la ventana.
+    const int width = widthFraction
+        ? (m_fixedRender ? floatingFractionSize(*widthFraction, usable.width)
+                         : clampWidth(floatingFractionSize(*widthFraction, usable.width), hints))
+        : basisWidth;
+    const int height = heightFraction
+        ? (m_fixedRender ? floatingFractionSize(*heightFraction, usable.height)
+                         : clampHeight(floatingFractionSize(*heightFraction, usable.height), hints))
+        : basisHeight;
     if (width <= 0 || height <= 0) {
       return false;
     }
     clearRegionState();
     dropMaximizedForResize();
     if (m_fixedRender) {
+      // Un resize por teclado crece desde el borde superior izquierdo; se
+      // descarta cualquier ancla de un arrastre anterior.
+      finishFloatingResize();
       resizeFixedRenderBox(width, height);
       return true;
     }
@@ -620,6 +641,9 @@ namespace umbriel {
   }
 
   std::array<int, 2> View::floatingRestoreSize() const {
+    if (m_fixedRender && m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+      return {m_fixedBoxWidth, m_fixedBoxHeight};
+    }
     if (m_floating.size()) {
       return *m_floating.size();
     }
@@ -665,6 +689,11 @@ namespace umbriel {
 
   void View::beginFloatingResize(uint32_t edges) {
     clearRegionState();
+    if (m_fixedRender) {
+      // La caja, no el tamaño del cliente, es lo que se ancla al arrastrar.
+      m_floating.beginResize({layoutX(), layoutY(), m_fixedBoxWidth, m_fixedBoxHeight}, edges);
+      return;
+    }
     const wlr_box& geo = geometryBox();
     m_floating.beginResize(
         {.x = layoutX() + geo.x, .y = layoutY() + geo.y, .width = geo.width, .height = geo.height}, edges
@@ -712,8 +741,14 @@ namespace umbriel {
         .width = basisWidth,
         .height = basisHeight,
     };
-    const int width = widthAxis ? clampWidth(floatingFractionSize(target, usable.width), hints) : basisWidth;
-    const int height = widthAxis ? basisHeight : clampHeight(floatingFractionSize(target, usable.height), hints);
+    const int width = widthAxis
+        ? (m_fixedRender ? floatingFractionSize(target, usable.width)
+                         : clampWidth(floatingFractionSize(target, usable.width), hints))
+        : basisWidth;
+    const int height = widthAxis
+        ? basisHeight
+        : (m_fixedRender ? floatingFractionSize(target, usable.height)
+                         : clampHeight(floatingFractionSize(target, usable.height), hints));
     if (width <= 0 || height <= 0) {
       return;
     }
@@ -725,7 +760,9 @@ namespace umbriel {
     // recomputes the origin from the actual geometry. finishFloatingResize ends the session but keeps the anchor until
     // the request settles; that commit re-pins the edge and retires the anchor.
     if (m_fixedRender) {
+      m_floating.beginResize({layoutX(), layoutY(), m_fixedBoxWidth, m_fixedBoxHeight}, edges);
       resizeFixedRenderBox(width, height);
+      finishFloatingResize();
       return;
     }
     const FloatingPoint anchoredOrigin =
@@ -744,7 +781,7 @@ namespace umbriel {
 
   void View::syncFloatingResizePosition() {
     // An attached dialog resizes around its centre, which its parent's layoutAttachments() keeps.
-    if (!m_floating.anchor() || attached()) {
+    if (m_fixedRender || !m_floating.anchor() || attached()) {
       return;
     }
     const wlr_box& geo = geometryBox();
@@ -764,6 +801,11 @@ namespace umbriel {
 
   void View::adoptFloatingClientSize() {
     if (m_tiled || !m_mapped || scheduledFullscreen() || scheduledMaximized() || m_region) {
+      return;
+    }
+    // El piloto de render fijo nunca adopta el tamaño del cliente como caja:
+    // un commit del juego cambia su resolución, no la ventana.
+    if (m_fixedRender) {
       return;
     }
     if (!retireFloatingSizeRequest()) {

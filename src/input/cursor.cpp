@@ -1268,7 +1268,13 @@ namespace umbriel {
       view->setMaximizedToEdges(false, false);
     }
 
-    const wlr_box& geometry = view->geometryBox();
+    const wlr_box geometryBox = view->geometryBox();
+    // El piloto de render fijo presenta el contenido en una caja que no
+    // coincide con el tamaño del cliente; la caja es la que se redimensiona.
+    const auto [boxWidth, boxHeight] = view->floatingSize();
+    const wlr_box geometry = view->fixedRender()
+        ? wlr_box{.x = 0, .y = 0, .width = boxWidth, .height = boxHeight}
+        : geometryBox;
     const double borderX = (view->layoutX() + geometry.x) + ((edges & WLR_EDGE_RIGHT) != 0 ? geometry.width : 0);
     const double borderY = (view->layoutY() + geometry.y) + ((edges & WLR_EDGE_BOTTOM) != 0 ? geometry.height : 0);
     m_grab = FloatingResizeGrab{
@@ -3565,39 +3571,42 @@ namespace umbriel {
     int newTop = grab->geometryY;
     int newBottom = grab->geometryY + grab->geometryHeight;
     const SizeHints hints = grab->view->sizeHints();
+    // La caja del render fijo no está limitada por los hints del cliente: el
+    // juego declara su tamaño de render, no el de la ventana.
+    const bool clampToHints = !grab->view->fixedRender();
 
     if ((grab->edges & WLR_EDGE_TOP) != 0) {
       newTop = static_cast<int>(borderY);
-      if (newBottom - newTop < hints.minHeight) {
+      if (clampToHints && newBottom - newTop < hints.minHeight) {
         newTop = newBottom - hints.minHeight;
       }
-      if (hints.maxHeight > 0 && newBottom - newTop > hints.maxHeight) {
+      if (clampToHints && hints.maxHeight > 0 && newBottom - newTop > hints.maxHeight) {
         newTop = newBottom - hints.maxHeight;
       }
     } else if ((grab->edges & WLR_EDGE_BOTTOM) != 0) {
       newBottom = static_cast<int>(borderY);
-      if (newBottom - newTop < hints.minHeight) {
+      if (clampToHints && newBottom - newTop < hints.minHeight) {
         newBottom = newTop + hints.minHeight;
       }
-      if (hints.maxHeight > 0 && newBottom - newTop > hints.maxHeight) {
+      if (clampToHints && hints.maxHeight > 0 && newBottom - newTop > hints.maxHeight) {
         newBottom = newTop + hints.maxHeight;
       }
     }
 
     if ((grab->edges & WLR_EDGE_LEFT) != 0) {
       newLeft = static_cast<int>(borderX);
-      if (newRight - newLeft < hints.minWidth) {
+      if (clampToHints && newRight - newLeft < hints.minWidth) {
         newLeft = newRight - hints.minWidth;
       }
-      if (hints.maxWidth > 0 && newRight - newLeft > hints.maxWidth) {
+      if (clampToHints && hints.maxWidth > 0 && newRight - newLeft > hints.maxWidth) {
         newLeft = newRight - hints.maxWidth;
       }
     } else if ((grab->edges & WLR_EDGE_RIGHT) != 0) {
       newRight = static_cast<int>(borderX);
-      if (newRight - newLeft < hints.minWidth) {
+      if (clampToHints && newRight - newLeft < hints.minWidth) {
         newRight = newLeft + hints.minWidth;
       }
-      if (hints.maxWidth > 0 && newRight - newLeft > hints.maxWidth) {
+      if (clampToHints && hints.maxWidth > 0 && newRight - newLeft > hints.maxWidth) {
         newRight = newLeft + hints.maxWidth;
       }
     }
