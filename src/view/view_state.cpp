@@ -1050,6 +1050,21 @@ namespace umbriel {
       };
       m_hasFullscreenRestoreBox = width > 0 && height > 0;
     }
+    if (fullscreen && m_fixedRender) {
+      // Al entrar en fullscreen el render pasa a la resolución de la salida.
+      // Al salir se conserva esa resolución y la caja vuelve a su tamaño;
+      // el contenido se escala hacia abajo sin reconfigurar al cliente.
+      const wlr_box fullArea = fullscreenArea();
+      if (fullArea.width > 0
+          && fullArea.height > 0
+          && (m_fixedRenderWidth != fullArea.width || m_fixedRenderHeight != fullArea.height)) {
+        m_fixedRenderWidth = fullArea.width;
+        m_fixedRenderHeight = fullArea.height;
+        m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
+        configureSize(m_fixedRenderWidth, m_fixedRenderHeight);
+        applyContentScale();
+      }
+    }
     const bool restoreFloating = !fullscreen && !m_tiled && m_hasFullscreenRestoreBox;
     // Any leave-fullscreen invalidates a pending float-toggle restore: the
     // float path re-sets the flag right after its own setFullscreen(false).
