@@ -499,8 +499,12 @@ namespace umbriel {
       return;
     }
     m_fixedRender = true;
+    m_fixedContentX = 0;
+    m_fixedContentY = 0;
     m_fixedRenderWidth = size.width;
     m_fixedRenderHeight = size.height;
+    m_fixedSurfaceWidth = size.width;
+    m_fixedSurfaceHeight = size.height;
     m_fixedBoxWidth = size.width;
     m_fixedBoxHeight = size.height;
     m_fixedScale = 1.0;
@@ -509,11 +513,74 @@ namespace umbriel {
     syncXwaylandConfigure();
     m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
     m_presentation.resetCrop(m_contentTree, rootSurface());
+    refreshFixedRenderContent(false);
     applyContentScale();
     kLog.info(
-        "fixed-render '{}': cliente {}x{}, caja {}x{}", appId(), m_fixedRenderWidth, m_fixedRenderHeight,
-        m_fixedBoxWidth, m_fixedBoxHeight
+        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{} caja {}x{}", appId(), m_fixedSurfaceWidth,
+        m_fixedSurfaceHeight, m_fixedRenderWidth, m_fixedRenderHeight, m_fixedContentX, m_fixedContentY, m_fixedBoxWidth,
+        m_fixedBoxHeight
     );
+  }
+
+  void View::refreshFixedRenderContent(bool repaint) {
+    if (!m_fixedRender || m_xsurface == nullptr) {
+      return;
+    }
+    const wlr_box geometry = geometryBox();
+    if (geometry.width <= 0 || geometry.height <= 0) {
+      return;
+    }
+    int contentX = 0;
+    int contentY = 0;
+    int contentWidth = geometry.width;
+    int contentHeight = geometry.height;
+    // La ventana hija de Wine/DXVK está en coordenadas X. El piloto solo
+    // admite escala de salida 1, donde coinciden con las de superficie. Si
+    // Xwayland emula un modo con un viewport, la ventana X y el búfer no
+    // miden lo mismo: se deja la superficie completa.
+    if (m_xScale == 1.0
+        && m_xsurface->width == geometry.width
+        && m_xsurface->height == geometry.height
+        && m_server->xwayland() != nullptr) {
+      if (const auto rect = m_server->xwayland()->contentRect(m_xsurface)) {
+        if (rect->width > 0 && rect->height > 0) {
+          contentX = std::clamp(rect->x, 0, geometry.width - 1);
+          contentY = std::clamp(rect->y, 0, geometry.height - 1);
+          contentWidth = std::min(rect->width, geometry.width - contentX);
+          contentHeight = std::min(rect->height, geometry.height - contentY);
+        }
+      }
+    }
+    m_fixedSurfaceWidth = geometry.width;
+    m_fixedSurfaceHeight = geometry.height;
+    if (contentX == m_fixedContentX
+        && contentY == m_fixedContentY
+        && contentWidth == m_fixedRenderWidth
+        && contentHeight == m_fixedRenderHeight) {
+      return;
+    }
+    m_fixedContentX = contentX;
+    m_fixedContentY = contentY;
+    m_fixedRenderWidth = contentWidth;
+    m_fixedRenderHeight = contentHeight;
+    if (m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+      m_fixedScale = std::min(
+          static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth,
+          static_cast<double>(m_fixedBoxHeight) / m_fixedRenderHeight
+      );
+      const int scaledWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));
+      const int scaledHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
+      m_fixedOffsetX = std::max(0, (m_fixedBoxWidth - scaledWidth) / 2);
+      m_fixedOffsetY = std::max(0, (m_fixedBoxHeight - scaledHeight) / 2);
+    }
+    kLog.info(
+        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{}", appId(), m_fixedSurfaceWidth, m_fixedSurfaceHeight,
+        m_fixedRenderWidth, m_fixedRenderHeight, m_fixedContentX, m_fixedContentY
+    );
+    applyContentScale();
+    if (repaint) {
+      syncOwnedPresentation();
+    }
   }
 
   void View::resizeFixedRenderBox(int width, int height) {
@@ -570,7 +637,13 @@ namespace umbriel {
       // de contenido: así el borde y el fondo se quedan en la caja y la imagen
       // se reparte con las barras negras dentro.
       if (wlr_scene_node* surfaceNode = view_detail::toplevelSurfaceTreeNode(m_contentTree, rootSurface())) {
-        wlr_scene_node_set_position(surfaceNode, m_fixedOffsetX, m_fixedOffsetY);
+        // La escala es divisoria: restar el recorte también lo convierte a
+        // unidades de escena. El rectángulo de contenido queda así en el
+        // offset calculado y el resto de la superficie fuera de la caja.
+        const double divisor = contentScale();
+        const int contentSceneX = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentX / divisor)) : 0;
+        const int contentSceneY = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentY / divisor)) : 0;
+        wlr_scene_node_set_position(surfaceNode, m_fixedOffsetX - contentSceneX, m_fixedOffsetY - contentSceneY);
         kLog.debug("fixed-render surface node at {},{}", surfaceNode->x, surfaceNode->y);
       } else {
         kLog.debug("fixed-render surface node NULL");
@@ -602,6 +675,33 @@ namespace umbriel {
       kLog.debug("fixed-render contenido en {},{} divisor {:.4}", lx, ly, scale);
     }
     syncXwaylandShape();
+  }
+
+  void View::applyFixedRenderClip() {
+    if (!m_fixedRender) {
+      setSurfaceTreeClip(nullptr);
+      return;
+    }
+    const wlr_box geometry = geometryBox();
+    if (m_fixedContentX == 0
+        && m_fixedContentY == 0
+        && (geometry.width <= 0 || m_fixedRenderWidth == geometry.width)
+        && (geometry.height <= 0 || m_fixedRenderHeight == geometry.height)) {
+      setSurfaceTreeClip(nullptr);
+      return;
+    }
+    // umbrielfx guarda el clip en unidades de escena y lo multiplica por la
+    // escala divisoria al recortar el búfer.
+    const double divisor = contentScale();
+    const wlr_box clip{
+        .x = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentX / divisor)) : 0,
+        .y = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentY / divisor)) : 0,
+        .width = divisor > 0.0 ? std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth / divisor)))
+                               : m_fixedRenderWidth,
+        .height = divisor > 0.0 ? std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight / divisor)))
+                                : m_fixedRenderHeight,
+    };
+    setSurfaceTreeClip(&clip);
   }
 
   std::array<int, 2> View::floatingSize() const {
@@ -646,6 +746,9 @@ namespace umbriel {
     const wlr_box usable = floatingUsableArea();
     if (usable.width <= 0 || usable.height <= 0) {
       return false;
+    }
+    if (m_fixedRender) {
+      refreshFixedRenderContent(false);
     }
     const SizeHints hints = sizeHints();
     const auto [basisWidth, basisHeight] = floatingSize();
@@ -727,6 +830,9 @@ namespace umbriel {
   void View::beginFloatingResize(uint32_t edges) {
     clearRegionState();
     if (m_fixedRender) {
+      // El juego puede haber cambiado resolución o aspecto desde el último
+      // frame; este es el momento barato de releer su ventana de render.
+      refreshFixedRenderContent(false);
       // La caja, no el tamaño del cliente, es lo que se ancla al arrastrar.
       m_floating.beginResize({layoutX(), layoutY(), m_fixedBoxWidth, m_fixedBoxHeight}, edges);
       return;
@@ -757,6 +863,9 @@ namespace umbriel {
     const wlr_box usable = floatingUsableArea();
     if (usable.width <= 0 || usable.height <= 0) {
       return;
+    }
+    if (m_fixedRender) {
+      refreshFixedRenderContent(false);
     }
     const bool widthAxis = (edges & (WLR_EDGE_LEFT | WLR_EDGE_RIGHT)) != 0;
     const auto current = floatingFraction(widthAxis);
@@ -873,9 +982,9 @@ namespace umbriel {
       return;
     }
     if (m_fixedRender) {
-      // La superficie se escala dentro de la caja; recortarla al tamaño del
-      // cliente dejaría solo una esquina visible.
-      setSurfaceTreeClip(nullptr);
+      // La superficie se escala dentro de la caja; el recorte válido es la
+      // ventana de render, no el tamaño del cliente.
+      applyFixedRenderClip();
       updateBlur();
       updateShadow();
       return;

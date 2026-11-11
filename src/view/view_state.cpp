@@ -1032,6 +1032,11 @@ namespace umbriel {
   void View::setFullscreen(bool fullscreen, FullscreenExitLayout exitLayout) {
     assert(!attached());
     m_deferredUnfullscreen.clear();
+    if (m_fixedRender) {
+      // El juego pudo cambiar de resolución o aspecto mientras estaba en
+      // ventana o en pantalla completa; la presentación usa su render actual.
+      refreshFixedRenderContent(false);
+    }
     const bool refreshHoverFocus = !fullscreen
         && m_mapped
         && m_onActiveWorkspace
@@ -1123,6 +1128,9 @@ namespace umbriel {
       }
       if (restoreFloating) {
         if (m_fixedRender) {
+          // El juego pudo cambiar de resolución o aspecto mientras estaba en
+          // pantalla completa; la caja restaurada debe usar su render actual.
+          refreshFixedRenderContent(false);
           // La caja vuelve a su tamaño anterior; el cliente no se reconfigura.
           m_fixedBoxWidth = m_fullscreenRestoreBox.width;
           m_fixedBoxHeight = m_fullscreenRestoreBox.height;

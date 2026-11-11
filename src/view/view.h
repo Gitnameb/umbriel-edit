@@ -817,7 +817,13 @@ namespace umbriel {
     // flotante. La caja se redimensiona y el contenido se escala.
     void beginFixedRenderPilot();
     void resizeFixedRenderBox(int width, int height);
+    // Relee el rectángulo de render dentro del cliente (ventana hija de
+    // Wine/DXVK) y recalcula la escala. Sin repaint solo actualiza el estado.
+    void refreshFixedRenderContent(bool repaint);
     void applyContentScale();
+    // Recorta la superficie a la ventana de render del juego. Sin recorte,
+    // desactiva el clip.
+    void applyFixedRenderClip();
     void finishFloatingResize();
     void syncFloatingResizePosition();
     void adoptFloatingClientSize();
@@ -1169,8 +1175,17 @@ namespace umbriel {
     // Piloto de render fijo: tamaño del cliente y caja presentada. Con
     // m_fixedScale = caja / cliente, el árbol de superficie se escala.
     bool m_fixedRender = false;
+    // Recorte del render dentro de la superficie del cliente. Wine/DXVK
+    // dibuja en una ventana hija cuando la resolución o el aspecto no llenan
+    // el toplevel; ese rectángulo es el contenido visible.
+    int m_fixedContentX = 0;
+    int m_fixedContentY = 0;
     int m_fixedRenderWidth = 0;
     int m_fixedRenderHeight = 0;
+    // Último tamaño de superficie visto, para releer el recorte solo cuando
+    // el cliente cambia de tamaño (no en cada fotograma).
+    int m_fixedSurfaceWidth = 0;
+    int m_fixedSurfaceHeight = 0;
     int m_fixedBoxWidth = 0;
     int m_fixedBoxHeight = 0;
     int m_fixedOffsetX = 0;

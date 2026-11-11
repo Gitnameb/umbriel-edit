@@ -284,8 +284,13 @@ namespace umbriel {
   void View::resetPresentedSurface() {
     m_presentation.resetCrop(m_contentTree, rootSurface());
     // Clear the subsurface clip so the next syncViewPresentation re-applies the resting clip through a real
-    // reconfigure: an unchanged clip box early-outs and would leave the animated src/dst behind.
-    setSurfaceTreeClip(nullptr);
+    // reconfigure: an unchanged clip box early-outs and would leave the animated src/dst behind. El piloto de
+    // render fijo repone su recorte de contenido.
+    if (m_fixedRender) {
+      applyFixedRenderClip();
+    } else {
+      setSurfaceTreeClip(nullptr);
+    }
   }
 
   void View::applyPresentedSize() {
@@ -1252,8 +1257,11 @@ namespace umbriel {
       // La escala se calcula con el tamaño REAL que ha commiteado el cliente.
       // El tamaño configurado puede ser la salida y el juego no haberlo
       // aceptado; usar el configurado dejaba la imagen pequeña en una esquina.
-      m_fixedRenderWidth = geometry.width;
-      m_fixedRenderHeight = geometry.height;
+      if (geometry.width != m_fixedSurfaceWidth || geometry.height != m_fixedSurfaceHeight) {
+        // El cliente cambió de tamaño: puede ser una resolución nueva y traer
+        // otra ventana de render (o ninguna). Solo se consulta X aquí.
+        refreshFixedRenderContent(false);
+      }
       const double sx = static_cast<double>(target.width) / m_fixedRenderWidth;
       const double sy = static_cast<double>(target.height) / m_fixedRenderHeight;
       m_fixedScale = std::min(sx, sy);
@@ -1282,7 +1290,9 @@ namespace umbriel {
       // solo una esquina, así que se saltan.
       m_presentedBox = {.x = target.x, .y = target.y, .width = target.width, .height = target.height};
       trackPresentedSize(target.width, target.height);
-      setSurfaceTreeClip(nullptr);
+      // Solo se presenta la ventana de render del juego; las barras que el
+      // cliente dibuja alrededor se recortan aquí y las pone el compositor.
+      applyFixedRenderClip();
       applyCornerRadius();
       updateBorderGeometry(target.width, target.height);
       syncWindowHandles(target.width, target.height);

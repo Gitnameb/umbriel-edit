@@ -202,6 +202,77 @@ namespace umbriel {
 
   wl_signal* Xwayland::shapeChanged() const { return m_shapes->changed(); }
 
+  std::optional<XwaylandContentRect> Xwayland::contentRect(wlr_xwayland_surface* xsurface) const {
+    if (m_wlr == nullptr
+        || m_wlr->display_name == nullptr
+        || xsurface == nullptr
+        || xsurface->window_id == XCB_WINDOW_NONE
+        || xsurface->width == 0
+        || xsurface->height == 0) {
+      return std::nullopt;
+    }
+    // A short-lived connection keeps these reads off the window manager's
+    // event queue. This runs only when the client changed its window size or
+    // when the user starts a resize, never per frame.
+    xcb_connection_t* connection = xcb_connect(m_wlr->display_name, nullptr);
+    if (connection == nullptr || xcb_connection_has_error(connection) != 0) {
+      if (connection != nullptr) {
+        xcb_disconnect(connection);
+      }
+      return std::nullopt;
+    }
+    xcb_query_tree_reply_t* tree =
+        xcb_query_tree_reply(connection, xcb_query_tree(connection, xsurface->window_id), nullptr);
+    if (tree == nullptr) {
+      xcb_disconnect(connection);
+      return std::nullopt;
+    }
+    const int parentWidth = xsurface->width;
+    const int parentHeight = xsurface->height;
+    const int64_t parentArea = static_cast<int64_t>(parentWidth) * parentHeight;
+    const xcb_window_t* children = xcb_query_tree_children(tree);
+    const int childCount = xcb_query_tree_children_length(tree);
+    int64_t bestArea = 0;
+    XwaylandContentRect best{};
+    for (int i = 0; i < childCount; ++i) {
+      xcb_get_window_attributes_reply_t* attributes =
+          xcb_get_window_attributes_reply(connection, xcb_get_window_attributes(connection, children[i]), nullptr);
+      xcb_get_geometry_reply_t* geometry =
+          xcb_get_geometry_reply(connection, xcb_get_geometry(connection, children[i]), nullptr);
+      if (attributes != nullptr && geometry != nullptr
+          && attributes->map_state == XCB_MAP_STATE_VIEWABLE
+          && !attributes->override_redirect
+          && attributes->_class == XCB_WINDOW_CLASS_INPUT_OUTPUT
+          && geometry->width > 0
+          && geometry->height > 0
+          && geometry->x >= 0
+          && geometry->y >= 0
+          && geometry->x + geometry->width <= parentWidth
+          && geometry->y + geometry->height <= parentHeight) {
+        const int64_t area = static_cast<int64_t>(geometry->width) * geometry->height;
+        if (area > bestArea) {
+          bestArea = area;
+          best = {
+              .x = geometry->x,
+              .y = geometry->y,
+              .width = geometry->width,
+              .height = geometry->height,
+          };
+        }
+      }
+      std::free(attributes);
+      std::free(geometry);
+    }
+    std::free(tree);
+    xcb_disconnect(connection);
+    // Overlay windows (Steam, IMEs) are children too. A render area is at
+    // least half of the toplevel; anything smaller is left out.
+    if (bestArea == 0 || bestArea * 2 < parentArea) {
+      return std::nullopt;
+    }
+    return best;
+  }
+
   double Xwayland::surfaceScale(wlr_surface* surface) const {
     if (!m_nativeResolution || surface == nullptr) {
       return 1.0;

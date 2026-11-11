@@ -32,6 +32,17 @@ namespace umbriel {
   // Configure the window as the client asked; fields the request leaves out keep their current value.
   void grantConfigureRequest(wlr_xwayland_surface* xsurface, const wlr_xwayland_surface_configure_event* event);
 
+  // Rectangle of an X11 child window inside its toplevel, in X surface-local
+  // coordinates. Wine/DXVK games draw into a swapchain child window when the
+  // render resolution or aspect differs from the toplevel; that child is the
+  // visible content.
+  struct XwaylandContentRect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+  };
+
   // The wlroots Xwayland server. It starts lazily: the X display socket exists from construction, and the Xwayland
   // process spawns when the first X client connects. Every X11 window it announces gets an XwaylandWindow.
   class Xwayland {
@@ -60,6 +71,9 @@ namespace umbriel {
     // Bounding shape in X surface-local coordinates. NULL means unshaped; an empty region cuts all pixels away.
     // A new surface remains empty until its initial asynchronous query completes.
     const pixman_region32_t* surfaceShape(wlr_surface* surface) const;
+    // Largest mapped child window that behaves as the game's render area.
+    // Nullopt when the toplevel draws its content directly or X is gone.
+    std::optional<XwaylandContentRect> contentRect(wlr_xwayland_surface* xsurface) const;
     // Emits wlr_surface* after a bounding-shape query or removal changes its rendering mask.
     wl_signal* shapeChanged() const;
     // Cursor surfaces have no wlr_xwayland_surface role. Identify them by the
