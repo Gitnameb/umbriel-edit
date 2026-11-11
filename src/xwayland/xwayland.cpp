@@ -320,17 +320,22 @@ namespace umbriel {
     }
     uint32_t toplevel = XCB_WINDOW_NONE;
     uint32_t child = XCB_WINDOW_NONE;
+    int delayMs = 1;
     switch (event->response_type & 0x7f) {
     case XCB_CREATE_NOTIFY: {
       const auto* ev = reinterpret_cast<const xcb_create_notify_event_t*>(event);
       toplevel = ev->parent;
       child = ev->window;
+      // La ventana existe, pero todavía puede no estar mapeada ni configurada:
+      // una lectura inmediata no encontraría la hija nueva.
+      delayMs = 30;
       break;
     }
     case XCB_DESTROY_NOTIFY: {
       const auto* ev = reinterpret_cast<const xcb_destroy_notify_event_t*>(event);
       toplevel = ev->event;
       child = ev->window;
+      delayMs = 150;
       break;
     }
     case XCB_MAP_NOTIFY: {
@@ -343,6 +348,7 @@ namespace umbriel {
       const auto* ev = reinterpret_cast<const xcb_unmap_notify_event_t*>(event);
       toplevel = ev->event;
       child = ev->window;
+      delayMs = 150;
       break;
     }
     case XCB_REPARENT_NOTIFY: {
@@ -368,8 +374,11 @@ namespace umbriel {
       m_contentPending.push_back(toplevel);
     }
     if (m_contentTimer != nullptr) {
-      // Games rebuild the swapchain in bursts; one refresh after the burst is enough.
-      wl_event_source_timer_update(m_contentTimer, 60);
+      // Los cambios se leen en el siguiente ciclo, antes de dibujar, no en cada
+      // fotograma. Si la hija desaparece se espera algo más (Wine la recrea al
+      // cambiar de resolución) para no enseñar el toplevel entero durante el
+      // hueco; en cuanto llega la hija nueva, su evento acorta la espera.
+      wl_event_source_timer_update(m_contentTimer, delayMs);
     }
     return true;
   }

@@ -3711,9 +3711,12 @@ namespace umbriel {
       return WLR_EDGE_RIGHT | WLR_EDGE_BOTTOM;
     }
     const wlr_box& geo = view->geometryBox();
+    // El piloto de render fijo presenta una caja distinta del tamaño del
+    // cliente: los tiradores están en la caja visible, no en la superficie.
+    const auto [width, height] = view->floatingSize();
     const int x = view->layoutX() + geo.x;
     const int y = view->layoutY() + geo.y;
-    const wlr_box box{.x = x, .y = y, .width = geo.width, .height = geo.height};
+    const wlr_box box{.x = x, .y = y, .width = width, .height = height};
     return resizeEdgesForPoint(box, m_cursor->x, m_cursor->y);
   }
 
@@ -3722,10 +3725,12 @@ namespace umbriel {
       return 0;
     }
     const wlr_box& geo = view->geometryBox();
+    // Igual que floatResizeEdges: en el render fijo manda la caja presentada.
+    const auto [width, height] = view->floatingSize();
     const double left = view->layoutX() + geo.x;
     const double top = view->layoutY() + geo.y;
-    const double right = left + geo.width;
-    const double bottom = top + geo.height;
+    const double right = left + width;
+    const double bottom = top + height;
     // Unos píxeles de margen fuera del contenido cubren el borde dibujado.
     const double margin = 2.0;
     if (x < left - margin || x > right + margin || y < top - margin || y > bottom + margin) {

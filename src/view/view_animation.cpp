@@ -1271,10 +1271,6 @@ namespace umbriel {
       const int contentHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
       m_fixedOffsetX = std::max(0, (target.width - contentWidth) / 2);
       m_fixedOffsetY = std::max(0, (target.height - contentHeight) / 2);
-      kLog.debug(
-          "fixed-render presentacion {}x{} cliente {}x{} escala {:.4} offset {},{}", target.width, target.height,
-          m_fixedRenderWidth, m_fixedRenderHeight, m_fixedScale, m_fixedOffsetX, m_fixedOffsetY
-      );
       // El árbol de contenido se queda en el origen de la caja para que el
       // borde, la barra de título y el fondo coincidan con la ventana. El
       // centrado de la imagen se hace moviendo solo el nodo de la superficie.

@@ -514,6 +514,7 @@ namespace umbriel {
     m_fixedRender = true;
     m_fixedContentX = 0;
     m_fixedContentY = 0;
+    m_fixedHasContent = false;
     m_fixedRenderWidth = size.width;
     m_fixedRenderHeight = size.height;
     m_fixedSurfaceWidth = size.width;
@@ -590,6 +591,7 @@ namespace umbriel {
     int contentY = 0;
     int contentWidth = geometry.width;
     int contentHeight = geometry.height;
+    const bool surfaceUnchanged = geometry.width == m_fixedSurfaceWidth && geometry.height == m_fixedSurfaceHeight;
     // La ventana hija de Wine/DXVK está en coordenadas X. El piloto solo
     // admite escala de salida 1, donde coinciden con las de superficie. Si
     // Xwayland emula un modo con un viewport, la ventana X y el búfer no
@@ -604,7 +606,16 @@ namespace umbriel {
           contentY = std::clamp(rect->y, 0, geometry.height - 1);
           contentWidth = std::min(rect->width, geometry.width - contentX);
           contentHeight = std::min(rect->height, geometry.height - contentY);
+          m_fixedHasContent = true;
         }
+      } else if (m_fixedHasContent && surfaceUnchanged && m_fixedRenderWidth > 0 && m_fixedRenderHeight > 0) {
+        // Wine destruye y recrea la hija al cambiar de resolución. Durante el
+        // hueco se conserva el último recorte: el toplevel aún tiene la imagen
+        // anterior y enseñarlo entero haría saltar las barras del juego.
+        contentX = m_fixedContentX;
+        contentY = m_fixedContentY;
+        contentWidth = m_fixedRenderWidth;
+        contentHeight = m_fixedRenderHeight;
       }
     }
     m_fixedSurfaceWidth = geometry.width;
@@ -752,35 +763,7 @@ namespace umbriel {
         const int contentSceneX = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentX / divisor)) : 0;
         const int contentSceneY = divisor > 0.0 ? static_cast<int>(std::lround(m_fixedContentY / divisor)) : 0;
         wlr_scene_node_set_position(surfaceNode, m_fixedOffsetX - contentSceneX, m_fixedOffsetY - contentSceneY);
-        kLog.debug("fixed-render surface node at {},{}", surfaceNode->x, surfaceNode->y);
-      } else {
-        kLog.debug("fixed-render surface node NULL");
       }
-      struct Ctx {
-        double applied;
-      } ctx{scale};
-      wlr_scene_node_for_each_buffer(
-          &m_contentTree->node,
-          [](wlr_scene_buffer* buffer, int sx, int sy, void* data) {
-            auto* ctx = static_cast<Ctx*>(data);
-            wlr_scene_surface* sceneSurface = wlr_scene_surface_try_from_buffer(buffer);
-            if (sceneSurface == nullptr) {
-              return;
-            }
-            int width = 0;
-            int height = 0;
-            wlr_scene_surface_get_size(sceneSurface, &width, &height);
-            kLog.debug(
-                "fixed-render buffer '{}x{}' at {},{}, dest {}x{}, divisor {:.4}", sceneSurface->surface->current.width,
-                sceneSurface->surface->current.height, sx, sy, width, height, ctx->applied
-            );
-          },
-          &ctx
-      );
-      int lx = 0;
-      int ly = 0;
-      wlr_scene_node_coords(&m_contentTree->node, &lx, &ly);
-      kLog.debug("fixed-render contenido en {},{} divisor {:.4}", lx, ly, scale);
     }
     syncXwaylandShape();
   }

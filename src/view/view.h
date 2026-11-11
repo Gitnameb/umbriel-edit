@@ -1191,6 +1191,10 @@ namespace umbriel {
     int m_fixedContentY = 0;
     int m_fixedRenderWidth = 0;
     int m_fixedRenderHeight = 0;
+    // Hubo una ventana de render en la última consulta. Si desaparece y el
+    // toplevel conserva su tamaño, se mantiene el recorte anterior: Wine la
+    // recrea al cambiar de resolución y el hueco no debe enseñar las barras.
+    bool m_fixedHasContent = false;
     // Último tamaño de superficie visto, para releer el recorte solo cuando
     // el cliente cambia de tamaño (no en cada fotograma).
     int m_fixedSurfaceWidth = 0;
