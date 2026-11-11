@@ -508,6 +508,7 @@ namespace umbriel {
     m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
     syncXwaylandConfigure();
     m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
+    m_presentation.resetCrop(m_contentTree, rootSurface());
     applyContentScale();
     kLog.info(
         "fixed-render '{}': cliente {}x{}, caja {}x{}", appId(), m_fixedRenderWidth, m_fixedRenderHeight,

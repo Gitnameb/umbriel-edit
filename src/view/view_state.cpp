@@ -1133,6 +1133,10 @@ namespace umbriel {
           m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
           beginResizeAnimation(m_fixedBoxWidth, m_fixedBoxHeight, true);
           animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+          // El fullscreen pudo dejar un recorte/desplazamiento en el búfer.
+          // Al volver a ventana se limpia para que la primera imagen ya salga
+          // centrada, sin esperar a que el cliente vuelva a dibujar.
+          m_presentation.resetCrop(m_contentTree, rootSurface());
           applyContentScale();
         } else {
           requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
