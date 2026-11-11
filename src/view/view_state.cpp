@@ -480,7 +480,10 @@ namespace umbriel {
       reassertRoleState();
       return;
     }
-    if (!requested && scheduledFullscreen() && m_xCompositorFullscreen) {
+    if (!requested && scheduledFullscreen() && m_xCompositorFullscreen
+        && std::chrono::steady_clock::now() - m_xCompositorFullscreenAt < std::chrono::milliseconds(750)) {
+      // Wine suele pedir unfullscreen justo después de que el compositor lo
+      // active. Pasada la ventana de gracia, el Alt+Enter del juego sí sale.
       kLog.debug("request_fullscreen denied for compositor-owned X11 '{}'", appId() != nullptr ? appId() : "?");
       reassertRoleState();
       return;
@@ -545,6 +548,9 @@ namespace umbriel {
     }
     const bool fullscreen = !scheduledFullscreen();
     m_xCompositorFullscreen = m_xsurface != nullptr && fullscreen;
+    if (m_xCompositorFullscreen) {
+      m_xCompositorFullscreenAt = std::chrono::steady_clock::now();
+    }
     setFullscreen(fullscreen);
   }
 

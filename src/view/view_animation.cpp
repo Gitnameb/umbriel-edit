@@ -1244,7 +1244,13 @@ namespace umbriel {
 
   void View::applyPresentation(const wlr_box& target) {
     updateFullscreenPresentation(target.width, target.height);
-    if (m_fixedRender && m_fixedRenderWidth > 0 && m_fixedRenderHeight > 0) {
+    const wlr_box& geometry = geometryBox();
+    if (m_fixedRender && geometry.width > 0 && geometry.height > 0) {
+      // La escala se calcula con el tamaño REAL que ha commiteado el cliente.
+      // El tamaño configurado puede ser la salida y el juego no haberlo
+      // aceptado; usar el configurado dejaba la imagen pequeña en una esquina.
+      m_fixedRenderWidth = geometry.width;
+      m_fixedRenderHeight = geometry.height;
       const double sx = static_cast<double>(target.width) / m_fixedRenderWidth;
       const double sy = static_cast<double>(target.height) / m_fixedRenderHeight;
       m_fixedScale = std::min(sx, sy);
@@ -1255,8 +1261,8 @@ namespace umbriel {
       m_fixedOffsetX = std::max(0, (target.width - contentWidth) / 2);
       m_fixedOffsetY = std::max(0, (target.height - contentHeight) / 2);
       kLog.debug(
-          "fixed-render presentacion {}x{} escala {:.4} offset {},{}", target.width, target.height, m_fixedScale,
-          m_fixedOffsetX, m_fixedOffsetY
+          "fixed-render presentacion {}x{} cliente {}x{} escala {:.4} offset {},{}", target.width, target.height,
+          m_fixedRenderWidth, m_fixedRenderHeight, m_fixedScale, m_fixedOffsetX, m_fixedOffsetY
       );
       if (m_contentTree != nullptr) {
         wlr_scene_node_set_position(&m_contentTree->node, m_fixedOffsetX, m_fixedOffsetY);
@@ -1265,7 +1271,6 @@ namespace umbriel {
       // La superficie completa se dibuja escalada en la caja; sin recorte.
       setSurfaceTreeClip(nullptr);
     }
-    const wlr_box& geometry = geometryBox();
     // Stay inside the tile while geometry lags configure (Electron often stays wide).
     const wlr_box content{
         .x = target.x,

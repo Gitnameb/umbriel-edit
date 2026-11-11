@@ -453,14 +453,6 @@ namespace umbriel {
       grantConfigureRequest(m_xsurface, event);
       return;
     }
-    if (m_fixedRender) {
-      // El cliente conserva su resolución; los cambios de tamaño solo mueven
-      // la caja de presentación. Reafirmar el tamaño de render evita que un
-      // juego que se redimensiona solo vuelva a entrar en el bucle de resize.
-      m_xConfigured.x = INT_MIN;
-      syncXwaylandConfigure();
-      return;
-    }
     // A request may name one axis only; the other keeps the configured size.
     const bool widthRequested = (event->mask & XCB_CONFIG_WINDOW_WIDTH) != 0;
     const bool heightRequested = (event->mask & XCB_CONFIG_WINDOW_HEIGHT) != 0;
@@ -482,6 +474,18 @@ namespace umbriel {
           && height <= fullHeight
           && (width != fullWidth || height != fullHeight);
       m_xFullscreenSize = emulated ? std::optional<ClientSize>({.width = width, .height = height}) : std::nullopt;
+    }
+    if (m_fixedRender && (widthRequested || heightRequested) && width > 0 && height > 0) {
+      // Un cambio pedido por el cliente es su resolución (por ejemplo al
+      // entrar en fullscreen o al elegir otro modo). Se acepta y se conserva
+      // la caja; el redimensionado del usuario nunca pasa por aquí.
+      m_fixedRenderWidth = xToLayoutLength(width);
+      m_fixedRenderHeight = xToLayoutLength(height);
+      m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
+      m_xConfigured.x = INT_MIN;
+      syncXwaylandConfigure();
+      syncOwnedPresentation();
+      return;
     }
     if (!m_tiled
         && !scheduledFullscreen()
