@@ -665,6 +665,9 @@ namespace umbriel {
     void handleForeignDestroy();
     void handleExtForeignDestroy();
     void handleCaptureSourceDestroy();
+    // Tamaño de la caja que se presenta (para sombra, borde y blur). En el
+    // piloto de render fijo es la caja flotante, no el tamaño del cliente.
+    std::array<int, 2> presentedContentSize() const;
     void updateBorderGeometry();
     void updateBorderGeometry(int contentWidth, int contentHeight);
     // Coloca los indicadores nativos con el tamaño de contenido presentado.

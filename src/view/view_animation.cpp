@@ -1285,7 +1285,7 @@ namespace umbriel {
       applyCornerRadius();
       updateBorderGeometry(target.width, target.height);
       syncWindowHandles(target.width, target.height);
-      updateShadow();
+      updateShadow(target.width, target.height);
       updateBlur(target.width, target.height);
       syncModalShade();
       layoutAttachments();
