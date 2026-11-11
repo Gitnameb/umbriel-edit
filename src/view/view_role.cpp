@@ -118,9 +118,16 @@ namespace umbriel {
     if (m_toplevel != nullptr) {
       wlr_xdg_toplevel_set_fullscreen(m_toplevel, fullscreen);
     } else {
+      if (m_fixedRender && fullscreen) {
+        m_fixedClientFullscreen = true;
+      }
+      // m_xState es el estado del compositor; el piloto mantiene aparte lo que
+      // el cliente cree. Una vez que el juego ha estado en pantalla completa,
+      // se le sigue diciendo que lo está aunque la ventana se presente en
+      // ventana, para que no cambie su resolución ni vuelva a pedirlo.
       m_xState.fullscreen = fullscreen;
       m_xFullscreenSize.reset();
-      wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen);
+      wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen || m_fixedClientFullscreen);
     }
     syncSsdFrame();
   }
@@ -273,7 +280,9 @@ namespace umbriel {
       wlr_xdg_surface_schedule_configure(m_toplevel->base);
       return;
     }
-    wlr_xwayland_surface_set_fullscreen(m_xsurface, m_xState.fullscreen);
+    // Para el piloto, el cliente sigue creyendo que está en pantalla completa
+    // aunque el compositor lo presente en ventana.
+    wlr_xwayland_surface_set_fullscreen(m_xsurface, m_xState.fullscreen || m_fixedClientFullscreen);
     wlr_xwayland_surface_set_maximized(m_xsurface, m_xState.maximized, m_xState.maximized);
   }
 

@@ -1121,6 +1121,11 @@ namespace umbriel {
     // Momento en que el compositor activó el fullscreen; un unfullscreen del
     // cliente justo después es el eco de Wine y se ignora brevemente.
     std::chrono::steady_clock::time_point m_xCompositorFullscreenAt{};
+    // Piloto de render fijo: una vez que el juego ha estado en pantalla
+    // completa, se le sigue diciendo que lo está aunque el compositor lo
+    // presente en ventana. Así no cambia su resolución ni vuelve a pedir
+    // fullscreen al salir.
+    bool m_fixedClientFullscreen = false;
     bool m_onActiveWorkspace = false;
     bool m_inScratchpad = false;
     bool m_urgent = false;
