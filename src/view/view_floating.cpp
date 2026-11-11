@@ -1,4 +1,5 @@
 #include "config/config.h"
+#include "core/log.h"
 #include "input/cursor.h"
 #include "input/seat.h"
 #include "layer/layer_surface.h"
@@ -16,7 +17,9 @@ extern "C" {
 #include "view/view_internal.h"
 // clang-format off
 #include <algorithm>
+#include <cmath>
 #include <ranges>
+#include <string_view>
 #include "wlr.h"
 // clang-format on
 #include "workspace/scratchpad.h"
@@ -24,6 +27,10 @@ extern "C" {
 #include "xwayland/xwayland.h"
 
 namespace umbriel {
+  namespace {
+    constexpr Logger kLog("view");
+  }
+
   wlr_box View::floatingUsableArea() const {
     if (m_workspace != nullptr && m_workspace->group() != nullptr && m_workspace->group()->output() != nullptr) {
       return m_workspace->group()->output()->usableArea();
@@ -464,7 +471,143 @@ namespace umbriel {
     m_floating.recordSizeRequest(width, height, configureSize(width, height));
   }
 
+  // Piloto de render fijo. Solo para Xwayland y escala de salida 1: el cliente
+  // conserva su tamaño (su resolución) y la caja flotante se escala. Así una
+  // ventana más pequeña no reconfigura al cliente y no dispara los bugs de
+  // resize de los juegos.
+  void View::beginFixedRenderPilot() {
+    if (m_fixedRender || m_tiled || m_xsurface == nullptr || m_contentTree == nullptr) {
+      return;
+    }
+    const std::string_view id = appId() != nullptr ? std::string_view(appId()) : std::string_view{};
+    const SizeHints hints = sizeHints();
+    const bool fixedSize = hints.maxWidth > 0
+        && hints.maxHeight > 0
+        && hints.minWidth == hints.maxWidth
+        && hints.minHeight == hints.maxHeight;
+    // Juegos de Steam y cualquier app que ya pida fullscreen o declare tamaño
+    // fijo. El piloto solo escala Xwayland; una app Wayland nativa no entra.
+    if (!id.starts_with("steam_app_") && !requestedFullscreen() && !scheduledFullscreen() && !fixedSize) {
+      return;
+    }
+    auto size = currentSize();
+    if (size.width <= 0 || size.height <= 0) {
+      const wlr_box& geo = geometryBox();
+      size = {.width = geo.width, .height = geo.height};
+    }
+    if (size.width <= 0 || size.height <= 0) {
+      return;
+    }
+    m_fixedRender = true;
+    m_fixedRenderWidth = size.width;
+    m_fixedRenderHeight = size.height;
+    m_fixedBoxWidth = size.width;
+    m_fixedBoxHeight = size.height;
+    m_fixedScale = 1.0;
+    // El cliente no debe recibir el tamaño de la caja, sino su resolución.
+    m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
+    syncXwaylandConfigure();
+    m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
+    m_presentation.resetCrop(m_contentTree, rootSurface());
+    applyContentScale();
+    kLog.info(
+        "fixed-render '{}': cliente {}x{}, caja {}x{}", appId(), m_fixedRenderWidth, m_fixedRenderHeight,
+        m_fixedBoxWidth, m_fixedBoxHeight
+    );
+  }
+
+  void View::resizeFixedRenderBox(int width, int height) {
+    if (!m_fixedRender || m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0) {
+      return;
+    }
+    // La caja puede tener cualquier proporción, como una ventana de vídeo: el
+    // contenido se escala con fit y las barras que sobren se pintan en negro.
+    const int boxWidth = std::max(1, width);
+    const int boxHeight = std::max(1, height);
+    m_fixedBoxWidth = boxWidth;
+    m_fixedBoxHeight = boxHeight;
+    m_fixedScale = std::min(
+        static_cast<double>(boxWidth) / m_fixedRenderWidth,
+        static_cast<double>(boxHeight) / m_fixedRenderHeight
+    );
+    kLog.debug(
+        "fixed-render '{}': caja {}x{}, escala {:.4}", appId(), boxWidth, boxHeight, m_fixedScale
+    );
+    m_presentation.setSize(boxWidth, boxHeight);
+    beginResizeAnimation(boxWidth, boxHeight);
+    applyContentScale();
+    // La ventana X cambia de posición con la caja, pero no de tamaño.
+    if (const auto& anchor = m_floating.anchor(); anchor && !currentFullscreen()) {
+      // Al arrastrar un borde, el opuesto se queda quieto y la caja crece
+      // hacia el lado que se mueve.
+      const auto origin = anchoredContentOrigin(
+          *anchor, m_floating.edges(), {.x = 0, .y = 0, .width = boxWidth, .height = boxHeight}
+      );
+      setPosition(origin.x, origin.y);
+    }
+    // Igual que la ruta normal: si la caja nueva no cabe, se recoloca. Durante
+    // un arrastre con el ratón esto no hace nada y el cursor manda.
+    clampFloatingPositionForSize(boxWidth, boxHeight);
+    syncXwaylandConfigure();
+    syncOwnedPresentation();
+  }
+
+  // El árbol de superficie se dibuja con una escala divisoria: el tamaño en
+  // escena es el del búfer dividido por la escala. La escala de salida de
+  // Xwayland (m_xScale) ya divide el búfer a tamaño lógico, así que para
+  // agrandar el contenido k veces hay que dividir por k: m_xScale / k.
+  void View::applyContentScale() {
+    if (m_contentTree == nullptr) {
+      return;
+    }
+    const double scale = contentScale();
+    wlr_scene_subsurface_tree_set_scale(&m_contentTree->node, scale);
+    if (m_captureScene != nullptr) {
+      wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
+    }
+    if (m_fixedRender) {
+      // El centrado de la imagen va en el nodo de superficie, no en el árbol
+      // de contenido: así el borde y el fondo se quedan en la caja y la imagen
+      // se reparte con las barras negras dentro.
+      if (wlr_scene_node* surfaceNode = view_detail::toplevelSurfaceTreeNode(m_contentTree, rootSurface())) {
+        wlr_scene_node_set_position(surfaceNode, m_fixedOffsetX, m_fixedOffsetY);
+        kLog.debug("fixed-render surface node at {},{}", surfaceNode->x, surfaceNode->y);
+      } else {
+        kLog.debug("fixed-render surface node NULL");
+      }
+      struct Ctx {
+        double applied;
+      } ctx{scale};
+      wlr_scene_node_for_each_buffer(
+          &m_contentTree->node,
+          [](wlr_scene_buffer* buffer, int sx, int sy, void* data) {
+            auto* ctx = static_cast<Ctx*>(data);
+            wlr_scene_surface* sceneSurface = wlr_scene_surface_try_from_buffer(buffer);
+            if (sceneSurface == nullptr) {
+              return;
+            }
+            int width = 0;
+            int height = 0;
+            wlr_scene_surface_get_size(sceneSurface, &width, &height);
+            kLog.debug(
+                "fixed-render buffer '{}x{}' at {},{}, dest {}x{}, divisor {:.4}", sceneSurface->surface->current.width,
+                sceneSurface->surface->current.height, sx, sy, width, height, ctx->applied
+            );
+          },
+          &ctx
+      );
+      int lx = 0;
+      int ly = 0;
+      wlr_scene_node_coords(&m_contentTree->node, &lx, &ly);
+      kLog.debug("fixed-render contenido en {},{} divisor {:.4}", lx, ly, scale);
+    }
+    syncXwaylandShape();
+  }
+
   std::array<int, 2> View::floatingSize() const {
+    if (m_fixedRender && !m_tiled && m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+      return {m_fixedBoxWidth, m_fixedBoxHeight};
+    }
     if (const auto& pending = m_floating.pendingSize()) {
       return *pending;
     }
@@ -506,15 +649,28 @@ namespace umbriel {
     }
     const SizeHints hints = sizeHints();
     const auto [basisWidth, basisHeight] = floatingSize();
-    const int width =
-        widthFraction ? clampWidth(floatingFractionSize(*widthFraction, usable.width), hints) : basisWidth;
-    const int height =
-        heightFraction ? clampHeight(floatingFractionSize(*heightFraction, usable.height), hints) : basisHeight;
+    // El piloto de render fijo desacopla la caja del cliente: sus límites de
+    // tamaño son la resolución del juego, no los de la ventana.
+    const int width = widthFraction
+        ? (m_fixedRender ? floatingFractionSize(*widthFraction, usable.width)
+                         : clampWidth(floatingFractionSize(*widthFraction, usable.width), hints))
+        : basisWidth;
+    const int height = heightFraction
+        ? (m_fixedRender ? floatingFractionSize(*heightFraction, usable.height)
+                         : clampHeight(floatingFractionSize(*heightFraction, usable.height), hints))
+        : basisHeight;
     if (width <= 0 || height <= 0) {
       return false;
     }
     clearRegionState();
     dropMaximizedForResize();
+    if (m_fixedRender) {
+      // Un resize por teclado crece desde el borde superior izquierdo; se
+      // descarta cualquier ancla de un arrastre anterior.
+      finishFloatingResize();
+      resizeFixedRenderBox(width, height);
+      return true;
+    }
     requestFloatingSize(width, height);
     beginResizeAnimation(width, height);
     clampFloatingPositionForSize(width, height);
@@ -522,6 +678,9 @@ namespace umbriel {
   }
 
   std::array<int, 2> View::floatingRestoreSize() const {
+    if (m_fixedRender && m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+      return {m_fixedBoxWidth, m_fixedBoxHeight};
+    }
     if (m_floating.size()) {
       return *m_floating.size();
     }
@@ -567,6 +726,11 @@ namespace umbriel {
 
   void View::beginFloatingResize(uint32_t edges) {
     clearRegionState();
+    if (m_fixedRender) {
+      // La caja, no el tamaño del cliente, es lo que se ancla al arrastrar.
+      m_floating.beginResize({layoutX(), layoutY(), m_fixedBoxWidth, m_fixedBoxHeight}, edges);
+      return;
+    }
     const wlr_box& geo = geometryBox();
     m_floating.beginResize(
         {.x = layoutX() + geo.x, .y = layoutY() + geo.y, .width = geo.width, .height = geo.height}, edges
@@ -576,6 +740,10 @@ namespace umbriel {
 
   void View::resizeFloating(int width, int height) {
     syncFloatingResizePosition();
+    if (m_fixedRender) {
+      resizeFixedRenderBox(width, height);
+      return;
+    }
     requestFloatingSize(width, height);
   }
 
@@ -610,8 +778,14 @@ namespace umbriel {
         .width = basisWidth,
         .height = basisHeight,
     };
-    const int width = widthAxis ? clampWidth(floatingFractionSize(target, usable.width), hints) : basisWidth;
-    const int height = widthAxis ? basisHeight : clampHeight(floatingFractionSize(target, usable.height), hints);
+    const int width = widthAxis
+        ? (m_fixedRender ? floatingFractionSize(target, usable.width)
+                         : clampWidth(floatingFractionSize(target, usable.width), hints))
+        : basisWidth;
+    const int height = widthAxis
+        ? basisHeight
+        : (m_fixedRender ? floatingFractionSize(target, usable.height)
+                         : clampHeight(floatingFractionSize(target, usable.height), hints));
     if (width <= 0 || height <= 0) {
       return;
     }
@@ -622,6 +796,12 @@ namespace umbriel {
     // The anchor session stays open until the client answers the configure, so a commit at a different size still
     // recomputes the origin from the actual geometry. finishFloatingResize ends the session but keeps the anchor until
     // the request settles; that commit re-pins the edge and retires the anchor.
+    if (m_fixedRender) {
+      m_floating.beginResize({layoutX(), layoutY(), m_fixedBoxWidth, m_fixedBoxHeight}, edges);
+      resizeFixedRenderBox(width, height);
+      finishFloatingResize();
+      return;
+    }
     const FloatingPoint anchoredOrigin =
         anchoredContentOrigin(anchor, edges, {.x = 0, .y = 0, .width = width, .height = height});
     m_floating.beginResize(anchor, edges);
@@ -638,7 +818,7 @@ namespace umbriel {
 
   void View::syncFloatingResizePosition() {
     // An attached dialog resizes around its centre, which its parent's layoutAttachments() keeps.
-    if (!m_floating.anchor() || attached()) {
+    if (m_fixedRender || !m_floating.anchor() || attached()) {
       return;
     }
     const wlr_box& geo = geometryBox();
@@ -658,6 +838,11 @@ namespace umbriel {
 
   void View::adoptFloatingClientSize() {
     if (m_tiled || !m_mapped || scheduledFullscreen() || scheduledMaximized() || m_region) {
+      return;
+    }
+    // El piloto de render fijo nunca adopta el tamaño del cliente como caja:
+    // un commit del juego cambia su resolución, no la ventana.
+    if (m_fixedRender) {
       return;
     }
     if (!retireFloatingSizeRequest()) {
@@ -685,6 +870,14 @@ namespace umbriel {
 
   void View::syncFloatingSurfaceClip() {
     if (m_tiled || scheduledFullscreen()) {
+      return;
+    }
+    if (m_fixedRender) {
+      // La superficie se escala dentro de la caja; recortarla al tamaño del
+      // cliente dejaría solo una esquina visible.
+      setSurfaceTreeClip(nullptr);
+      updateBlur();
+      updateShadow();
       return;
     }
     const wlr_box& geo = geometryBox();

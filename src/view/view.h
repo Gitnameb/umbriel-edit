@@ -172,6 +172,12 @@ namespace umbriel {
     bool restoresTiledOnUnpin() const { return m_restoreTiledAfterUnpin; }
     bool maximizedToEdges() const { return m_maximizedToEdges; }
     bool floatingMaximized() const { return m_floatingMaximized; }
+    // Piloto de resolución de render fija: el cliente conserva su tamaño y la
+    // ventana flotante se escala a la caja. Solo Xwayland y escala 1.
+    bool fixedRender() const { return m_fixedRender; }
+    // Escala de la superficie en unidades de escena: píxeles de superficie por
+    // píxel de presentación. El piloto la usa también para el ratón.
+    double contentScale() const { return m_fixedRender && m_fixedScale > 0.0 ? m_xScale / m_fixedScale : m_xScale; }
     // Fullscreen for layout purposes follows the state already scheduled for the next configure.
     bool layoutFullscreen() const;
     bool urgent() const { return m_urgent; }
@@ -659,6 +665,9 @@ namespace umbriel {
     void handleForeignDestroy();
     void handleExtForeignDestroy();
     void handleCaptureSourceDestroy();
+    // Tamaño de la caja que se presenta (para sombra, borde y blur). En el
+    // piloto de render fijo es la caja flotante, no el tamaño del cliente.
+    std::array<int, 2> presentedContentSize() const;
     void updateBorderGeometry();
     void updateBorderGeometry(int contentWidth, int contentHeight);
     // Coloca los indicadores nativos con el tamaño de contenido presentado.
@@ -804,6 +813,11 @@ namespace umbriel {
     void syncFloatingSurfaceClip();
     void beginFloatingResize(uint32_t edges);
     void resizeFloating(int width, int height);
+    // Piloto: separa el tamaño del cliente (resolución de render) de la caja
+    // flotante. La caja se redimensiona y el contenido se escala.
+    void beginFixedRenderPilot();
+    void resizeFixedRenderBox(int width, int height);
+    void applyContentScale();
     void finishFloatingResize();
     void syncFloatingResizePosition();
     void adoptFloatingClientSize();
@@ -1110,6 +1124,14 @@ namespace umbriel {
     // An X11 window entered through the compositor toggle stays fullscreen until another compositor action releases
     // it. This prevents Wine from immediately undoing the explicit user action with a contradictory EWMH request.
     bool m_xCompositorFullscreen = false;
+    // Momento en que el compositor activó el fullscreen; un unfullscreen del
+    // cliente justo después es el eco de Wine y se ignora brevemente.
+    std::chrono::steady_clock::time_point m_xCompositorFullscreenAt{};
+    // Piloto de render fijo: una vez que el juego ha estado en pantalla
+    // completa, se le sigue diciendo que lo está aunque el compositor lo
+    // presente en ventana. Así no cambia su resolución ni vuelve a pedir
+    // fullscreen al salir.
+    bool m_fixedClientFullscreen = false;
     bool m_onActiveWorkspace = false;
     bool m_inScratchpad = false;
     bool m_urgent = false;
@@ -1144,6 +1166,16 @@ namespace umbriel {
     // The box a maximized float was last placed in, so a refit acts only when its settings moved it.
     wlr_box m_floatingMaximizedBox{};
     FloatingGeometry m_floating;
+    // Piloto de render fijo: tamaño del cliente y caja presentada. Con
+    // m_fixedScale = caja / cliente, el árbol de superficie se escala.
+    bool m_fixedRender = false;
+    int m_fixedRenderWidth = 0;
+    int m_fixedRenderHeight = 0;
+    int m_fixedBoxWidth = 0;
+    int m_fixedBoxHeight = 0;
+    int m_fixedOffsetX = 0;
+    int m_fixedOffsetY = 0;
+    double m_fixedScale = 1.0;
     // Unapplied floating defaults stay in their configured units until the first float transition.
     std::optional<int> m_pendingFloatingWidthPx;
     std::optional<int> m_pendingFloatingHeightPx;

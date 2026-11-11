@@ -205,7 +205,7 @@ namespace umbriel {
     }
 
     // The hint and the seat position are surface-local; the cursor moves in layout units.
-    const double scale = surfaceScale(constraint->surface);
+    const double scale = contentScaleForSurface(constraint->surface);
     double sx = seat->pointer_state.sx;
     double sy = seat->pointer_state.sy;
     double lx = m_cursor->x + ((constraint->current.cursor_hint.x - sx) / scale);
@@ -228,7 +228,7 @@ namespace umbriel {
     }
 
     // The region is surface-local; the deltas are in layout units.
-    const double scale = surfaceScale(m_activeConstraint->surface);
+    const double scale = contentScaleForSurface(m_activeConstraint->surface);
     double sx = seat->pointer_state.sx;
     double sy = seat->pointer_state.sy;
 
@@ -260,6 +260,13 @@ namespace umbriel {
   double Cursor::surfaceScale(wlr_surface* surface) const {
     const Xwayland* xwayland = m_server->xwayland();
     return xwayland != nullptr ? xwayland->surfaceScale(surface) : 1.0;
+  }
+
+  double Cursor::contentScaleForSurface(wlr_surface* surface) const {
+    if (View* view = View::fromSurface(surface); view != nullptr) {
+      return view->contentScale();
+    }
+    return surfaceScale(surface);
   }
 
 } // namespace umbriel

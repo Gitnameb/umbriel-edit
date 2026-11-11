@@ -228,6 +228,9 @@ namespace umbriel {
     if (sizeGrabActive()) {
       return target.width;
     }
+    if (m_fixedRender) {
+      return target.width;
+    }
     if (layoutPresentationOwned()) {
       return m_presentation.width();
     }
@@ -243,6 +246,9 @@ namespace umbriel {
     if (sizeGrabActive()) {
       return target.height;
     }
+    if (m_fixedRender) {
+      return target.height;
+    }
     if (layoutPresentationOwned()) {
       return m_presentation.height();
     }
@@ -256,6 +262,15 @@ namespace umbriel {
   // remain centered and cropped without distortion.
 
   void View::updateFullscreenPresentation(int width, int height) {
+    if (m_fixedRender) {
+      // La escala la aplica el árbol de superficie. Se pasa el nodo para que
+      // se deshaga cualquier centrado viejo del fullscreen: si no, el
+      // contenido queda desplazado media caja y se sale de la ventana.
+      m_presentation.updateFullscreen(
+          false, 0, 0, toplevelSurfaceTreeNode(m_contentTree, rootSurface()), geometryBox()
+      );
+      return;
+    }
     m_presentation.updateFullscreen(
         currentFullscreen(), width, height, toplevelSurfaceTreeNode(m_contentTree, rootSurface()), geometryBox()
     );
@@ -1200,7 +1215,8 @@ namespace umbriel {
     if (fullArea.width <= 0 || fullArea.height <= 0) {
       return;
     }
-    if (scheduledSize().width != fullArea.width || scheduledSize().height != fullArea.height) {
+    if (!m_fixedRender
+        && (scheduledSize().width != fullArea.width || scheduledSize().height != fullArea.height)) {
       configureSize(fullArea.width, fullArea.height);
     }
     if (fullscreenOpeningActive()) {
@@ -1232,6 +1248,50 @@ namespace umbriel {
   void View::applyPresentation(const wlr_box& target) {
     updateFullscreenPresentation(target.width, target.height);
     const wlr_box& geometry = geometryBox();
+    if (m_fixedRender && geometry.width > 0 && geometry.height > 0) {
+      // La escala se calcula con el tamaño REAL que ha commiteado el cliente.
+      // El tamaño configurado puede ser la salida y el juego no haberlo
+      // aceptado; usar el configurado dejaba la imagen pequeña en una esquina.
+      m_fixedRenderWidth = geometry.width;
+      m_fixedRenderHeight = geometry.height;
+      const double sx = static_cast<double>(target.width) / m_fixedRenderWidth;
+      const double sy = static_cast<double>(target.height) / m_fixedRenderHeight;
+      m_fixedScale = std::min(sx, sy);
+      // Centrar la imagen si la caja no tiene la misma proporción que el
+      // render; en la ventana normal el aspecto está forzado y el offset es 0.
+      const int contentWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));
+      const int contentHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
+      m_fixedOffsetX = std::max(0, (target.width - contentWidth) / 2);
+      m_fixedOffsetY = std::max(0, (target.height - contentHeight) / 2);
+      kLog.debug(
+          "fixed-render presentacion {}x{} cliente {}x{} escala {:.4} offset {},{}", target.width, target.height,
+          m_fixedRenderWidth, m_fixedRenderHeight, m_fixedScale, m_fixedOffsetX, m_fixedOffsetY
+      );
+      // El árbol de contenido se queda en el origen de la caja para que el
+      // borde, la barra de título y el fondo coincidan con la ventana. El
+      // centrado de la imagen se hace moviendo solo el nodo de la superficie.
+      if (m_contentTree != nullptr) {
+        wlr_scene_node_set_position(&m_contentTree->node, 0, 0);
+      }
+      // Fondo negro de la ventana: cubre las barras que deja el fit.
+      m_presentation.setBackdropBox(0, 0, target.width, target.height);
+      m_presentation.setBackdropEnabled(true);
+      applyContentScale();
+      // La superficie se dibuja escalada dentro de la caja; el recorte y el
+      // crop de abajo trabajan en coordenadas de superficie 1:1 y dejarían
+      // solo una esquina, así que se saltan.
+      m_presentedBox = {.x = target.x, .y = target.y, .width = target.width, .height = target.height};
+      trackPresentedSize(target.width, target.height);
+      setSurfaceTreeClip(nullptr);
+      applyCornerRadius();
+      updateBorderGeometry(target.width, target.height);
+      syncWindowHandles(target.width, target.height);
+      updateShadow(target.width, target.height);
+      updateBlur(target.width, target.height);
+      syncModalShade();
+      layoutAttachments();
+      return;
+    }
     // Stay inside the tile while geometry lags configure (Electron often stays wide).
     const wlr_box content{
         .x = target.x,

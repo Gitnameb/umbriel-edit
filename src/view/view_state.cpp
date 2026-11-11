@@ -104,6 +104,10 @@ namespace umbriel {
   }
 
   void View::setMaximized(bool maximized, bool animate) {
+    if (m_fixedRender) {
+      // El piloto de render fijo no reconfigura al cliente para maximizar.
+      return;
+    }
     if (m_tiled && m_workspace != nullptr) {
       m_floatingMaximized = false;
       if (m_maximizedToEdges) {
@@ -356,6 +360,10 @@ namespace umbriel {
   }
 
   void View::setMaximizedToEdges(bool maximized, bool animate) {
+    if (m_fixedRender) {
+      // Ver setMaximized: el tamaño del cliente no cambia.
+      return;
+    }
     if (!maximized) {
       m_restoreMaximizedToEdges = false;
     }
@@ -472,7 +480,10 @@ namespace umbriel {
       reassertRoleState();
       return;
     }
-    if (!requested && scheduledFullscreen() && m_xCompositorFullscreen) {
+    if (!requested && scheduledFullscreen() && m_xCompositorFullscreen
+        && std::chrono::steady_clock::now() - m_xCompositorFullscreenAt < std::chrono::milliseconds(750)) {
+      // Wine suele pedir unfullscreen justo después de que el compositor lo
+      // active. Pasada la ventana de gracia, el Alt+Enter del juego sí sale.
       kLog.debug("request_fullscreen denied for compositor-owned X11 '{}'", appId() != nullptr ? appId() : "?");
       reassertRoleState();
       return;
@@ -537,6 +548,9 @@ namespace umbriel {
     }
     const bool fullscreen = !scheduledFullscreen();
     m_xCompositorFullscreen = m_xsurface != nullptr && fullscreen;
+    if (m_xCompositorFullscreen) {
+      m_xCompositorFullscreenAt = std::chrono::steady_clock::now();
+    }
     setFullscreen(fullscreen);
   }
 
@@ -765,6 +779,11 @@ namespace umbriel {
     // animation.
     const bool wantTiled = !floating;
     if (m_tiled == wantTiled) {
+      return;
+    }
+    if (m_fixedRender && wantTiled) {
+      // La ventana de render fijo vive fuera del mosaico: volver a mosaicarla
+      // reconfiguraría al cliente y rompería el piloto.
       return;
     }
     // A window shows before it joins the layout, which cannot hold a hidden tile.
@@ -1037,6 +1056,15 @@ namespace umbriel {
       };
       m_hasFullscreenRestoreBox = width > 0 && height > 0;
     }
+    if (fullscreen && m_fixedRender && (m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0)) {
+      // El piloto nunca reconfigura al cliente de tamaño: la resolución del
+      // juego se queda como está y el compositor la escala en pantalla
+      // completa. Así el juego puede seguir creyendo que está en fullscreen y
+      // no cambia de resolución al entrar o salir de la ventana.
+      const wlr_box fullArea = fullscreenArea();
+      m_fixedRenderWidth = fullArea.width;
+      m_fixedRenderHeight = fullArea.height;
+    }
     const bool restoreFloating = !fullscreen && !m_tiled && m_hasFullscreenRestoreBox;
     // Any leave-fullscreen invalidates a pending float-toggle restore: the
     // float path re-sets the flag right after its own setFullscreen(false).
@@ -1094,9 +1122,34 @@ namespace umbriel {
         raiseToTop();
       }
       if (restoreFloating) {
-        requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
-        beginResizeAnimation(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height, true);
-        animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+        if (m_fixedRender) {
+          // La caja vuelve a su tamaño anterior; el cliente no se reconfigura.
+          m_fixedBoxWidth = m_fullscreenRestoreBox.width;
+          m_fixedBoxHeight = m_fullscreenRestoreBox.height;
+          m_fixedScale = std::min(
+              static_cast<double>(m_fixedBoxWidth) / m_fixedRenderWidth,
+              static_cast<double>(m_fixedBoxHeight) / m_fixedRenderHeight
+          );
+          const int contentWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));
+          const int contentHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
+          m_fixedOffsetX = std::max(0, (m_fixedBoxWidth - contentWidth) / 2);
+          m_fixedOffsetY = std::max(0, (m_fixedBoxHeight - contentHeight) / 2);
+          m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
+          beginResizeAnimation(m_fixedBoxWidth, m_fixedBoxHeight, true);
+          animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+          // El fullscreen pudo dejar un recorte/desplazamiento en el búfer.
+          // Al volver a ventana se limpia para que la primera imagen ya salga
+          // centrada, sin esperar a que el cliente vuelva a dibujar.
+          m_presentation.resetCrop(m_contentTree, rootSurface());
+          applyContentScale();
+          // Sin frames de animación, nada más aplicaría la presentación: se
+          // hace ahora para que la primera imagen ya salga centrada.
+          syncOwnedPresentation();
+        } else {
+          requestFloatingSize(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height);
+          beginResizeAnimation(m_fullscreenRestoreBox.width, m_fullscreenRestoreBox.height, true);
+          animateTo(m_fullscreenRestoreBox.x, m_fullscreenRestoreBox.y);
+        }
       } else if (m_tiled) {
         m_hasFullscreenRestoreBox = false;
       }

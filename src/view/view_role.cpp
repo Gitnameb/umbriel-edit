@@ -118,9 +118,16 @@ namespace umbriel {
     if (m_toplevel != nullptr) {
       wlr_xdg_toplevel_set_fullscreen(m_toplevel, fullscreen);
     } else {
+      if (m_fixedRender && fullscreen) {
+        m_fixedClientFullscreen = true;
+      }
+      // m_xState es el estado del compositor; el piloto mantiene aparte lo que
+      // el cliente cree. Una vez que el juego ha estado en pantalla completa,
+      // se le sigue diciendo que lo está aunque la ventana se presente en
+      // ventana, para que no cambie su resolución ni vuelva a pedirlo.
       m_xState.fullscreen = fullscreen;
       m_xFullscreenSize.reset();
-      wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen);
+      wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen || m_fixedClientFullscreen);
     }
     syncSsdFrame();
   }
@@ -273,7 +280,9 @@ namespace umbriel {
       wlr_xdg_surface_schedule_configure(m_toplevel->base);
       return;
     }
-    wlr_xwayland_surface_set_fullscreen(m_xsurface, m_xState.fullscreen);
+    // Para el piloto, el cliente sigue creyendo que está en pantalla completa
+    // aunque el compositor lo presente en ventana.
+    wlr_xwayland_surface_set_fullscreen(m_xsurface, m_xState.fullscreen || m_fixedClientFullscreen);
     wlr_xwayland_surface_set_maximized(m_xsurface, m_xState.maximized, m_xState.maximized);
   }
 
@@ -341,6 +350,22 @@ namespace umbriel {
     // in particular, react to every move; the last tick of the animation publishes where the window came to rest.
     int lx = region.toX(layoutX());
     int ly = region.toY(layoutY());
+    if (m_fixedRender) {
+      // El piloto presenta la ventana escalada. Xwayland calcula las
+      // coordenadas raíz del puntero como posición del X window + coordenadas
+      // de superficie; si la ventana visual está lejos del origen, esa suma se
+      // sale del root y Xwayland recorta el ratón. Se acerca el X window al
+      // origen solo lo necesario para que el render completo quepa en el root.
+      // Así los menús X siguen cerca de su sitio cuando el render es pequeño.
+      const int renderWidth = m_xScheduled.width > 0 ? region.toXWidth(m_xScheduled.width) : m_xsurface->width;
+      const int renderHeight = m_xScheduled.height > 0 ? region.toXHeight(m_xScheduled.height) : m_xsurface->height;
+      wlr_box root{};
+      wlr_output_layout_get_box(m_server->outputLayout(), nullptr, &root);
+      const int maxX = root.x + std::max(0, root.width - renderWidth);
+      const int maxY = root.y + std::max(0, root.height - renderHeight);
+      lx = std::clamp(lx, root.x, maxX);
+      ly = std::clamp(ly, root.y, maxY);
+    }
     // X11 geometry is 16-bit: coordinates are signed, sizes unsigned and nonzero.
     constexpr int kMinCoordinate = std::numeric_limits<int16_t>::min();
     constexpr int kMaxCoordinate = std::numeric_limits<int16_t>::max();
@@ -390,11 +415,9 @@ namespace umbriel {
       return;
     }
     m_xScale = scale;
-    wlr_scene_subsurface_tree_set_scale(&m_contentTree->node, scale);
-    if (m_captureScene != nullptr) {
-      wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);
-    }
-    syncXwaylandShape();
+    // La escala de salida se combina con la de presentación del piloto de
+    // render fijo (m_fixedScale) en un solo sitio.
+    applyContentScale();
   }
 
   void View::syncXwaylandShape() {
@@ -476,6 +499,18 @@ namespace umbriel {
           && height <= fullHeight
           && (width != fullWidth || height != fullHeight);
       m_xFullscreenSize = emulated ? std::optional<ClientSize>({.width = width, .height = height}) : std::nullopt;
+    }
+    if (m_fixedRender && (widthRequested || heightRequested) && width > 0 && height > 0) {
+      // Un cambio pedido por el cliente es su resolución (por ejemplo al
+      // entrar en fullscreen o al elegir otro modo). Se acepta y se conserva
+      // la caja; el redimensionado del usuario nunca pasa por aquí.
+      m_fixedRenderWidth = xToLayoutLength(width);
+      m_fixedRenderHeight = xToLayoutLength(height);
+      m_xScheduled = {.width = m_fixedRenderWidth, .height = m_fixedRenderHeight};
+      m_xConfigured.x = INT_MIN;
+      syncXwaylandConfigure();
+      syncOwnedPresentation();
+      return;
     }
     if (!m_tiled
         && !scheduledFullscreen()

@@ -408,8 +408,8 @@ namespace umbriel {
   }
 
   void View::updateBlur() {
-    const wlr_box content = committedContentBox();
-    updateBlur(content.width, content.height);
+    const auto [width, height] = presentedContentSize();
+    updateBlur(width, height);
   }
 
   SurfaceBlurOptions View::blurOptions() const {
@@ -449,15 +449,15 @@ namespace umbriel {
       m_decoration.hideShadow();
       return;
     }
-    // Shadows follow the presented frame through layout changes, animations, and pending floating restores.
-    const wlr_box& geometry = geometryBox();
+    // Shadows follow the presented frame through layout changes, animations, pending floating restores and the
+    // fixed-render pilot, where the client size is not the box on screen.
+    const auto [width, height] = presentedContentSize();
     const bool usePresentedSize =
-        (m_tiled || sizeAnimating() || sizeGrabActive() || m_floating.pendingSize().has_value())
+        (m_tiled || m_fixedRender || sizeAnimating() || sizeGrabActive() || m_floating.pendingSize().has_value())
         && m_presentation.width() > 0
         && m_presentation.height() > 0;
     updateShadow(
-        usePresentedSize ? m_presentation.width() : geometry.width,
-        usePresentedSize ? m_presentation.height() : geometry.height
+        usePresentedSize ? m_presentation.width() : width, usePresentedSize ? m_presentation.height() : height
     );
   }
 
@@ -479,9 +479,17 @@ namespace umbriel {
     updateShadow();
   }
 
-  void View::updateBorderGeometry() {
+  std::array<int, 2> View::presentedContentSize() const {
+    if (m_fixedRender && m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+      return {m_fixedBoxWidth, m_fixedBoxHeight};
+    }
     const wlr_box content = committedContentBox();
-    updateBorderGeometry(content.width, content.height);
+    return {content.width, content.height};
+  }
+
+  void View::updateBorderGeometry() {
+    const auto [width, height] = presentedContentSize();
+    updateBorderGeometry(width, height);
   }
 
   void View::updateBorderGeometry(int contentWidth, int contentHeight) {

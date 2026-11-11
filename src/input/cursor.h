@@ -456,6 +456,10 @@ namespace umbriel {
     bool confineDelta(double* dx, double* dy) const;
     // Surface-local units per layout unit in `surface`: above 1 for an X11 window drawn at native resolution.
     double surfaceScale(wlr_surface* surface) const;
+    // Escala real con la que se presenta la superficie: incluye la escala de
+    // presentación del piloto de render fijo. Unidades de superficie por
+    // unidad de escena.
+    double contentScaleForSurface(wlr_surface* surface) const;
     bool ruleConstraintApplies(View& view) const;
     bool ruleConstraintEligible(View& view) const;
     void confineRuleDelta(double* dx, double* dy);
