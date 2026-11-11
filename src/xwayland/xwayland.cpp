@@ -5,6 +5,7 @@
 #include "input/cursor.h"
 #include "input/seat.h"
 #include "server/server.h"
+#include "view/view.h"
 #include "wlr.h"
 #include "xwayland/primary.h"
 #include "xwayland/shape.h"
@@ -96,6 +97,7 @@ namespace umbriel {
     m_focusClearTimer = wl_event_loop_add_timer(wl_display_get_event_loop(server.display()), onFocusClearTimer, this);
     m_selectionRefreshTimer =
         wl_event_loop_add_timer(wl_display_get_event_loop(server.display()), onSelectionRefreshTimer, this);
+    m_contentTimer = wl_event_loop_add_timer(wl_display_get_event_loop(server.display()), onContentTimer, this);
     m_keyboardFocusChange.notify = onKeyboardFocusChange;
     wl_signal_add(&server.seat()->wlr()->keyboard_state.events.focus_change, &m_keyboardFocusChange);
     kLog.info("Xwayland listening on DISPLAY={}", m_wlr->display_name);
@@ -115,6 +117,9 @@ namespace umbriel {
     wl_list_remove(&m_keyboardFocusChange.link);
     if (m_selectionRefreshTimer != nullptr) {
       wl_event_source_remove(m_selectionRefreshTimer);
+    }
+    if (m_contentTimer != nullptr) {
+      wl_event_source_remove(m_contentTimer);
     }
     // Windows only detach here; the server deletes views before destroying this.
     m_windows.clear();
@@ -194,6 +199,7 @@ namespace umbriel {
   }
 
   void Xwayland::forget(XwaylandWindow* window) {
+    unwatchContent(window->xsurface());
     m_shapes->remove(window->xsurface());
     std::erase_if(m_windows, [window](const std::unique_ptr<XwaylandWindow>& entry) { return entry.get() == window; });
   }
@@ -239,6 +245,13 @@ namespace umbriel {
           xcb_get_window_attributes_reply(connection, xcb_get_window_attributes(connection, children[i]), nullptr);
       xcb_get_geometry_reply_t* geometry =
           xcb_get_geometry_reply(connection, xcb_get_geometry(connection, children[i]), nullptr);
+      if (attributes != nullptr && geometry != nullptr) {
+        kLog.debug(
+            "content child {:#x} {}x{}+{}+{} viewable={} override_redirect={} class={}", children[i], geometry->width,
+            geometry->height, geometry->x, geometry->y, attributes->map_state == XCB_MAP_STATE_VIEWABLE,
+            static_cast<int>(attributes->override_redirect), static_cast<int>(attributes->_class)
+        );
+      }
       if (attributes != nullptr && geometry != nullptr
           && attributes->map_state == XCB_MAP_STATE_VIEWABLE
           && !attributes->override_redirect
@@ -265,12 +278,118 @@ namespace umbriel {
     }
     std::free(tree);
     xcb_disconnect(connection);
-    // Overlay windows (Steam, IMEs) are children too. A render area is at
-    // least half of the toplevel; anything smaller is left out.
-    if (bestArea == 0 || bestArea * 2 < parentArea) {
+    // Overlay windows (Steam, IMEs) are children too. The old threshold (half of the toplevel's area) rejected every
+    // render below ~1357x764 on a 1080p screen: 1280x720, 1024x768 or 800x600 kept the game's own black bars. A
+    // sixteenth of the area still leaves out small overlays and accepts 640x480 and up.
+    if (bestArea == 0 || bestArea * 16 < parentArea) {
+      kLog.debug("content rect: no child large enough (best area {}, toplevel {})", bestArea, parentArea);
       return std::nullopt;
     }
     return best;
+  }
+
+  void Xwayland::watchContent(wlr_xwayland_surface* xsurface) {
+    xcb_connection_t* connection = m_wlr != nullptr ? wlr_xwayland_get_xwm_connection(m_wlr) : nullptr;
+    if (connection == nullptr
+        || xsurface == nullptr
+        || xsurface->window_id == XCB_WINDOW_NONE
+        || xcb_connection_has_error(connection) != 0
+        || std::ranges::find(m_contentWatched, xsurface->window_id) != m_contentWatched.end()) {
+      return;
+    }
+    // The mask of one connection on one window is replaced, not merged: keep what wlroots selects for managed windows
+    // (focus and property changes) and add SubstructureNotify for the direct children.
+    const uint32_t mask = XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
+    xcb_change_window_attributes(connection, xsurface->window_id, XCB_CW_EVENT_MASK, &mask);
+    xcb_flush(connection);
+    m_contentWatched.push_back(xsurface->window_id);
+    kLog.debug("watching children of X11 window {:#x}", xsurface->window_id);
+  }
+
+  void Xwayland::unwatchContent(wlr_xwayland_surface* xsurface) {
+    if (xsurface == nullptr) {
+      return;
+    }
+    std::erase(m_contentWatched, xsurface->window_id);
+    std::erase(m_contentPending, xsurface->window_id);
+  }
+
+  bool Xwayland::handleContentEvent(const xcb_generic_event_t* event) {
+    if (m_contentWatched.empty()) {
+      return false;
+    }
+    uint32_t toplevel = XCB_WINDOW_NONE;
+    uint32_t child = XCB_WINDOW_NONE;
+    switch (event->response_type & 0x7f) {
+    case XCB_CREATE_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_create_notify_event_t*>(event);
+      toplevel = ev->parent;
+      child = ev->window;
+      break;
+    }
+    case XCB_DESTROY_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_destroy_notify_event_t*>(event);
+      toplevel = ev->event;
+      child = ev->window;
+      break;
+    }
+    case XCB_MAP_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_map_notify_event_t*>(event);
+      toplevel = ev->event;
+      child = ev->window;
+      break;
+    }
+    case XCB_UNMAP_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_unmap_notify_event_t*>(event);
+      toplevel = ev->event;
+      child = ev->window;
+      break;
+    }
+    case XCB_REPARENT_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_reparent_notify_event_t*>(event);
+      toplevel = ev->event;
+      child = ev->window;
+      break;
+    }
+    case XCB_CONFIGURE_NOTIFY: {
+      const auto* ev = reinterpret_cast<const xcb_configure_notify_event_t*>(event);
+      toplevel = ev->event;
+      child = ev->window;
+      break;
+    }
+    default:
+      return false;
+    }
+    // Events about the toplevel itself (event == window) and root-level events stay with wlroots.
+    if (toplevel == child || std::ranges::find(m_contentWatched, toplevel) == m_contentWatched.end()) {
+      return false;
+    }
+    if (std::ranges::find(m_contentPending, toplevel) == m_contentPending.end()) {
+      m_contentPending.push_back(toplevel);
+    }
+    if (m_contentTimer != nullptr) {
+      // Games rebuild the swapchain in bursts; one refresh after the burst is enough.
+      wl_event_source_timer_update(m_contentTimer, 60);
+    }
+    return true;
+  }
+
+  int Xwayland::onContentTimer(void* data) {
+    auto* self = static_cast<Xwayland*>(data);
+    std::vector<uint32_t> pending;
+    pending.swap(self->m_contentPending);
+    for (const uint32_t id : pending) {
+      const auto found = std::ranges::find(
+          self->m_windows, id, [](const std::unique_ptr<XwaylandWindow>& entry) { return entry->xsurface()->window_id; }
+      );
+      if (found == self->m_windows.end() || (*found)->xsurface()->surface == nullptr) {
+        continue;
+      }
+      if (View* view = View::fromSurface(wlr_surface_get_root_surface((*found)->xsurface()->surface))) {
+        view->handleXwaylandContentChanged();
+      }
+    }
+    return 0;
   }
 
   double Xwayland::surfaceScale(wlr_surface* surface) const {
@@ -358,6 +477,8 @@ namespace umbriel {
     Xwayland* self = wl_container_of(listener, self, m_serverStart); // NOLINT(modernize-use-auto)
     self->m_xwmSyncConnection = nullptr;
     self->m_xwmSyncWindow = XCB_NONE;
+    self->m_contentWatched.clear();
+    self->m_contentPending.clear();
     self->m_shapes->stop();
     self->m_primary->stop();
     if (self->m_clientDestroy.link.next != nullptr) {
@@ -410,6 +531,9 @@ namespace umbriel {
           return true;
         }
       }
+    }
+    if (self->handleContentEvent(event)) {
+      return true;
     }
     return self->m_primary->handleEvent(event) || self->m_shapes->handleEvent(event);
   }

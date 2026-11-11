@@ -94,7 +94,10 @@ namespace umbriel {
   }
 
   FloatingPoint View::grabbableOrigin(FloatingPoint origin, const wlr_box& usable) const {
-    return keepTitleBarReachable(clampFloatingOrigin(origin, geometryBox(), usable), titleBarHeight(), usable);
+    const auto [width, height] = floatingSize();
+    return keepTitleBarReachable(
+        clampFloatingOrigin(origin, {.x = 0, .y = 0, .width = width, .height = height}, usable), titleBarHeight(), usable
+    );
   }
 
   FloatingPoint View::settleFloatingDrop(int x, int y) {
@@ -136,12 +139,12 @@ namespace umbriel {
     // Mid-tween the clamp applies to where the tween is headed and retargets it. Skipping instead would spend the
     // usable-change check on a target that settles out of the margin, and the change is never re-checked.
     const bool animating = m_posX.animating() || m_posY.animating();
-    const wlr_box& geo = geometryBox();
+    const auto [width, height] = floatingSize();
     const FloatingPoint origin{
         .x = animating ? layoutTargetX() : layoutX(),
         .y = animating ? layoutTargetY() : layoutY(),
     };
-    if (const auto clamped = floatingClampTarget(origin, geo.width, geo.height, false)) {
+    if (const auto clamped = floatingClampTarget(origin, width, height, false)) {
       if (animating) {
         animateTo(clamped->x, clamped->y);
       } else {
@@ -189,11 +192,11 @@ namespace umbriel {
       return false;
     }
     const wlr_box usable = floatingUsableArea();
-    const wlr_box& geo = geometryBox();
-    if (usable.width <= 0 || usable.height <= 0 || geo.width <= 0 || geo.height <= 0) {
+    const auto [width, height] = floatingSize();
+    if (usable.width <= 0 || usable.height <= 0 || width <= 0 || height <= 0) {
       return false;
     }
-    FloatingPoint origin = centeredOrigin(usable, geo.width, geo.height + titleBarHeight());
+    FloatingPoint origin = centeredOrigin(usable, width, height + titleBarHeight());
     origin.y += titleBarHeight();
     clearRegionState();
     animateTo(origin.x, origin.y);
@@ -222,13 +225,13 @@ namespace umbriel {
     if (!m_mapped || m_tiled || scheduledFullscreen() || currentFullscreen()) {
       return false;
     }
-    const wlr_box& geo = geometryBox();
+    const auto [width, height] = floatingSize();
     const wlr_box usable = floatingUsableArea();
-    if (usable.width <= 0 || usable.height <= 0 || geo.width <= 0 || geo.height <= 0) {
+    if (usable.width <= 0 || usable.height <= 0 || width <= 0 || height <= 0) {
       return false;
     }
     FloatingPoint origin = {.x = layoutTargetX() + deltaX, .y = layoutTargetY() + deltaY};
-    origin = clampFloatingOrigin(origin, geo, usable);
+    origin = clampFloatingOrigin(origin, {.x = 0, .y = 0, .width = width, .height = height}, usable);
     clearRegionState();
     animateTo(origin.x, origin.y);
     m_floating.rememberPositionFraction(origin, usable);
@@ -239,9 +242,9 @@ namespace umbriel {
     if (!m_mapped || m_tiled || scheduledFullscreen() || currentFullscreen()) {
       return false;
     }
-    const wlr_box& geo = geometryBox();
+    const auto [width, height] = floatingSize();
     const wlr_box usable = floatingUsableArea();
-    if (usable.width <= 0 || usable.height <= 0 || geo.width <= 0 || geo.height <= 0) {
+    if (usable.width <= 0 || usable.height <= 0 || width <= 0 || height <= 0) {
       return false;
     }
     const wlr_box area = floatingMarginArea(usable);
@@ -252,13 +255,13 @@ namespace umbriel {
       origin.x = area.x;
       break;
     case WLR_EDGE_RIGHT:
-      origin.x = area.x + area.width - geo.width;
+      origin.x = area.x + area.width - width;
       break;
     case WLR_EDGE_TOP:
       origin.y = area.y;
       break;
     case WLR_EDGE_BOTTOM:
-      origin.y = area.y + area.height - geo.height;
+      origin.y = area.y + area.height - height;
       break;
     case WLR_EDGE_NONE:
       return false;
@@ -286,9 +289,9 @@ namespace umbriel {
       w = (*size)[0];
       h = (*size)[1];
     } else {
-      const wlr_box& geo = geometryBox();
-      w = geo.width > 0 ? geo.width : usable.width;
-      h = geo.height > 0 ? geo.height : usable.height;
+      const auto [boxWidth, boxHeight] = floatingSize();
+      w = boxWidth > 0 ? boxWidth : usable.width;
+      h = boxHeight > 0 ? boxHeight : usable.height;
     }
     // Floats keep their own size; only center within the usable area.
     const int width = w;
@@ -364,7 +367,8 @@ namespace umbriel {
 
     const bool stackingWorkspace =
         m_workspace != nullptr && m_workspace->layoutMode() == LayoutMode::Stacking;
-    const bool defaultSizeEligible = !placementSize
+    const bool defaultSizeEligible = !m_fixedRender
+        && !placementSize
         && transientParent() == nullptr
         && !passiveXwaylandUtility()
         && stackingWorkspace
@@ -412,9 +416,9 @@ namespace umbriel {
       // Where the parent is headed, not where its node is mid-animation right after it mapped. A fullscreen parent
       // shows over any panel, so the whole output counts as visible for it.
       const wlr_box shownIn = parent->scheduledFullscreen() ? parent->fullscreenArea() : usable;
-      const wlr_box& geo = geometryBox();
+      const auto [boxWidth, boxHeight] = floatingSize();
       const auto size = placementSize.value_or(
-          std::array{geo.width > 0 ? geo.width : usable.width, geo.height > 0 ? geo.height : usable.height}
+          std::array{boxWidth > 0 ? boxWidth : usable.width, boxHeight > 0 ? boxHeight : usable.height}
       );
       origin = centeredOverShown(parent->targetBox(), shownIn, size[0], size[1]);
     } else if (m_workspace != nullptr && m_workspace->layoutMode() == LayoutMode::Stacking) {
@@ -457,8 +461,17 @@ namespace umbriel {
         step = std::max(step, floatingCascadeStep(otherBar, otherBorder));
       }
     }
+    // El marco incluye borde y barra: se compara contra el área útil ampliada
+    // por esa decoración, o una ventana que llena el alto justo se tomaría por
+    // fuera de la pantalla y el cascado la desplazaría sin motivo.
+    const wlr_box cascadeArea{
+        .x = usable.x - border,
+        .y = usable.y - bar - border,
+        .width = usable.width + 2 * border,
+        .height = usable.height + bar + 2 * border,
+    };
     const FloatingPoint frame = cascadeOrigin(
-        {.x = origin.x - border, .y = origin.y - bar - border}, taken, step, usable, width + 2 * border,
+        {.x = origin.x - border, .y = origin.y - bar - border}, taken, step, cascadeArea, width + 2 * border,
         height + bar + 2 * border
     );
     return {.x = frame.x + border, .y = frame.y + bar + border};
@@ -514,12 +527,55 @@ namespace umbriel {
     m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
     m_presentation.resetCrop(m_contentTree, rootSurface());
     refreshFixedRenderContent(false);
+    // La ventana arranca con el tamaño y aspecto del render, no con el de la superficie del cliente: sin barras del
+    // juego ni del compositor. Si el render no cabe en el área útil, se encoge sin cambiar de aspecto.
+    const auto [boxWidth, boxHeight] = fixedRenderBoxSize(m_fixedRenderWidth, m_fixedRenderHeight);
+    if (boxWidth > 0 && boxHeight > 0 && m_fixedRenderWidth > 0 && m_fixedRenderHeight > 0) {
+      m_fixedBoxWidth = boxWidth;
+      m_fixedBoxHeight = boxHeight;
+      m_fixedScale = std::min(
+          static_cast<double>(boxWidth) / m_fixedRenderWidth,
+          static_cast<double>(boxHeight) / m_fixedRenderHeight
+      );
+      const int scaledWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));
+      const int scaledHeight = std::max(1, static_cast<int>(std::lround(m_fixedRenderHeight * m_fixedScale)));
+      m_fixedOffsetX = std::max(0, (boxWidth - scaledWidth) / 2);
+      m_fixedOffsetY = std::max(0, (boxHeight - scaledHeight) / 2);
+      m_presentation.setSize(m_fixedBoxWidth, m_fixedBoxHeight);
+    }
+    m_fixedAdoptedWidth = m_fixedRenderWidth;
+    m_fixedAdoptedHeight = m_fixedRenderHeight;
+    if (m_server->xwayland() != nullptr) {
+      m_server->xwayland()->watchContent(m_xsurface);
+    }
     applyContentScale();
     kLog.info(
         "fixed-render '{}': superficie {}x{}, render {}x{}+{},{} caja {}x{}", appId(), m_fixedSurfaceWidth,
         m_fixedSurfaceHeight, m_fixedRenderWidth, m_fixedRenderHeight, m_fixedContentX, m_fixedContentY, m_fixedBoxWidth,
         m_fixedBoxHeight
     );
+    // El piloto puede activarse después de que la ventana se colocara con su
+    // tamaño de cliente: se recoloca con la caja y el aspecto nuevos.
+    if (m_mapped && !m_tiled && !attached() && !currentFullscreen() && !scheduledFullscreen()) {
+      placeInUsableArea(m_initialRules.defaultPosition);
+    }
+  }
+
+  std::array<int, 2> View::fixedRenderBoxSize(int renderWidth, int renderHeight) const {
+    if (renderWidth <= 0 || renderHeight <= 0) {
+      return {0, 0};
+    }
+    double width = renderWidth;
+    double height = renderHeight;
+    const wlr_box usable = floatingUsableArea();
+    const int availableHeight = usable.height - titleBarHeight();
+    if (usable.width > 0 && availableHeight > 0) {
+      const double shrink =
+          std::min({1.0, static_cast<double>(usable.width) / width, static_cast<double>(availableHeight) / height});
+      width *= shrink;
+      height *= shrink;
+    }
+    return {std::max(1, static_cast<int>(std::lround(width))), std::max(1, static_cast<int>(std::lround(height)))};
   }
 
   void View::refreshFixedRenderContent(bool repaint) {
@@ -557,6 +613,9 @@ namespace umbriel {
         && contentY == m_fixedContentY
         && contentWidth == m_fixedRenderWidth
         && contentHeight == m_fixedRenderHeight) {
+      if (repaint) {
+        adoptFixedRenderAspect();
+      }
       return;
     }
     m_fixedContentX = contentX;
@@ -579,8 +638,57 @@ namespace umbriel {
     );
     applyContentScale();
     if (repaint) {
+      adoptFixedRenderAspect();
       syncOwnedPresentation();
     }
+  }
+
+  void View::handleXwaylandContentChanged() { refreshFixedRenderContent(true); }
+
+  void View::adoptFixedRenderAspect() {
+    if (!m_fixedRender || m_tiled || m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0) {
+      return;
+    }
+    const double aspect = static_cast<double>(m_fixedRenderWidth) / m_fixedRenderHeight;
+    const double adopted = m_fixedAdoptedWidth > 0 && m_fixedAdoptedHeight > 0
+        ? static_cast<double>(m_fixedAdoptedWidth) / m_fixedAdoptedHeight
+        : 0.0;
+    if (adopted > 0.0 && std::abs(aspect / adopted - 1.0) < 0.005) {
+      m_fixedAdoptedWidth = m_fixedRenderWidth;
+      m_fixedAdoptedHeight = m_fixedRenderHeight;
+      return;
+    }
+    // Mientras el usuario arrastra un borde manda el ratón; se adopta al soltar, en la siguiente notificación.
+    if (m_floating.anchor()) {
+      return;
+    }
+    m_fixedAdoptedWidth = m_fixedRenderWidth;
+    m_fixedAdoptedHeight = m_fixedRenderHeight;
+    // Conserva el área para que la ventana no crezca ni se encoja a cada cambio de aspecto.
+    const double area = static_cast<double>(m_fixedBoxWidth) * m_fixedBoxHeight;
+    double width = std::sqrt(area * aspect);
+    double height = width / aspect;
+    // Si la caja nueva no cabe en el área útil, se encoge conservando el aspecto.
+    const auto [newWidth, newHeight] = fixedRenderBoxSize(
+        std::max(1, static_cast<int>(std::lround(width))), std::max(1, static_cast<int>(std::lround(height)))
+    );
+    kLog.info(
+        "fixed-render '{}': el render pasa a {}x{} (aspecto {:.4}); caja {}x{} -> {}x{}", appId(), m_fixedRenderWidth,
+        m_fixedRenderHeight, aspect, m_fixedBoxWidth, m_fixedBoxHeight, newWidth, newHeight
+    );
+    if (currentFullscreen() || scheduledFullscreen()) {
+      // En pantalla completa la caja no se ve: solo se corrige la que se restaurará al salir.
+      m_fullscreenRestoreBox.width = newWidth;
+      m_fullscreenRestoreBox.height = newHeight;
+      return;
+    }
+    const int oldWidth = m_fixedBoxWidth;
+    const int oldHeight = m_fixedBoxHeight;
+    resizeFixedRenderBox(newWidth, newHeight);
+    // La ventana cambia de forma alrededor de su centro.
+    setPosition(layoutTargetX() + (oldWidth - newWidth) / 2, layoutTargetY() + (oldHeight - newHeight) / 2);
+    clampFloatingPositionForSize(newWidth, newHeight);
+    syncXwaylandConfigure();
   }
 
   void View::resizeFixedRenderBox(int width, int height) {

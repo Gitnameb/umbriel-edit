@@ -264,6 +264,9 @@ namespace umbriel {
     // The toplevel view owning `surface` after walking xdg popup parents, or
     // nullptr when the surface is not under a view (layer surfaces, cursors).
     static View* fromSurface(wlr_surface* surface);
+    // Xwayland aviso: cambió la ventana hija (render) de este cliente. Relee el rectángulo y, si cambió el aspecto,
+    // adapta la caja flotante al aspecto nuevo.
+    void handleXwaylandContentChanged();
 
     // Mechanism only: applies seat keyboard, activation chrome, and raise. Policy lives in Server::focusView; do not
     // call from input/event code. `withKeyboard` is false while overview owns the seat: chrome and activation still
@@ -816,10 +819,16 @@ namespace umbriel {
     // Piloto: separa el tamaño del cliente (resolución de render) de la caja
     // flotante. La caja se redimensiona y el contenido se escala.
     void beginFixedRenderPilot();
+    // Caja para un render concreto: su aspecto a 1:1, encogida si no cabe en
+    // el área útil (una ventana 4:3 de 1080p no entra en 1080p con barra).
+    std::array<int, 2> fixedRenderBoxSize(int renderWidth, int renderHeight) const;
     void resizeFixedRenderBox(int width, int height);
     // Relee el rectángulo de render dentro del cliente (ventana hija de
     // Wine/DXVK) y recalcula la escala. Sin repaint solo actualiza el estado.
     void refreshFixedRenderContent(bool repaint);
+    // La ventana adopta el aspecto del render (conserva el área, centrada). Solo cuando cambió respecto a la última
+    // adaptación; no toca la caja mientras el usuario arrastra.
+    void adoptFixedRenderAspect();
     void applyContentScale();
     // Recorta la superficie a la ventana de render del juego. Sin recorte,
     // desactiva el clip.
@@ -1185,6 +1194,9 @@ namespace umbriel {
     // Último tamaño de superficie visto, para releer el recorte solo cuando
     // el cliente cambia de tamaño (no en cada fotograma).
     int m_fixedSurfaceWidth = 0;
+    // Render para el que se adaptó la caja por última vez (aspecto ya adoptado).
+    int m_fixedAdoptedWidth = 0;
+    int m_fixedAdoptedHeight = 0;
     int m_fixedSurfaceHeight = 0;
     int m_fixedBoxWidth = 0;
     int m_fixedBoxHeight = 0;

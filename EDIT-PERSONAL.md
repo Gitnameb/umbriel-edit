@@ -32,8 +32,13 @@ mis necesidades y mi forma de usar el escritorio.
   resolución interna (y puede seguir creyendo que está en pantalla completa) y
   el contenido se presenta escalado con la relación de aspecto del render,
   centrado y con barras negras donde sobra, como una ventana de vídeo. Así una
-  ventana más pequeña no dispara los bugs de resize de los juegos. Solo con
-  escala de salida 1 y, por ahora, en ventanas flotantes.
+  ventana más pequeña no dispara los bugs de resize de los juegos.
+  Si Wine/DXVK dibuja en una ventana hija (resolución o aspecto distintos del
+  toplevel), el piloto recorta la superficie a esa hija y descarta las barras
+  que pinta el propio juego. La ventana nace con el tamaño y aspecto del
+  render, y los adopta en vivo cuando el juego cambia de resolución, sin
+  sondear X por fotograma. Solo con escala de salida 1 y, por ahora, en
+  ventanas flotantes.
 
 ## Licencia
 

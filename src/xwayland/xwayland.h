@@ -74,6 +74,11 @@ namespace umbriel {
     // Largest mapped child window that behaves as the game's render area.
     // Nullopt when the toplevel draws its content directly or X is gone.
     std::optional<XwaylandContentRect> contentRect(wlr_xwayland_surface* xsurface) const;
+    // Watches the direct children of an X11 toplevel. When one is created, destroyed, (un)mapped, reparented or
+    // reconfigured, the owning View re-reads its render rectangle after a short debounce. Uses the XWM connection, so
+    // it costs nothing per frame and opens no extra X connection.
+    void watchContent(wlr_xwayland_surface* xsurface);
+    void unwatchContent(wlr_xwayland_surface* xsurface);
     // Emits wlr_surface* after a bounding-shape query or removal changes its rendering mask.
     wl_signal* shapeChanged() const;
     // Cursor surfaces have no wlr_xwayland_surface role. Identify them by the
@@ -101,6 +106,10 @@ namespace umbriel {
     static void onKeyboardFocusChange(wl_listener* listener, void* data);
     static int onSelectionRefreshTimer(void* data);
     static int onFocusClearTimer(void* data);
+    static int onContentTimer(void* data);
+    // True when `event` belongs to a watched toplevel's child and must not reach wlroots (it would otherwise create a
+    // bogus wlr_xwayland_surface for every child on CreateNotify).
+    bool handleContentEvent(const xcb_generic_event_t* event);
     void handleReady();
     void handleNewSurface(wlr_xwayland_surface* xsurface);
     void handleKeyboardFocusChange(void* data);
@@ -136,6 +145,9 @@ namespace umbriel {
     uint32_t m_xsettingsSerial = 0;
     XsettingsValues m_xsettings;
     wl_event_source* m_focusClearTimer = nullptr;
+    std::vector<uint32_t> m_contentWatched;
+    std::vector<uint32_t> m_contentPending;
+    wl_event_source* m_contentTimer = nullptr;
     wl_event_source* m_selectionRefreshTimer = nullptr;
     wl_listener m_serverStart{};
     wl_listener m_clientDestroy{};
