@@ -1267,6 +1267,11 @@ namespace umbriel {
       if (m_contentTree != nullptr) {
         wlr_scene_node_set_position(&m_contentTree->node, m_fixedOffsetX, m_fixedOffsetY);
       }
+      // Fondo negro de la ventana: cubre las barras que deja el fit. El
+      // rectángulo vive dentro del árbol desplazado, así que se compensa el
+      // offset para que en coordenadas de la ventana empiece en 0,0.
+      m_presentation.setBackdropBox(-m_fixedOffsetX, -m_fixedOffsetY, target.width, target.height);
+      m_presentation.setBackdropEnabled(true);
       applyContentScale();
       // La superficie completa se dibuja escalada en la caja; sin recorte.
       setSurfaceTreeClip(nullptr);

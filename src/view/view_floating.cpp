@@ -519,23 +519,16 @@ namespace umbriel {
     if (!m_fixedRender || m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0) {
       return;
     }
-    const double aspect = static_cast<double>(m_fixedRenderWidth) / m_fixedRenderHeight;
-    int boxWidth = std::max(1, width);
-    int boxHeight = std::max(1, height);
-    // Respetar la relación de aspecto eligiendo el eje que más se movió desde
-    // la caja actual, para que arrastrar un borde vertical no la deforme.
-    const double changeX =
-        std::abs(boxWidth - m_fixedBoxWidth) / static_cast<double>(std::max(1, m_fixedBoxWidth));
-    const double changeY =
-        std::abs(boxHeight - m_fixedBoxHeight) / static_cast<double>(std::max(1, m_fixedBoxHeight));
-    if (changeX >= changeY) {
-      boxHeight = std::max(1, static_cast<int>(std::lround(boxWidth / aspect)));
-    } else {
-      boxWidth = std::max(1, static_cast<int>(std::lround(boxHeight * aspect)));
-    }
+    // La caja puede tener cualquier proporción, como una ventana de vídeo: el
+    // contenido se escala con fit y las barras que sobren se pintan en negro.
+    const int boxWidth = std::max(1, width);
+    const int boxHeight = std::max(1, height);
     m_fixedBoxWidth = boxWidth;
     m_fixedBoxHeight = boxHeight;
-    m_fixedScale = static_cast<double>(boxWidth) / m_fixedRenderWidth;
+    m_fixedScale = std::min(
+        static_cast<double>(boxWidth) / m_fixedRenderWidth,
+        static_cast<double>(boxHeight) / m_fixedRenderHeight
+    );
     kLog.info(
         "fixed-render '{}': caja {}x{}, escala {:.4}", appId(), boxWidth, boxHeight, m_fixedScale
     );
@@ -544,6 +537,7 @@ namespace umbriel {
     applyContentScale();
     // La ventana X cambia de posición con la caja, pero no de tamaño.
     syncXwaylandConfigure();
+    clampFloatingPositionForSize(boxWidth, boxHeight);
     syncOwnedPresentation();
   }
 
