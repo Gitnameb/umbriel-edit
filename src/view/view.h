@@ -175,6 +175,9 @@ namespace umbriel {
     // Piloto de resolución de render fija: el cliente conserva su tamaño y la
     // ventana flotante se escala a la caja. Solo Xwayland y escala 1.
     bool fixedRender() const { return m_fixedRender; }
+    // Escala de la superficie en unidades de escena: píxeles de superficie por
+    // píxel de presentación. El piloto la usa también para el ratón.
+    double contentScale() const { return m_fixedRender && m_fixedScale > 0.0 ? m_xScale / m_fixedScale : m_xScale; }
     // Fullscreen for layout purposes follows the state already scheduled for the next configure.
     bool layoutFullscreen() const;
     bool urgent() const { return m_urgent; }

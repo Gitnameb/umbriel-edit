@@ -559,7 +559,7 @@ namespace umbriel {
     if (m_contentTree == nullptr) {
       return;
     }
-    const double scale = m_fixedRender && m_fixedScale > 0.0 ? m_xScale / m_fixedScale : m_xScale;
+    const double scale = contentScale();
     wlr_scene_subsurface_tree_set_scale(&m_contentTree->node, scale);
     if (m_captureScene != nullptr) {
       wlr_scene_subsurface_tree_set_scale(&m_captureScene->tree.node, scale);

@@ -350,6 +350,22 @@ namespace umbriel {
     // in particular, react to every move; the last tick of the animation publishes where the window came to rest.
     int lx = region.toX(layoutX());
     int ly = region.toY(layoutY());
+    if (m_fixedRender) {
+      // El piloto presenta la ventana escalada. Xwayland calcula las
+      // coordenadas raíz del puntero como posición del X window + coordenadas
+      // de superficie; si la ventana visual está lejos del origen, esa suma se
+      // sale del root y Xwayland recorta el ratón. Se acerca el X window al
+      // origen solo lo necesario para que el render completo quepa en el root.
+      // Así los menús X siguen cerca de su sitio cuando el render es pequeño.
+      const int renderWidth = m_xScheduled.width > 0 ? region.toXWidth(m_xScheduled.width) : m_xsurface->width;
+      const int renderHeight = m_xScheduled.height > 0 ? region.toXHeight(m_xScheduled.height) : m_xsurface->height;
+      wlr_box root{};
+      wlr_output_layout_get_box(m_server->outputLayout(), nullptr, &root);
+      const int maxX = root.x + std::max(0, root.width - renderWidth);
+      const int maxY = root.y + std::max(0, root.height - renderHeight);
+      lx = std::clamp(lx, root.x, maxX);
+      ly = std::clamp(ly, root.y, maxY);
+    }
     // X11 geometry is 16-bit: coordinates are signed, sizes unsigned and nonzero.
     constexpr int kMinCoordinate = std::numeric_limits<int16_t>::min();
     constexpr int kMaxCoordinate = std::numeric_limits<int16_t>::max();

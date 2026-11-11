@@ -107,9 +107,11 @@ namespace umbriel {
       return factor ? (vertical ? factor->vertical : factor->horizontal).value_or(1.0) : 1.0;
     }
 
-    // `scale` is the surface-local units per layout unit in `target`.
+    // Devuelve coordenadas locales de la superficie, contando la escala con
+    // la que se presenta (el piloto de render fijo dibuja la superficie
+    // escalada y el cliente sigue esperando sus propias coordenadas).
     bool surfaceLocalCoordinates(
-        wlr_scene* scene, wlr_surface* target, double scale, double lx, double ly, double* sx, double* sy
+        wlr_scene* scene, wlr_surface* target, double lx, double ly, double* sx, double* sy
     ) {
       if (target == nullptr) {
         return false;
@@ -119,8 +121,9 @@ namespace umbriel {
         wlr_surface* target;
         int x = 0;
         int y = 0;
+        double sceneScale = 1.0;
         bool found = false;
-      } position{target};
+      } position{.target = target};
 
       wlr_scene_node_for_each_buffer(
           &scene->tree.node,
@@ -133,6 +136,15 @@ namespace umbriel {
             if (sceneSurface != nullptr && sceneSurface->surface == position->target) {
               position->x = x;
               position->y = y;
+              int destWidth = 0;
+              int destHeight = 0;
+              wlr_scene_surface_get_size(sceneSurface, &destWidth, &destHeight);
+              const int surfaceWidth = sceneSurface->surface->current.width;
+              // El piloto dibuja la superficie escalada; las coordenadas del
+              // cliente siguen siendo las de la superficie sin escalar.
+              position->sceneScale = destWidth > 0 && surfaceWidth > 0
+                  ? static_cast<double>(surfaceWidth) / destWidth
+                  : 1.0;
               position->found = true;
             }
           },
@@ -142,8 +154,8 @@ namespace umbriel {
       if (!position.found) {
         return false;
       }
-      *sx = (lx - position.x) * scale;
-      *sy = (ly - position.y) * scale;
+      *sx = (lx - position.x) * position.sceneScale;
+      *sy = (ly - position.y) * position.sceneScale;
       return true;
     }
 
@@ -2478,7 +2490,7 @@ namespace umbriel {
 
     double sx = 0;
     double sy = 0;
-    if (!surfaceLocalCoordinates(m_server->scene(), point->surface, surfaceScale(point->surface), lx, ly, &sx, &sy)) {
+    if (!surfaceLocalCoordinates(m_server->scene(), point->surface, lx, ly, &sx, &sy)) {
       kLog.warn(
           "touch motion id={} could not map target surface {} at layout=({}, {})", event->touch_id,
           static_cast<void*>(point->surface), lx, ly
@@ -2674,7 +2686,7 @@ namespace umbriel {
       // Keep an implicit grab in the coordinate space established by the press. Re-resolving against the scene
       // would turn compositor-driven window animation into apparent pointer travel and make small clicks look like
       // client drags.
-      const double scale = surfaceScale(seat->pointer_state.focused_surface);
+      const double scale = contentScaleForSurface(seat->pointer_state.focused_surface);
       const double sx = seat->pointer_state.sx + ((m_cursor->x - oldX) * scale);
       const double sy = seat->pointer_state.sy + ((m_cursor->y - oldY) * scale);
       wlr_seat_pointer_notify_motion(seat, timeMsec, sx, sy);
@@ -2938,7 +2950,7 @@ namespace umbriel {
       double sx = 0;
       double sy = 0;
       wlr_surface* focused = state->v2->focused_surface;
-      surfaceLocalCoordinates(m_server->scene(), focused, surfaceScale(focused), m_cursor->x, m_cursor->y, &sx, &sy);
+      surfaceLocalCoordinates(m_server->scene(), focused, m_cursor->x, m_cursor->y, &sx, &sy);
       wlr_tablet_v2_tablet_tool_notify_motion(state->v2, sx, sy);
       forwardEffectPointer();
       return;
