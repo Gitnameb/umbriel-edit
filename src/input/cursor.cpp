@@ -60,6 +60,49 @@ namespace umbriel {
     // starts swapping tiles.
     constexpr double kSwapThreshold = 5.0;
 
+    // El fondo negro de una ventana de render fijo es un wlr_scene_rect del propio View, no un búfer de cliente, así que
+    // Server::viewAt no se lo atribuye a ninguna ventana: con Mod pulsado el gesto de mover o redimensionar solo
+    // arrancaba sobre la imagen. Se pregunta a la escena qué nodo queda arriba y se busca a qué ventana flotante de
+    // render fijo pertenece, siempre que el punto caiga dentro de su caja visible.
+    View* letterboxViewAt(Server& server, double x, double y) {
+      Output* output = server.outputFromWlr(wlr_output_layout_output_at(server.outputLayout(), x, y));
+      if (output == nullptr || output->workspaceGroup() == nullptr) {
+        return nullptr;
+      }
+      Workspace* workspace = output->workspaceGroup()->active();
+      if (workspace == nullptr) {
+        return nullptr;
+      }
+      double nodeX = 0;
+      double nodeY = 0;
+      wlr_scene_node* top = wlr_scene_node_at(&server.scene()->tree.node, x, y, &nodeX, &nodeY);
+      if (top == nullptr) {
+        return nullptr;
+      }
+      for (View* view : workspace->allViews()) {
+        if (view == nullptr
+            || !view->mapped()
+            || !view->fixedRender()
+            || !view->floating()
+            || view->sceneTree() == nullptr) {
+          continue;
+        }
+        const wlr_box& geo = view->geometryBox();
+        const auto [width, height] = view->floatingSize();
+        const double left = view->layoutX() + geo.x;
+        const double top2 = view->layoutY() + geo.y;
+        if (x < left || x >= left + width || y < top2 || y >= top2 + height) {
+          continue;
+        }
+        for (wlr_scene_node* node = top; node != nullptr; node = node->parent != nullptr ? &node->parent->node : nullptr) {
+          if (node == &view->sceneTree()->node) {
+            return view;
+          }
+        }
+      }
+      return nullptr;
+    }
+
     // Panels (top/overlay) keep working inside the overview. Background- and bottom-layer surfaces are part of the
     // inert backdrop behind the filmstrip, so their clicks belong to the overview instead.
     bool panelLayer(const LayerSurface* layer) {
@@ -1954,6 +1997,9 @@ namespace umbriel {
     wlr_surface* surface = nullptr;
     LayerSurface* layer = nullptr;
     View* view = m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+    if (view == nullptr && layer == nullptr && surface == nullptr && !m_server->sessionLocked()) {
+      view = letterboxViewAt(*m_server, m_cursor->x, m_cursor->y);
+    }
 
     if (m_server->sessionLocked()) {
       m_server->seat()->notifyPointerModifiers();
@@ -2638,6 +2684,9 @@ namespace umbriel {
       wlr_surface* surface = nullptr;
       LayerSurface* layer = nullptr;
       View* view = m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+      if (view == nullptr && layer == nullptr && surface == nullptr) {
+        view = letterboxViewAt(*m_server, m_cursor->x, m_cursor->y);
+      }
       // The shield branch owns motion while Mod is held, so this is where the
       // hovered window is tracked. Native chrome is not a client buffer, so
       // the SSD hit test supplies the window when the pointer sits on the
@@ -2700,6 +2749,9 @@ namespace umbriel {
     wlr_surface* surface = nullptr;
     LayerSurface* layer = nullptr;
     View* view = m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+    if (view == nullptr && layer == nullptr && surface == nullptr) {
+      view = letterboxViewAt(*m_server, m_cursor->x, m_cursor->y);
+    }
     // While Mod is held, only the window under the pointer is blurred. This
     // runs even when follow-mouse focus is off. Over the native title bar
     // there is no client surface, so consult the SSD frame too.
@@ -3969,6 +4021,9 @@ namespace umbriel {
     wlr_surface* surface = nullptr;
     LayerSurface* layer = nullptr;
     View* view = m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+    if (view == nullptr && layer == nullptr && surface == nullptr) {
+      view = letterboxViewAt(*m_server, m_cursor->x, m_cursor->y);
+    }
     if (m_modInputShield) {
       // Window content is inert while Mod is held, but the resize and move
       // hints still have to follow the pointer over the desktop and the bar.
@@ -4101,6 +4156,9 @@ namespace umbriel {
     wlr_surface* surface = nullptr;
     LayerSurface* layer = nullptr;
     View* view = m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+    if (view == nullptr && layer == nullptr && surface == nullptr) {
+      view = letterboxViewAt(*m_server, m_cursor->x, m_cursor->y);
+    }
     updateInteractiveCursor(view, layer != nullptr && panelLayer(layer));
   }
 

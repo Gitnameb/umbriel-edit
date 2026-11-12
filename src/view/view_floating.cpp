@@ -491,10 +491,12 @@ namespace umbriel {
     m_floating.recordSizeRequest(width, height, configureSize(width, height));
   }
 
-  // Piloto de render fijo. Solo para Xwayland y escala de salida 1: el cliente
-  // conserva su tamaño (su resolución) y la caja flotante se escala. Así una
-  // ventana más pequeña no reconfigura al cliente y no dispara los bugs de
-  // resize de los juegos.
+  // Piloto de render fijo. Solo para Xwayland: el cliente conserva su tamaño
+  // (su resolución) y la caja se escala. Se activa con apps que no se dejan
+  // redimensionar como una ventana normal:
+  //   - piden pantalla completa;
+  //   - declaran tamaño fijo (min == max) o un aspecto fijo;
+  //   - son juegos de Steam (steam_app_<id>) o binarios de Wine (*.exe, wine*).
   void View::beginFixedRenderPilot() {
     if (m_fixedRender || m_xsurface == nullptr || m_contentTree == nullptr) {
       return;
@@ -505,9 +507,19 @@ namespace umbriel {
         && hints.maxHeight > 0
         && hints.minWidth == hints.maxWidth
         && hints.minHeight == hints.maxHeight;
-    // Juegos de Steam y cualquier app que ya pida fullscreen o declare tamaño
-    // fijo. El piloto solo escala Xwayland; una app Wayland nativa no entra.
-    if (!id.starts_with("steam_app_") && !requestedFullscreen() && !scheduledFullscreen() && !fixedSize) {
+    // Patrones genéricos, no una lista de juegos: Steam publica
+    // steam_app_<id>; Wine usa el ejecutable (juego.exe) o wine/wine64.
+    const bool wineLike = id.starts_with("steam_app_") || id.starts_with("wine") || id.ends_with(".exe")
+        || id.ends_with(".EXE");
+    // Un aspecto declarado en WM_NORMAL_HINTS es una promesa de «no me
+    // redimensiones libremente»: la caja escala y el render conserva su
+    // proporción.
+    const xcb_size_hints_t* xhints = m_xsurface->size_hints;
+    const bool fixedAspect = xhints != nullptr
+        && (xhints->flags & XCB_ICCCM_SIZE_HINT_P_ASPECT) != 0
+        && xhints->min_aspect_num > 0
+        && xhints->min_aspect_den > 0;
+    if (!wineLike && !requestedFullscreen() && !scheduledFullscreen() && !fixedSize && !fixedAspect) {
       return;
     }
     auto size = currentSize();

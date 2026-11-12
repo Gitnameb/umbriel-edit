@@ -287,6 +287,11 @@ namespace umbriel {
     // reconfigure: an unchanged clip box early-outs and would leave the animated src/dst behind. El piloto de
     // render fijo repone su recorte de contenido.
     if (m_fixedRender) {
+      // resetCrop acaba de dejar el búfer sin source box y con el destino de la superficie entera. Reponer el MISMO
+      // recorte no lo arregla: wlr_scene_subsurface_tree_set_clip sale sin hacer nada si el recorte no cambia, y la
+      // imagen (con las barras del cliente) se salía de la caja hasta el siguiente commit del juego. Se limpia primero
+      // para forzar una reconfiguración real.
+      setSurfaceTreeClip(nullptr);
       applyFixedRenderClip();
     } else {
       setSurfaceTreeClip(nullptr);
