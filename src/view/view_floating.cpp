@@ -29,6 +29,13 @@ extern "C" {
 namespace umbriel {
   namespace {
     constexpr Logger kLog("view");
+
+    // appId() es null en un cliente X11 que todavía no publicó WM_CLASS.
+    // std::format no admite un const char* nulo.
+    std::string_view safeAppId(const View& view) {
+      const char* id = view.appId();
+      return id != nullptr ? std::string_view(id) : std::string_view{};
+    }
   }
 
   wlr_box View::floatingUsableArea() const {
@@ -492,7 +499,7 @@ namespace umbriel {
     if (m_fixedRender || m_tiled || m_xsurface == nullptr || m_contentTree == nullptr) {
       return;
     }
-    const std::string_view id = appId() != nullptr ? std::string_view(appId()) : std::string_view{};
+    const std::string_view id = safeAppId(*this);
     const SizeHints hints = sizeHints();
     const bool fixedSize = hints.maxWidth > 0
         && hints.maxHeight > 0
@@ -551,7 +558,7 @@ namespace umbriel {
     }
     applyContentScale();
     kLog.info(
-        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{} caja {}x{}", appId(), m_fixedSurfaceWidth,
+        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{} caja {}x{}", safeAppId(*this), m_fixedSurfaceWidth,
         m_fixedSurfaceHeight, m_fixedRenderWidth, m_fixedRenderHeight, m_fixedContentX, m_fixedContentY, m_fixedBoxWidth,
         m_fixedBoxHeight
     );
@@ -644,7 +651,7 @@ namespace umbriel {
       m_fixedOffsetY = std::max(0, (m_fixedBoxHeight - scaledHeight) / 2);
     }
     kLog.info(
-        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{}", appId(), m_fixedSurfaceWidth, m_fixedSurfaceHeight,
+        "fixed-render '{}': superficie {}x{}, render {}x{}+{},{}", safeAppId(*this), m_fixedSurfaceWidth, m_fixedSurfaceHeight,
         m_fixedRenderWidth, m_fixedRenderHeight, m_fixedContentX, m_fixedContentY
     );
     applyContentScale();
@@ -684,7 +691,7 @@ namespace umbriel {
         std::max(1, static_cast<int>(std::lround(width))), std::max(1, static_cast<int>(std::lround(height)))
     );
     kLog.info(
-        "fixed-render '{}': el render pasa a {}x{} (aspecto {:.4}); caja {}x{} -> {}x{}", appId(), m_fixedRenderWidth,
+        "fixed-render '{}': el render pasa a {}x{} (aspecto {:.4}); caja {}x{} -> {}x{}", safeAppId(*this), m_fixedRenderWidth,
         m_fixedRenderHeight, aspect, m_fixedBoxWidth, m_fixedBoxHeight, newWidth, newHeight
     );
     if (currentFullscreen() || scheduledFullscreen()) {
@@ -717,7 +724,7 @@ namespace umbriel {
         static_cast<double>(boxHeight) / m_fixedRenderHeight
     );
     kLog.debug(
-        "fixed-render '{}': caja {}x{}, escala {:.4}", appId(), boxWidth, boxHeight, m_fixedScale
+        "fixed-render '{}': caja {}x{}, escala {:.4}", safeAppId(*this), boxWidth, boxHeight, m_fixedScale
     );
     m_presentation.setSize(boxWidth, boxHeight);
     beginResizeAnimation(boxWidth, boxHeight);
