@@ -314,6 +314,10 @@ namespace umbriel {
       wl_event_source_remove(m_acceptClientMaximizeIdle);
       m_acceptClientMaximizeIdle = nullptr;
     }
+    if (m_fixedProbeTimer != nullptr) {
+      wl_event_source_remove(m_fixedProbeTimer);
+      m_fixedProbeTimer = nullptr;
+    }
     m_server->unregisterAnimatable(this);
     m_effects.detach();
     clearViewSurfaceWatches();

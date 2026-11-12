@@ -20,6 +20,7 @@ extern "C" {
 #include <cmath>
 #include <ranges>
 #include <string_view>
+#include <utility>
 #include "wlr.h"
 // clang-format on
 #include "workspace/scratchpad.h"
@@ -29,6 +30,17 @@ extern "C" {
 namespace umbriel {
   namespace {
     constexpr Logger kLog("view");
+
+    // Diferencia tolerada entre el tamaño pedido y el que el cliente adopta:
+    // los clientes con incrementos de tamaño redondean unos píxeles.
+    constexpr int kFixedProbeTolerance = 8;
+    // Margen para que un cliente normal procese el configure antes de decidir
+    // que lo ignoró.
+    constexpr int kFixedProbeDelayMs = 700;
+    // Peticiones seguidas de un tamaño distinto al del mosaico que cuentan
+    // como negativa (una puede ser el tamaño de arranque).
+    constexpr int kFixedRefusalCount = 3;
+    constexpr std::uint64_t kFixedRefusalWindowMs = 1000;
 
     // appId() es null en un cliente X11 que todavía no publicó WM_CLASS.
     // std::format no admite un const char* nulo.
@@ -492,34 +504,36 @@ namespace umbriel {
   }
 
   // Piloto de render fijo. Solo para Xwayland: el cliente conserva su tamaño
-  // (su resolución) y la caja se escala. Se activa con apps que no se dejan
-  // redimensionar como una ventana normal:
-  //   - piden pantalla completa;
-  //   - declaran tamaño fijo (min == max) o un aspecto fijo;
-  //   - son juegos de Steam (steam_app_<id>) o binarios de Wine (*.exe, wine*).
+  // (su resolución) y la caja se escala. No se activa por suposiciones débiles:
+  // el cliente de Steam pide fullscreen un instante y se redimensiona como
+  // cualquier app, así que fullscreen o un aspecto declarado no bastan. Los
+  // disparadores son:
+  //   - tamaño fijo declarado (min == max), una promesa explícita;
+  //   - app id de un juego de Steam (steam_app_<id>) o de Wine (*.exe, wine*);
+  //   - el cliente no acepta el tamaño que le pide el compositor (ver
+  //     scheduleFixedProbe y noteResizeRefusal), que cubre cualquier app.
   void View::beginFixedRenderPilot() {
-    if (m_fixedRender || m_xsurface == nullptr || m_contentTree == nullptr) {
+    if (m_fixedRender || !m_mapped || m_xsurface == nullptr || m_contentTree == nullptr) {
       return;
     }
-    const std::string_view id = safeAppId(*this);
     const SizeHints hints = sizeHints();
     const bool fixedSize = hints.maxWidth > 0
         && hints.maxHeight > 0
         && hints.minWidth == hints.maxWidth
         && hints.minHeight == hints.maxHeight;
+    const std::string_view id = safeAppId(*this);
     // Patrones genéricos, no una lista de juegos: Steam publica
     // steam_app_<id>; Wine usa el ejecutable (juego.exe) o wine/wine64.
-    const bool wineLike = id.starts_with("steam_app_") || id.starts_with("wine") || id.ends_with(".exe")
-        || id.ends_with(".EXE");
-    // Un aspecto declarado en WM_NORMAL_HINTS es una promesa de «no me
-    // redimensiones libremente»: la caja escala y el render conserva su
-    // proporción.
-    const xcb_size_hints_t* xhints = m_xsurface->size_hints;
-    const bool fixedAspect = xhints != nullptr
-        && (xhints->flags & XCB_ICCCM_SIZE_HINT_P_ASPECT) != 0
-        && xhints->min_aspect_num > 0
-        && xhints->min_aspect_den > 0;
-    if (!wineLike && !requestedFullscreen() && !scheduledFullscreen() && !fixedSize && !fixedAspect) {
+    const bool gameLike =
+        id.starts_with("steam_app_") || id.starts_with("wine") || id.ends_with(".exe") || id.ends_with(".EXE");
+    if (!fixedSize && !gameLike) {
+      return;
+    }
+    engageFixedRenderPilot();
+  }
+
+  void View::engageFixedRenderPilot() {
+    if (m_fixedRender || m_xsurface == nullptr || m_contentTree == nullptr) {
       return;
     }
     auto size = currentSize();
@@ -579,6 +593,122 @@ namespace umbriel {
     if (m_mapped && !m_tiled && !attached() && !currentFullscreen() && !scheduledFullscreen()) {
       placeInUsableArea(m_initialRules.defaultPosition);
     }
+  }
+
+  // Detección por comportamiento. X11 no permite saber de antemano si una app
+  // acepta un tamaño: se le pide el del mosaico o el de la caja y se mira qué
+  // hace. Un cliente normal adopta el tamaño en el mismo ciclo del servidor X;
+  // uno que no se deja redimensionar sigue con su resolución. Se sondea una
+  // sola vez por tamaño pedido: un cliente que se reconfigura en bucle no
+  // puede posponer el sondeo indefinidamente.
+  void View::scheduleFixedProbe(int width, int height) {
+    const wlr_surface* surface = rootSurface();
+    // El tamaño real del cliente es el de su búfer comprometido:
+    // xsurface->width ya trae el configure que acabamos de pedir. Con escala
+    // de salida 2 los dos sistemas de coordenadas no coinciden y el piloto no
+    // aplica, así que el sondeo solo tiene sentido a escala 1.
+    const int clientWidth = surface != nullptr ? surface->current.width : 0;
+    const int clientHeight = surface != nullptr ? surface->current.height : 0;
+    if (m_fixedRender || !m_mapped || m_xsurface == nullptr || m_xScale != 1.0 || attached() || sizeGrabActive()
+        || currentFullscreen() || scheduledFullscreen() || width <= 0 || height <= 0) {
+      return;
+    }
+    // Ya está en ese tamaño (o lo bastante cerca): no hay nada que comprobar.
+    if (std::abs(width - clientWidth) <= fixedProbeTolerance(true)
+        && std::abs(height - clientHeight) <= fixedProbeTolerance(false)) {
+      return;
+    }
+    if (m_fixedProbeTimer != nullptr && m_fixedProbeWidth == width && m_fixedProbeHeight == height) {
+      return;
+    }
+    m_fixedProbeWidth = width;
+    m_fixedProbeHeight = height;
+    if (m_fixedProbeTimer == nullptr) {
+      m_fixedProbeTimer =
+          wl_event_loop_add_timer(wl_display_get_event_loop(m_server->display()), onFixedProbeTimeout, this);
+      if (m_fixedProbeTimer == nullptr) {
+        return;
+      }
+    }
+    wl_event_source_timer_update(m_fixedProbeTimer, kFixedProbeDelayMs);
+  }
+
+  // Un cliente puede redondear a sus incrementos de tamaño; por debajo de eso
+  // el tamaño cuenta como adoptado.
+  int View::fixedProbeTolerance(bool horizontal) const {
+    int tolerance = kFixedProbeTolerance;
+    const xcb_size_hints_t* hints = m_xsurface != nullptr ? m_xsurface->size_hints : nullptr;
+    if (hints != nullptr && (hints->flags & XCB_ICCCM_SIZE_HINT_P_RESIZE_INC) != 0) {
+      const int increment = horizontal ? hints->width_inc : hints->height_inc;
+      tolerance = std::max(tolerance, increment);
+    }
+    return tolerance;
+  }
+
+  int View::onFixedProbeTimeout(void* data) {
+    static_cast<View*>(data)->probeClientResize();
+    return 0;
+  }
+
+  void View::probeClientResize() {
+    const int width = std::exchange(m_fixedProbeWidth, 0);
+    const int height = std::exchange(m_fixedProbeHeight, 0);
+    if (m_fixedRender || !m_mapped || m_xsurface == nullptr || width <= 0 || height <= 0) {
+      return;
+    }
+    if (currentFullscreen() || scheduledFullscreen() || sizeGrabActive()) {
+      return;
+    }
+    // Un configure posterior (otro tamaño) sustituyó a este sondeo.
+    if (m_xConfigured.width != width || m_xConfigured.height != height) {
+      return;
+    }
+    const wlr_surface* surface = rootSurface();
+    const int clientWidth = surface != nullptr ? surface->current.width : 0;
+    const int clientHeight = surface != nullptr ? surface->current.height : 0;
+    const int dx = std::abs(clientWidth - width);
+    const int dy = std::abs(clientHeight - height);
+    if (dx <= fixedProbeTolerance(true) && dy <= fixedProbeTolerance(false)) {
+      return; // el cliente adoptó el tamaño pedido
+    }
+    kLog.info(
+        "fixed-render '{}': pidió {}x{} y el cliente sigue en {}x{}; conserva su resolución y se escala", safeAppId(*this),
+        width, height, clientWidth, clientHeight
+    );
+    engageFixedRenderPilot();
+  }
+
+  // La ventana está en el mosaico y el cliente pide un tamaño distinto del que
+  // se le impuso: no acepta el del compositor. Una petición puede ser el
+  // tamaño con el que arranca; tres seguidas son una negativa.
+  void View::noteResizeRefusal(int width, int height) {
+    if (m_fixedRender || !m_mapped || !m_tiled || m_xsurface == nullptr || attached() || sizeGrabActive()
+        || scheduledFullscreen() || scheduledMaximized() || m_maximizedToEdges) {
+      m_fixedRefusals = 0;
+      return;
+    }
+    if (m_xConfigured.width <= 0 || m_xConfigured.height <= 0) {
+      return;
+    }
+    if (std::abs(width - m_xConfigured.width) <= fixedProbeTolerance(true)
+        && std::abs(height - m_xConfigured.height) <= fixedProbeTolerance(false)) {
+      m_fixedRefusals = 0;
+      return; // coincide con el tamaño impuesto: no es una negativa
+    }
+    const std::uint64_t now = m_server->uptimeMs();
+    if (m_fixedRefusalAt == 0 || now - m_fixedRefusalAt > kFixedRefusalWindowMs) {
+      m_fixedRefusals = 0;
+    }
+    m_fixedRefusalAt = now;
+    if (++m_fixedRefusals < kFixedRefusalCount) {
+      return;
+    }
+    m_fixedRefusals = 0;
+    kLog.info(
+        "fixed-render '{}': no acepta el tamaño del mosaico (pide {}x{}); conserva su resolución y se escala",
+        safeAppId(*this), width, height
+    );
+    engageFixedRenderPilot();
   }
 
   std::array<int, 2> View::fixedRenderBoxSize(int renderWidth, int renderHeight) const {

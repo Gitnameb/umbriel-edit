@@ -819,6 +819,9 @@ namespace umbriel {
     // Piloto: separa el tamaño del cliente (resolución de render) de la caja
     // flotante. La caja se redimensiona y el contenido se escala.
     void beginFixedRenderPilot();
+    // Engancha el piloto sin consultar pistas. Lo usa la detección por
+    // comportamiento cuando el cliente no adopta el tamaño pedido.
+    void engageFixedRenderPilot();
     // Caja para un render concreto: su aspecto a 1:1, encogida si no cabe en
     // el área útil (una ventana 4:3 de 1080p no entra en 1080p con barra).
     std::array<int, 2> fixedRenderBoxSize(int renderWidth, int renderHeight) const;
@@ -833,6 +836,16 @@ namespace umbriel {
     // Recorta la superficie a la ventana de render del juego. Sin recorte,
     // desactiva el clip.
     void applyFixedRenderClip();
+    // Detección por comportamiento: tras pedir un tamaño al cliente X11, se
+    // comprueba si lo adoptó. Si sigue en otro tamaño, la app no se deja
+    // redimensionar y el piloto conserva su resolución.
+    void scheduleFixedProbe(int width, int height);
+    void probeClientResize();
+    // Tolerancia por eje: el cliente puede redondear a sus incrementos.
+    int fixedProbeTolerance(bool horizontal) const;
+    // Registra que el cliente pidió un tamaño distinto al del mosaico.
+    void noteResizeRefusal(int width, int height);
+    static int onFixedProbeTimeout(void* data);
     void finishFloatingResize();
     void syncFloatingResizePosition();
     void adoptFloatingClientSize();
@@ -1207,6 +1220,15 @@ namespace umbriel {
     int m_fixedOffsetX = 0;
     int m_fixedOffsetY = 0;
     double m_fixedScale = 1.0;
+    // Sondeo de «¿adoptó el cliente este tamaño?». Queda armado mientras la
+    // app pueda reconfigurarse en bucle: no se reprograma si el tamaño pedido
+    // es el mismo.
+    wl_event_source* m_fixedProbeTimer = nullptr;
+    int m_fixedProbeWidth = 0;
+    int m_fixedProbeHeight = 0;
+    // Negativas del cliente a aceptar el tamaño del mosaico.
+    int m_fixedRefusals = 0;
+    std::uint64_t m_fixedRefusalAt = 0;
     // Unapplied floating defaults stay in their configured units until the first float transition.
     std::optional<int> m_pendingFloatingWidthPx;
     std::optional<int> m_pendingFloatingHeightPx;

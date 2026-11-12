@@ -403,6 +403,10 @@ namespace umbriel {
         m_xsurface, static_cast<int16_t>(lx), static_cast<int16_t>(ly), static_cast<uint16_t>(width),
         static_cast<uint16_t>(height)
     );
+    // ¿Adopta el cliente este tamaño? Un cliente normal lo hace en el mismo
+    // ciclo del servidor X; si no, la app no se deja redimensionar y el
+    // piloto conserva su resolución escalando la caja.
+    scheduleFixedProbe(width, height);
   }
 
   XwaylandRegion View::xwaylandRegion() const {
@@ -500,6 +504,9 @@ namespace umbriel {
           && (width != fullWidth || height != fullHeight);
       m_xFullscreenSize = emulated ? std::optional<ClientSize>({.width = width, .height = height}) : std::nullopt;
     }
+    // ¿Acepta el cliente el tamaño que le impone el mosaico? Si insiste en
+    // otro, no se deja redimensionar y el piloto conserva su resolución.
+    noteResizeRefusal(width, height);
     if (m_fixedRender && (widthRequested || heightRequested) && width > 0 && height > 0) {
       // Un cambio pedido por el cliente es su resolución (por ejemplo al
       // entrar en fullscreen o al elegir otro modo). Se acepta y se conserva
