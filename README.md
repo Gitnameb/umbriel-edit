@@ -69,7 +69,16 @@ Thank you to all their authors and contributors.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+This project is distributed under the GNU General Public License v3.0. See
+[LICENSE](LICENSE) for the full text.
+
+You can use, study, share and modify it freely. If you distribute a modified
+version, it must also be distributed under GPL-3.0 and include its source code.
+
+Umbriel itself is MIT-licensed. This project keeps the original copyright and
+permission notice of the upstream code in [LICENSE-MIT](LICENSE-MIT).
+`umbrielfx` is a fork of SceneFX and keeps its own MIT notice in
+[umbrielfx/LICENSE](umbrielfx/LICENSE).
 
 ## Star History
 

@@ -42,8 +42,12 @@ mis necesidades y mi forma de usar el escritorio.
 
 ## Licencia
 
-Umbriel es MIT. Este edit conserva la licencia y la atribución del proyecto
-original. Revisa `LICENSE`.
+El edit se distribuye bajo GNU GPL v3.0: es libre para usar, estudiar,
+compartir y modificar, pero si distribuyes una versión modificada tiene que
+seguir siendo GPL-3.0 y con el código disponible. Revisa `LICENSE`.
+
+Umbriel es MIT; el aviso y la atribución del proyecto original se conservan en
+`LICENSE-MIT`.
 
 ## Sin soporte
 

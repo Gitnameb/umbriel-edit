@@ -15,7 +15,7 @@ Use this short description for package metadata:
 | Name             | `umbriel`                                                         |
 | Homepage         | <https://github.com/noctalia-dev/umbriel>                         |
 | Documentation    | <https://docs.noctalia.dev/umbriel/>                              |
-| License          | MIT ([LICENSE](LICENSE))                                          |
+| License          | GPL-3.0 ([LICENSE](LICENSE)); upstream MIT ([LICENSE-MIT](LICENSE-MIT)) |
 | Version          | Meson `project(... version: ...)` in [`meson.build`](meson.build) |
 | Binary           | `umbriel`                                                         |
 | Session launcher | `start-umbriel`                                                   |
