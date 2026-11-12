@@ -1265,6 +1265,12 @@ namespace umbriel {
       const double sx = static_cast<double>(target.width) / m_fixedRenderWidth;
       const double sy = static_cast<double>(target.height) / m_fixedRenderHeight;
       m_fixedScale = std::min(sx, sy);
+      if (m_tiled) {
+        // Al salir del mosaico, la caja flotante conserva el tamaño de la
+        // celda en la que estaba el juego.
+        m_fixedBoxWidth = target.width;
+        m_fixedBoxHeight = target.height;
+      }
       // Centrar la imagen si la caja no tiene la misma proporción que el
       // render; en la ventana normal el aspecto está forzado y el offset es 0.
       const int contentWidth = std::max(1, static_cast<int>(std::lround(m_fixedRenderWidth * m_fixedScale)));

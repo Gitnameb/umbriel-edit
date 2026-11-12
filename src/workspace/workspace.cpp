@@ -1107,6 +1107,14 @@ namespace umbriel {
       if (m_layout->columnOf(view) < 0) {
         continue;
       }
+      if (view->fixedRender()) {
+        // El piloto de render fijo conserva la resolución del cliente: la
+        // celda solo cambia la caja presentada, sin configure. Se marca como
+        // redimensionada para que la animación del mosaico adopte la celda
+        // nueva en vez de quedarse con la presentación anterior.
+        resized.push_back(view);
+        continue;
+      }
       if (view->scheduledFullscreen()) {
         wlr_box fullArea{};
         wlr_output_layout_get_box(m_group->server()->outputLayout(), output->wlr(), &fullArea);

@@ -480,8 +480,14 @@ namespace umbriel {
   }
 
   std::array<int, 2> View::presentedContentSize() const {
-    if (m_fixedRender && m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
-      return {m_fixedBoxWidth, m_fixedBoxHeight};
+    if (m_fixedRender) {
+      // En el mosaico la caja es la celda, no el último tamaño flotante.
+      if (m_tiled && m_presentedBox.width > 0 && m_presentedBox.height > 0) {
+        return {m_presentedBox.width, m_presentedBox.height};
+      }
+      if (m_fixedBoxWidth > 0 && m_fixedBoxHeight > 0) {
+        return {m_fixedBoxWidth, m_fixedBoxHeight};
+      }
     }
     const wlr_box content = committedContentBox();
     return {content.width, content.height};

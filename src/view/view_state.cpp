@@ -104,8 +104,9 @@ namespace umbriel {
   }
 
   void View::setMaximized(bool maximized, bool animate) {
-    if (m_fixedRender) {
+    if (m_fixedRender && !m_tiled) {
       // El piloto de render fijo no reconfigura al cliente para maximizar.
+      // En el mosaico solo cambia la celda, así que se permite.
       return;
     }
     if (m_tiled && m_workspace != nullptr) {
@@ -264,6 +265,14 @@ namespace umbriel {
     // xdg-shell only ever asks to minimize; X11 WM_CHANGE_STATE can also ask for NormalState.
     const bool minimize = m_xsurface == nullptr || static_cast<wlr_xwayland_minimize_event*>(data)->minimize;
     if (minimize) {
+      // Wine minimiza la ventana que cree «fullscreen» al perder el foco. El
+      // piloto de render fijo la presenta como una ventana normal y el juego
+      // debe seguir visible: solo se atiende la minimización del título o del
+      // shell. La petición del cliente se ignora sin tocar WM_STATE.
+      if (m_fixedRender) {
+        kLog.debug("minimize request ignored for fixed-render '{}'", appId() != nullptr ? appId() : "?");
+        return;
+      }
       requestMinimize();
     } else {
       setMinimized(false);
@@ -360,8 +369,9 @@ namespace umbriel {
   }
 
   void View::setMaximizedToEdges(bool maximized, bool animate) {
-    if (m_fixedRender) {
-      // Ver setMaximized: el tamaño del cliente no cambia.
+    if (m_fixedRender && !m_tiled) {
+      // Ver setMaximized: en el mosaico la celda puede ocupar el área útil
+      // sin tocar el tamaño del cliente.
       return;
     }
     if (!maximized) {
@@ -781,10 +791,13 @@ namespace umbriel {
     if (m_tiled == wantTiled) {
       return;
     }
-    if (m_fixedRender && wantTiled) {
-      // La ventana de render fijo vive fuera del mosaico: volver a mosaicarla
-      // reconfiguraría al cliente y rompería el piloto.
-      return;
+    // La caja sigue al mosaico sin reconfigurar al cliente: el juego conserva
+    // su resolución y el compositor la escala dentro de la celda.
+    if (m_fixedRender) {
+      kLog.debug(
+          "fixed-render '{}' {}", appId() != nullptr ? appId() : "?",
+          wantTiled ? "entra en el mosaico" : "sale del mosaico"
+      );
     }
     // A window shows before it joins the layout, which cannot hold a hidden tile.
     if (!floating && m_minimized) {
@@ -857,31 +870,36 @@ namespace umbriel {
       }
       const wlr_box usable = floatingUsableArea();
       const SizeHints hints = sizeHints();
-      // The restored height leaves room in the usable area for the title bar and borders. A tab gets its title bar only
-      // once it floats, so its tile height can leave no room for it.
-      if (usable.height > 0) {
-        const int border = m_decoration.totalBorderWidth();
-        keepHeight = std::min(keepHeight, clampHeight(usable.height - 2 * border - titleBarHeight(), hints));
-      }
-      if (m_pendingFloatingWidthPx) {
-        keepWidth = clampWidth(*m_pendingFloatingWidthPx, hints);
-        m_pendingFloatingWidthPx.reset();
-        m_pendingFloatingWidth.reset();
-      } else if (m_pendingFloatingWidth && usable.width > 0) {
-        keepWidth = clampWidth(floatingFractionSize(*m_pendingFloatingWidth, usable.width), hints);
-        m_pendingFloatingWidth.reset();
-      }
-      if (m_pendingFloatingHeightPx) {
-        keepHeight = clampHeight(*m_pendingFloatingHeightPx, hints);
-        m_pendingFloatingHeightPx.reset();
-        m_pendingFloatingHeight.reset();
-      } else if (m_pendingFloatingHeight && usable.height > 0) {
-        keepHeight = clampHeight(floatingFractionSize(*m_pendingFloatingHeight, usable.height), hints);
-        m_pendingFloatingHeight.reset();
+      // Las pistas de tamaño describen al cliente, no a la caja del piloto.
+      // En render fijo la caja ya es la identidad flotante y no se toca.
+      if (!m_fixedRender) {
+        // The restored height leaves room in the usable area for the title bar and borders. A tab gets its title
+        // bar only once it floats, so its tile height can leave no room for it.
+        if (usable.height > 0) {
+          const int border = m_decoration.totalBorderWidth();
+          keepHeight = std::min(keepHeight, clampHeight(usable.height - 2 * border - titleBarHeight(), hints));
+        }
+        if (m_pendingFloatingWidthPx) {
+          keepWidth = clampWidth(*m_pendingFloatingWidthPx, hints);
+          m_pendingFloatingWidthPx.reset();
+          m_pendingFloatingWidth.reset();
+        } else if (m_pendingFloatingWidth && usable.width > 0) {
+          keepWidth = clampWidth(floatingFractionSize(*m_pendingFloatingWidth, usable.width), hints);
+          m_pendingFloatingWidth.reset();
+        }
+        if (m_pendingFloatingHeightPx) {
+          keepHeight = clampHeight(*m_pendingFloatingHeightPx, hints);
+          m_pendingFloatingHeightPx.reset();
+          m_pendingFloatingHeight.reset();
+        } else if (m_pendingFloatingHeight && usable.height > 0) {
+          keepHeight = clampHeight(floatingFractionSize(*m_pendingFloatingHeight, usable.height), hints);
+          m_pendingFloatingHeight.reset();
+        }
       }
       // Do not clear xdg tiled edges: GTK/Qt often resize (CSD / preferred size) when
       // tiled state is dropped. Floating is a compositor layout concern.
-      if (keepWidth > 0
+      if (!m_fixedRender
+          && keepWidth > 0
           && keepHeight > 0
           && (scheduledSize().width != keepWidth || scheduledSize().height != keepHeight)) {
         requestFloatingSize(keepWidth, keepHeight);

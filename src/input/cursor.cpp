@@ -3717,7 +3717,15 @@ namespace umbriel {
     const int x = view->layoutX() + geo.x;
     const int y = view->layoutY() + geo.y;
     const wlr_box box{.x = x, .y = y, .width = width, .height = height};
-    return resizeEdgesForPoint(box, m_cursor->x, m_cursor->y);
+    const uint32_t edges = resizeEdgesForPoint(box, m_cursor->x, m_cursor->y);
+    if (edges != 0 || !view->floating()) {
+      return edges;
+    }
+    // Los tercios dejan muerta la franja central de cada eje. En una ventana
+    // con barras negras (render fijo) el borde superior o inferior cae justo
+    // ahí, así que el borde visible manda: si el punto está pegado a él, se
+    // redimensiona igual que con el botón izquierdo.
+    return floatingBorderEdges(view, m_cursor->x, m_cursor->y);
   }
 
   uint32_t Cursor::floatingBorderEdges(View* view, double x, double y) const {

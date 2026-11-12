@@ -496,7 +496,7 @@ namespace umbriel {
   // ventana más pequeña no reconfigura al cliente y no dispara los bugs de
   // resize de los juegos.
   void View::beginFixedRenderPilot() {
-    if (m_fixedRender || m_tiled || m_xsurface == nullptr || m_contentTree == nullptr) {
+    if (m_fixedRender || m_xsurface == nullptr || m_contentTree == nullptr) {
       return;
     }
     const std::string_view id = safeAppId(*this);
