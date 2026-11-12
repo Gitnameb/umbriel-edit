@@ -663,7 +663,7 @@ namespace umbriel {
 
   void View::handleXwaylandContentChanged() { refreshFixedRenderContent(true); }
 
-  void View::adoptFixedRenderAspect() {
+  void View::adoptFixedRenderAspect(bool force) {
     if (!m_fixedRender || m_tiled || m_fixedRenderWidth <= 0 || m_fixedRenderHeight <= 0) {
       return;
     }
@@ -676,8 +676,9 @@ namespace umbriel {
       m_fixedAdoptedHeight = m_fixedRenderHeight;
       return;
     }
-    // Mientras el usuario arrastra un borde manda el ratón; se adopta al soltar, en la siguiente notificación.
-    if (m_floating.anchor()) {
+    // Mientras el usuario arrastra un borde manda el ratón; al soltar se
+    // adopta el aspecto del render, si cambió durante el arrastre.
+    if (!force && m_floating.anchor()) {
       return;
     }
     m_fixedAdoptedWidth = m_fixedRenderWidth;
@@ -1021,7 +1022,14 @@ namespace umbriel {
     finishFloatingResize();
   }
 
-  void View::finishFloatingResize() { m_floating.endResize(); }
+  void View::finishFloatingResize() {
+    m_floating.endResize();
+    // Si el juego cambió de resolución mientras se arrastraba, el aspecto
+    // nuevo quedó pendiente: ahora que manda la ventana, se adopta.
+    if (m_fixedRender) {
+      adoptFixedRenderAspect(true);
+    }
+  }
 
   void View::syncFloatingResizePosition() {
     // An attached dialog resizes around its centre, which its parent's layoutAttachments() keeps.

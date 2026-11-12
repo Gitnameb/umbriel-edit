@@ -827,8 +827,8 @@ namespace umbriel {
     // Wine/DXVK) y recalcula la escala. Sin repaint solo actualiza el estado.
     void refreshFixedRenderContent(bool repaint);
     // La ventana adopta el aspecto del render (conserva el área, centrada). Solo cuando cambió respecto a la última
-    // adaptación; no toca la caja mientras el usuario arrastra.
-    void adoptFixedRenderAspect();
+    // adaptación; no toca la caja mientras el usuario arrastra, salvo `force` al soltar el borde.
+    void adoptFixedRenderAspect(bool force = false);
     void applyContentScale();
     // Recorta la superficie a la ventana de render del juego. Sin recorte,
     // desactiva el clip.
